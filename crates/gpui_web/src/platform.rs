@@ -10,12 +10,13 @@ use crate::window::WebWindow;
 use anyhow::Result;
 use futures::channel::oneshot;
 use gpui::{
-    Action, ActivityGuard, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardEntry,
-    ClipboardItem, ClipboardReadError, ClipboardString, CursorStyle, DummyKeyboardMapper,
-    ForegroundExecutor, GestureTuning, Image, ImageFormat, Keymap, Menu, MenuItem,
-    PathPromptOptions, Platform, PlatformDisplay, PlatformGestures, PlatformKeyboardLayout,
-    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, ScrollPhysics, Task, ThermalState,
-    WindowAppearance, WindowKind, WindowParams, popup::PopupNotSupportedError,
+    AccessibilityDisplaySettings, Action, ActivityGuard, AnyWindowHandle, AppLifecyclePhase,
+    BackgroundExecutor, ClipboardEntry, ClipboardItem, ClipboardReadError, ClipboardString,
+    CursorStyle, DummyKeyboardMapper, ForegroundExecutor, GestureTuning, Image, ImageFormat,
+    Keymap, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay, PlatformGestures,
+    PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow,
+    ScrollPhysics, Task, ThermalState, WindowAppearance, WindowKind, WindowParams,
+    popup::PopupNotSupportedError,
 };
 use gpui_wgpu::{PreparedWebGraphics, WebBackendPreference, WgpuContext, wgpu};
 use std::{
@@ -49,6 +50,31 @@ pub struct WebPlatform {
     _cursor_restore_listeners: Vec<EventListenerHandle>,
     lifecycle: Rc<WebLifecycle>,
     _lifecycle_listeners: Vec<EventListenerHandle>,
+    /// `change` on each of [`ACCESSIBILITY_DISPLAY_QUERIES`], once the app asks.
+    accessibility_display_listeners: RefCell<Vec<EventListenerHandle>>,
+}
+
+/// The CSS media queries that carry the OS's settings: (reduce motion, reduce transparency). Browsers without
+/// `prefers-reduced-transparency` (Firefox, Safari in 2026) never match it.
+const ACCESSIBILITY_DISPLAY_QUERIES: [&str; 2] = [
+    "(prefers-reduced-motion: reduce)",
+    "(prefers-reduced-transparency: reduce)",
+];
+
+fn accessibility_display_settings(
+    browser_window: &web_sys::Window,
+) -> AccessibilityDisplaySettings {
+    let [reduce_motion, reduce_transparency] = ACCESSIBILITY_DISPLAY_QUERIES.map(|query| {
+        browser_window
+            .match_media(query)
+            .ok()
+            .flatten()
+            .is_some_and(|media_query| media_query.matches())
+    });
+    AccessibilityDisplaySettings {
+        reduce_motion,
+        reduce_transparency,
+    }
 }
 
 /// Gesture feel for the browser, chosen so touch scrolling matches the host
@@ -220,6 +246,7 @@ impl WebPlatform {
             _cursor_restore_listeners: cursor_restore_listeners,
             lifecycle,
             _lifecycle_listeners: lifecycle_listeners,
+            accessibility_display_listeners: RefCell::new(Vec::new()),
         }
     }
 
@@ -525,6 +552,29 @@ impl Platform for WebPlatform {
 
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
         self.callbacks.borrow_mut().reopen = Some(callback);
+    }
+
+    fn accessibility_display_settings(&self) -> Option<AccessibilityDisplaySettings> {
+        Some(accessibility_display_settings(&self.browser_window))
+    }
+
+    fn on_accessibility_display_settings_change(
+        &self,
+        callback: Box<dyn FnMut(AccessibilityDisplaySettings)>,
+    ) {
+        // The browser fires `change` from its event loop, never inside a GPUI call, so the callback runs at once.
+        let callback = Rc::new(RefCell::new(callback));
+        let listeners = ACCESSIBILITY_DISPLAY_QUERIES
+            .iter()
+            .filter_map(|query| self.browser_window.match_media(query).ok().flatten())
+            .map(|media_query| {
+                let (callback, browser_window) = (callback.clone(), self.browser_window.clone());
+                EventListenerHandle::add(media_query.as_ref(), "change", move |_event: JsValue| {
+                    (callback.borrow_mut())(accessibility_display_settings(&browser_window))
+                })
+            })
+            .collect();
+        *self.accessibility_display_listeners.borrow_mut() = listeners;
     }
 
     /// The page's lifecycle (`page_lifecycle.rs`): focus, visibility, the
