@@ -1,4 +1,4 @@
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, rc::Rc, time::Duration};
 
 use gpui::{
     Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, Image,
@@ -8,6 +8,7 @@ use gpui::{
     TouchEvent, TouchId, TouchPhase, point, px,
 };
 use wasm_bindgen::prelude::*;
+use web_time::Instant;
 
 use crate::ime_mirror::ImeMirror;
 use crate::window::WebWindowInner;
@@ -275,6 +276,7 @@ impl WebWindowInner {
                     predicted_position: None,
                     force: None,
                     device: PointerDevice::Touch,
+                    time_stamp: event_time_stamp(&event),
                 }));
                 // Keyboard and IME focus intentionally do not change here:
                 // whether this touch is a tap or a pan is only known at
@@ -349,6 +351,7 @@ impl WebWindowInner {
                     predicted_position: None,
                     force: None,
                     device: PointerDevice::Touch,
+                    time_stamp: event_time_stamp(&event),
                 }));
 
                 // A keyboard opening or closing mid-gesture reflows the
@@ -462,6 +465,7 @@ impl WebWindowInner {
                     predicted_position: None,
                     force: None,
                     device: PointerDevice::Touch,
+                    time_stamp: event_time_stamp(&event),
                 }));
             } else {
                 this.pressed_button.set(None);
@@ -591,6 +595,7 @@ impl WebWindowInner {
                     predicted_position: predicted_pointer_position(&event, position),
                     force: None,
                     device: PointerDevice::Touch,
+                    time_stamp: event_time_stamp(&event),
                 }));
                 return;
             }
@@ -1405,6 +1410,26 @@ fn compute_key_char(
     }
 
     None
+}
+
+#[wasm_bindgen]
+extern "C" {
+    /// `performance.now()`: the timeline `Event.timeStamp` is on, and the one
+    /// `web_time::Instant` reads.
+    #[wasm_bindgen(js_namespace = performance, js_name = "now")]
+    fn performance_now() -> f64;
+}
+
+// Ported from flutter/flutter engine/src/flutter/lib/web_ui/lib/src/engine/
+// pointer_binding.dart (`_BaseAdapter._eventTimeStampToDuration(event.timeStamp)`)
+// @ 3.50.1 (ae9b586f34a8443573f82ef57c3bf914a908cbf7). Copyright 2014 The
+// Flutter Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
+/// When the browser says `event` happened (`Event.timeStamp`, Flutter's
+/// `PointerEvent.timeStamp` on the web), on GPUI's clock: `Instant` here is
+/// `performance.now()`, so the event's age is taken off the current instant.
+fn event_time_stamp(event: &web_sys::Event) -> Option<Instant> {
+    let age_ms = performance_now() - event.time_stamp();
+    Instant::now().checked_sub(Duration::from_secs_f64(age_ms.max(0.) / 1000.))
 }
 
 fn pointer_position_in_element(event: &web_sys::PointerEvent) -> Point<Pixels> {

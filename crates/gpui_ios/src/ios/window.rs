@@ -535,8 +535,8 @@ impl IosWindowState {
 
     /// Delivers a UIKit touch through GPUI's platform-neutral touch API.
     pub fn handle_touch(&self, touch: &UITouch, _event: Option<&UIEvent>) {
-        // GPUI timestamps delivery itself. Replaying UIKit's historical coalesced
-        // samples here would make them appear simultaneous and distort fling velocity.
+        // Each touch carries UIKit's own time stamp. UIKit's historical coalesced
+        // samples are not replayed: one sample per touch callback, as Flutter's embedder.
         let id = touch_id(touch);
         self.handle_touch_sample(touch, id);
     }
@@ -552,6 +552,7 @@ impl IosWindowState {
             predicted_position: None,
             force: touch_force(touch),
             device: touch_device(touch),
+            time_stamp: touch_time_stamp(touch),
         };
         self.handle_keyboard_dismiss_touch(&event);
         self.input_callback

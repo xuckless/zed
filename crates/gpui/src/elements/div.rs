@@ -5347,6 +5347,7 @@ mod tests {
                         predicted_position: None,
                         force: None,
                         device: PointerDevice::Touch,
+                        time_stamp: None,
                     }
                     .to_platform_input(),
                     cx,
@@ -5374,6 +5375,7 @@ mod tests {
                         predicted_position: None,
                         force: None,
                         device: PointerDevice::Touch,
+                        time_stamp: None,
                     }
                     .to_platform_input(),
                     cx,
@@ -5396,6 +5398,7 @@ mod tests {
                         predicted_position: None,
                         force: None,
                         device: PointerDevice::Touch,
+                        time_stamp: None,
                     }
                     .to_platform_input(),
                     cx,
@@ -5681,6 +5684,7 @@ mod tests {
                     position: point(px(75.), px(75.)),
                     force: None,
                     device: PointerDevice::Touch,
+                    time_stamp: None,
                     predicted_position: None,
                 };
                 window.dispatch_event(started.clone().to_platform_input(), cx);
@@ -5741,6 +5745,7 @@ mod tests {
                             predicted_position: None,
                             force: None,
                             device: PointerDevice::Touch,
+                            time_stamp: None,
                         }
                         .to_platform_input(),
                         cx,
@@ -6284,6 +6289,7 @@ mod tests {
                 predicted_position: None,
                 force: None,
                 device: PointerDevice::Touch,
+                time_stamp: None,
             }
             .to_platform_input()
         };

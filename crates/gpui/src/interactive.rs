@@ -2,6 +2,7 @@ use crate::{
     BackGestureEvent, Bounds, Capslock, Context, Empty, IntoElement, Keystroke, LongPressEvent,
     Modifiers, Pixels, Point, Render, TouchDragEvent, Window, point, seal::Sealed,
 };
+use scheduler::Instant;
 use smallvec::SmallVec;
 use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
 
@@ -137,6 +138,14 @@ pub struct TouchEvent {
     /// The device making contact: a finger, or a stylus or mouse button the
     /// platform reports as a touch.
     pub device: PointerDevice,
+    /// When the touch was at `position`, by the platform's own event time
+    /// (Flutter's `PointerEvent.timeStamp`), on the executor's clock
+    /// ([`BackgroundExecutor::now`](crate::BackgroundExecutor::now)): the
+    /// backend moves the OS time onto it by the event's age. Velocity
+    /// estimates read it, so a platform that delivers touches late or in
+    /// bunches still measures the finger's speed. `None` when the platform
+    /// reports no event time: GPUI then times the touch when it dispatches it.
+    pub time_stamp: Option<Instant>,
 }
 
 /// The kind of device behind a pointer event.

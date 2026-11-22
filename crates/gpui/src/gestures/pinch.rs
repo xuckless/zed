@@ -155,6 +155,9 @@ impl PinchArena {
         now: Instant,
         touch_slop: Pixels,
     ) -> PinchStep {
+        // Flutter's scale recognizer is timed by `PointerEvent.timeStamp`; the
+        // dispatch time `now` stands in when the platform reports none.
+        let now = event.time_stamp.unwrap_or(now);
         let mut step = PinchStep {
             to_recognizer: true,
             won: SmallVec::new(),

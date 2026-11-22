@@ -183,6 +183,7 @@ impl TraceEvent {
             predicted_position: None,
             force: None,
             device: PointerDevice::Touch,
+            time_stamp: None,
         }
     }
 

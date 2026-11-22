@@ -10405,6 +10405,7 @@ mod tests {
             predicted_position: None,
             force: None,
             device: PointerDevice::Touch,
+            time_stamp: None,
         }
         .to_platform_input();
         let rows = [
@@ -10546,6 +10547,7 @@ mod tests {
                 predicted_position: None,
                 force: None,
                 device,
+                time_stamp: None,
             }
             .to_platform_input()
         };
@@ -11571,6 +11573,7 @@ mod tests {
                         predicted_position: None,
                         force: None,
                         device: PointerDevice::Touch,
+                        time_stamp: None,
                     }
                     .to_platform_input(),
                     cx,

@@ -606,6 +606,7 @@ mod tests {
                                 predicted_position: None,
                                 force: None,
                                 device: PointerDevice::Touch,
+                                time_stamp: None,
                             };
                             window.dispatch_event(touch.to_platform_input(), cx);
                         }

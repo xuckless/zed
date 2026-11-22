@@ -5,10 +5,12 @@ use gpui::{
     ScrollDelta, ScrollEvent, ScrollSource, TouchId, TouchPhase, px,
 };
 use objc2_core_foundation::CGPoint;
+use objc2_foundation::NSProcessInfo;
 use objc2_ui_kit::{
     UIGestureRecognizerState, UIKeyModifierFlags, UIPanGestureRecognizer, UIRectEdge,
     UIScreenEdgePanGestureRecognizer, UITouch, UITouchPhase, UITouchType, UIView,
 };
+use std::time::{Duration, Instant};
 
 /// A release faster than this, in points per second toward going back, commits
 /// a back gesture regardless of how far it travelled.
@@ -126,6 +128,20 @@ pub fn touch_force(touch: &UITouch) -> Option<f32> {
         return None;
     }
     Some((touch.force() / maximum_force).clamp(0.0, 1.0) as f32)
+}
+
+// Ported from flutter/flutter engine/src/flutter/shell/platform/darwin/ios/
+// framework/Source/FlutterViewController.mm (`dispatchTouches:`, its
+// `pointer_data.time_stamp = touch.timestamp * kMicrosecondsPerSecond`) @ 3.50.1
+// (ae9b586f34a8443573f82ef57c3bf914a908cbf7). Copyright 2014 The Flutter
+// Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
+/// When UIKit says the touch happened (`UITouch.timestamp`, which Flutter's
+/// iOS embedder sends as `PointerEvent.timeStamp`), on GPUI's clock: both
+/// `timestamp` and `NSProcessInfo.systemUptime` count seconds since boot, so
+/// the touch's age is taken off the current instant.
+pub fn touch_time_stamp(touch: &UITouch) -> Option<Instant> {
+    let age = NSProcessInfo::processInfo().systemUptime() - touch.timestamp();
+    Instant::now().checked_sub(Duration::try_from_secs_f64(age.max(0.)).ok()?)
 }
 
 /// The device behind a touch: Apple Pencil is a pen, and an iPad pointer's

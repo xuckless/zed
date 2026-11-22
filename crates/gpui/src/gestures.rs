@@ -649,6 +649,10 @@ impl TouchGestureRecognizer {
         now: Instant,
         target: TapTarget,
     ) -> SmallVec<[RecognizedTouchGesture; 2]> {
+        // Velocity samples are timed by the platform's event time, as Flutter's
+        // trackers take `PointerEvent.timeStamp`; timers and deadlines stay on
+        // `now`, the dispatch clock, as Flutter's run on its own timers.
+        let sampled_at = event.time_stamp.unwrap_or(now);
         let mut recognized = SmallVec::new();
         match event.phase {
             TouchPhase::Started => {
@@ -666,7 +670,7 @@ impl TouchGestureRecognizer {
                 if matches!(self.state, TouchGestureState::Idle) {
                     let mut velocity_tracker =
                         VelocityTracker::with_kind(self.tuning.velocity_tracker);
-                    velocity_tracker.add_position(now, event.position);
+                    velocity_tracker.add_position(sampled_at, event.position);
                     let touch = ActiveTouch {
                         id: event.id,
                         target,
@@ -709,7 +713,9 @@ impl TouchGestureRecognizer {
                     long_press_offered,
                     touch_drag_offered,
                 } if touch.id == event.id => {
-                    touch.velocity_tracker.add_position(now, event.position);
+                    touch
+                        .velocity_tracker
+                        .add_position(sampled_at, event.position);
                     touch.last_position = event.position;
                     let accumulated = event.position - touch.start_position;
                     if accumulated.magnitude() > f64::from(self.tuning.touch_slop) {
@@ -761,7 +767,9 @@ impl TouchGestureRecognizer {
                     if raw_delta != Point::default() {
                         touch.last_movement = raw_delta;
                     }
-                    touch.velocity_tracker.add_position(now, event.position);
+                    touch
+                        .velocity_tracker
+                        .add_position(sampled_at, event.position);
                     touch.last_position = event.position;
                     let mut target = event.predicted_position.unwrap_or(event.position);
                     let mut delta = target - touch.emitted_position;
@@ -873,7 +881,7 @@ impl TouchGestureRecognizer {
                     let VelocityEstimate {
                         pixels_per_second: mut velocity,
                         mut offset,
-                    } = touch.velocity_tracker.get_velocity_estimate(now);
+                    } = touch.velocity_tracker.get_velocity_estimate(sampled_at);
                     match axis {
                         Axis::Vertical => (velocity.x, offset.x) = (0., 0.),
                         Axis::Horizontal => (velocity.y, offset.y) = (0., 0.),
@@ -1787,6 +1795,54 @@ mod tests {
         }
     }
 
+    /// Flutter's trackers take each event's `timeStamp`: a fling sampled every
+    /// 16 ms flings as fast however late the platform delivers the samples.
+    /// (row, dispatch delay of each event after its time stamp, in ms)
+    #[test]
+    fn velocity_follows_event_time_stamps_not_dispatch() {
+        let rows: [(&str, fn(u64) -> u64); 3] = [
+            ("dispatched as they happen", |_| 0),
+            ("dispatched at the next 33 ms frame", |ms| {
+                (33 - ms % 33) % 33
+            }),
+            ("dispatched 50 ms late", |_| 50),
+        ];
+        let mut velocities = Vec::new();
+        for (name, delay) in rows {
+            let mut recognizer = TouchGestureRecognizer::new(GestureTuning {
+                velocity_tracker: VelocityTrackerKind::LeastSquares,
+                ..GestureTuning::default()
+            });
+            let origin = Instant::now();
+            let at = |ms| origin + Duration::from_millis(ms);
+            let touch = TouchId(1);
+            let mut release_dispatched_at = origin;
+            for (ms, phase, y) in [
+                (0, TouchPhase::Started, 0.),
+                (16, TouchPhase::Moved, 40.),
+                (32, TouchPhase::Moved, 80.),
+                (48, TouchPhase::Moved, 120.),
+                (64, TouchPhase::Moved, 160.),
+                (80, TouchPhase::Moved, 200.),
+                (80, TouchPhase::Ended, 200.),
+            ] {
+                let event = TouchEvent {
+                    time_stamp: Some(at(ms)),
+                    ..touch_event(touch, phase, 0., y)
+                };
+                release_dispatched_at = at(ms + delay(ms));
+                recognizer.handle_event_at(&event, release_dispatched_at, None);
+            }
+            assert!(recognizer.has_momentum(), "{name}");
+            velocities.push((name, recognizer.fling_velocity(release_dispatched_at).y));
+        }
+        let (_, expected) = velocities[0];
+        assert!((expected - 2500.).abs() < 1., "{expected} px/s");
+        for (name, velocity) in velocities {
+            assert!((velocity - expected).abs() < 1., "{name}: {velocity} px/s");
+        }
+    }
+
     /// A 20000 px/s flick flings at the tuning's `max_fling_velocity`:
     /// (row, max fling velocity).
     #[test]
@@ -2508,6 +2564,7 @@ mod tests {
             predicted_position: None,
             force: None,
             device: PointerDevice::Touch,
+            time_stamp: None,
         }
     }
 }
