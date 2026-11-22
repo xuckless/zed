@@ -7,6 +7,22 @@ use objc2_foundation::{
     NSProcessInfoPowerStateDidChangeNotification, NSProcessInfoThermalState,
     NSProcessInfoThermalStateDidChangeNotification,
 };
+use std::time::{Duration, Instant};
+
+// Ported from flutter/flutter engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterViewController.mm
+// (`dispatchTouches:`, its `pointer_data.time_stamp = touch.timestamp * kMicrosecondsPerSecond`) and
+// engine/src/flutter/shell/platform/darwin/macos/framework/Source/FlutterViewController.mm (its pointer events'
+// `.timestamp = static_cast<size_t>(event.timestamp * USEC_PER_SEC)`) @ 3.50.1
+// (ae9b586f34a8443573f82ef57c3bf914a908cbf7). Copyright 2014 The Flutter Authors. BSD-3-Clause, see
+// third_party/flutter/LICENSE.
+/// An event time on the uptime clock moved onto GPUI's clock, as Flutter's Apple embedders send `UITouch.timestamp`
+/// and `NSEvent.timestamp` as `PointerEvent.timeStamp`. Both count seconds since boot, as
+/// `NSProcessInfo.systemUptime` does, so the event's age is taken off the current instant; a stamp later than now
+/// counts as now.
+pub fn uptime_instant(timestamp: f64) -> Option<Instant> {
+    let age = NSProcessInfo::processInfo().systemUptime() - timestamp;
+    Instant::now().checked_sub(Duration::try_from_secs_f64(age.max(0.)).ok()?)
+}
 
 pub fn thermal_state() -> ThermalState {
     match NSProcessInfo::processInfo().thermalState() {

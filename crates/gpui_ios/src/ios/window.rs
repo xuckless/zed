@@ -24,6 +24,7 @@ use gpui::{
 use gpui_apple::{
     main_thread_marker,
     metal_renderer::{Context as MetalContext, MetalRenderer},
+    process_info,
 };
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
@@ -552,7 +553,7 @@ impl IosWindowState {
             predicted_position: None,
             force: touch_force(touch),
             device: touch_device(touch),
-            time_stamp: touch_time_stamp(touch),
+            time_stamp: process_info::uptime_instant(touch.timestamp()),
         };
         self.handle_keyboard_dismiss_touch(&event);
         self.input_callback
