@@ -10,6 +10,7 @@
 //! whose view hosts a CAMetalLayer.
 
 use super::events::*;
+use super::keyboard::{KeyResponder, Press, PressPhase, Primary};
 use super::text_input::TextInputView;
 use super::{CallbackSlot, IosDisplay, platform::IosPlatformState};
 use gpui::{
@@ -42,10 +43,10 @@ use objc2_ui_kit::{
 };
 use objc2_ui_kit::{
     UICornerConfiguration, UICornerRadius, UIEvent, UIGestureRecognizer,
-    UIGestureRecognizerDelegate, UIPanGestureRecognizer, UIRectCorner, UIRectEdge, UIScreen,
-    UIScreenEdgePanGestureRecognizer, UIScrollTypeMask, UITouch, UITraitCollection,
-    UITraitEnvironment, UIUserInterfaceLayoutDirection, UIUserInterfaceStyle, UIView,
-    UIViewAutoresizing, UIViewController, UIWindow, UIWindowScene,
+    UIGestureRecognizerDelegate, UIPanGestureRecognizer, UIPress, UIPressPhase, UIPressesEvent,
+    UIRectCorner, UIRectEdge, UIScreen, UIScreenEdgePanGestureRecognizer, UIScrollTypeMask,
+    UITouch, UITraitCollection, UITraitEnvironment, UIUserInterfaceLayoutDirection,
+    UIUserInterfaceStyle, UIView, UIViewAutoresizing, UIViewController, UIWindow, UIWindowScene,
 };
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, UiKitDisplayHandle, UiKitWindowHandle};
@@ -116,6 +117,46 @@ define_class!(
             }
             self.ivars().with_window(IosWindowState::handle_layout_change);
         }
+
+        // Ported from flutter/flutter engine/src/flutter/shell/platform/darwin/ios/framework/Source/
+        // FlutterViewController.mm (`pressesBegan:withEvent:` … `pressesCancelled:withEvent:`) @ 3.50.1
+        // (ae9b586f34a8443573f82ef57c3bf914a908cbf7). Copyright 2014 The Flutter Authors. BSD-3-Clause, see
+        // third_party/flutter/LICENSE.
+        // Each press goes to GPUI first; one GPUI leaves unhandled goes on to `super`, alone, as Flutter's
+        // `superPresses…`, and up the responder chain to UIKit's text system, which types it into the focused field.
+        // The text input view is first responder while a field is focused; it has no presses methods of its own,
+        // so its presses come here through the chain.
+        #[unsafe(method(pressesBegan:withEvent:))]
+        fn presses_began(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            // SAFETY: UIResponder's own `pressesBegan:withEvent:`, with a set of UIKit's presses and its event.
+            self.handle_presses(presses, |press| unsafe {
+                msg_send![super(self), pressesBegan: press, withEvent: event]
+            });
+        }
+
+        #[unsafe(method(pressesChanged:withEvent:))]
+        fn presses_changed(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            // SAFETY: UIResponder's own `pressesChanged:withEvent:`, with a set of UIKit's presses and its event.
+            self.handle_presses(presses, |press| unsafe {
+                msg_send![super(self), pressesChanged: press, withEvent: event]
+            });
+        }
+
+        #[unsafe(method(pressesEnded:withEvent:))]
+        fn presses_ended(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            // SAFETY: UIResponder's own `pressesEnded:withEvent:`, with a set of UIKit's presses and its event.
+            self.handle_presses(presses, |press| unsafe {
+                msg_send![super(self), pressesEnded: press, withEvent: event]
+            });
+        }
+
+        #[unsafe(method(pressesCancelled:withEvent:))]
+        fn presses_cancelled(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            // SAFETY: UIResponder's own `pressesCancelled:withEvent:`, with a set of UIKit's presses and its event.
+            self.handle_presses(presses, |press| unsafe {
+                msg_send![super(self), pressesCancelled: press, withEvent: event]
+            });
+        }
     }
 );
 
@@ -123,6 +164,21 @@ impl ViewController {
     fn new(main_thread: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(main_thread).set_ivars(WindowReference::default());
         unsafe { msg_send![super(this), init] }
+    }
+
+    /// Offers each press to GPUI; `next` (UIKit's handling, as `super`) gets those GPUI leaves unhandled, and the
+    /// ups and cancels of the downs it got, one at a time. Flutter: "I have not yet seen multiple presses in the set
+    /// in the wild".
+    fn handle_presses(&self, presses: &NSSet<UIPress>, next: impl Fn(&NSSet<UIPress>)) {
+        for press in presses {
+            let uikit = self
+                .ivars()
+                .with_window(|window| window.handle_press(&press))
+                .unwrap_or(true);
+            if uikit {
+                next(&NSSet::from_slice(&[&*press]));
+            }
+        }
     }
 }
 
@@ -301,6 +357,10 @@ pub(crate) struct IosWindowState {
     mouse_position: Cell<Point<Pixels>>,
     /// Current modifiers
     modifiers: Cell<Modifiers>,
+    /// The hardware keyboard's keys down and modifier state (keyboard.rs).
+    key_responder: RefCell<KeyResponder>,
+    /// Fires the held key's repeats while `key_responder` has a key that repeats.
+    key_repeat_timer: RefCell<Option<Retained<objc2_foundation::NSTimer>>>,
     renderer: Mutex<MetalRenderer>,
 }
 
@@ -460,6 +520,8 @@ impl IosWindow {
             keyboard_height: Cell::new(0.),
             mouse_position: Cell::new(Point::default()),
             modifiers: Cell::new(Modifiers::default()),
+            key_responder: RefCell::default(),
+            key_repeat_timer: RefCell::default(),
             renderer: Mutex::new(renderer),
         };
 
@@ -561,6 +623,95 @@ impl IosWindowState {
             self.input_callback
                 .with(|callback| callback(PlatformInput::Touch(event)));
         }
+    }
+
+    /// Delivers a hardware keyboard press as GPUI key events, returning whether UIKit gets it too (`super`, and so
+    /// UIKit's text system). While the focused field composes (marked text), downs are UIKit's alone (keyboard.rs).
+    /// The responder is never borrowed while GPUI runs, which may ask for `capslock()`.
+    fn handle_press(&self, press: &UIPress) -> bool {
+        let Some(key) = press.key(self.view.mtm()) else {
+            // Not a keyboard's press (a remote's button): UIKit's.
+            return true;
+        };
+        let composing = self
+            .with_input_handler(|handler| handler.marked_text_range())
+            .flatten()
+            .is_some();
+        let characters = key.characters().to_string();
+        let characters_ignoring_modifiers = key.charactersIgnoringModifiers().to_string();
+        let key_code = key.keyCode().0 as u32;
+        let repeating = self.key_responder.borrow().repeating_key();
+        let events = self.key_responder.borrow_mut().handle_press(
+            &Press {
+                phase: press_phase(press.phase()),
+                key_code,
+                modifier_flags: key.modifierFlags().0 as u32,
+                characters: &characters,
+                characters_ignoring_modifiers: &characters_ignoring_modifiers,
+            },
+            composing,
+        );
+        self.modifiers.set(self.key_responder.borrow().modifiers());
+        if let Some(event) = events.modifiers_changed {
+            self.input_callback
+                .with(|callback| callback(PlatformInput::ModifiersChanged(event)));
+        }
+        let uikit = match events.primary {
+            Primary::Offer(event) => {
+                let handled = self
+                    .input_callback
+                    .with(|callback| !callback(event.clone()).propagate)
+                    .unwrap_or(false);
+                self.key_responder
+                    .borrow_mut()
+                    .offered(key_code, &event, handled);
+                !handled
+            }
+            Primary::Send { event, uikit } => {
+                if let Some(event) = event {
+                    self.input_callback.with(|callback| callback(event));
+                }
+                uikit
+            }
+        };
+        if self.key_responder.borrow().repeating_key() != repeating {
+            self.restart_key_repeat();
+        }
+        uikit
+    }
+
+    /// Stops the held key's repeat timer and, if a key repeats now, starts one for it: `KEY_REPEAT_DELAY`, then a
+    /// repeat every `KEY_REPEAT_INTERVAL` until the key's up, another key's down or the window resigning.
+    fn restart_key_repeat(&self) {
+        if let Some(timer) = self.key_repeat_timer.take() {
+            timer.invalidate();
+        }
+        if self.key_responder.borrow().repeating_key().is_none() {
+            return;
+        }
+        let window = self.view.ivars().0.borrow().clone();
+        let block = block2::RcBlock::new(move |_: NonNull<objc2_foundation::NSTimer>| {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            let repeat = window.key_responder.borrow().repeat();
+            if let Some(event) = repeat {
+                window.input_callback.with(|callback| callback(event));
+            }
+        });
+        // SAFETY: scheduled on the main thread's run loop, so the block (which holds only a weak window) runs on the
+        // main thread it was made on; the timer is invalidated before it is replaced and when the window resigns.
+        let timer = unsafe {
+            objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_repeats_block(
+                super::keyboard::KEY_REPEAT_INTERVAL.as_secs_f64(),
+                true,
+                &block,
+            )
+        };
+        timer.setFireDate(&objc2_foundation::NSDate::dateWithTimeIntervalSinceNow(
+            super::keyboard::KEY_REPEAT_DELAY.as_secs_f64(),
+        ));
+        self.key_repeat_timer.replace(Some(timer));
     }
 
     /// Delivers one step of a trackpad or mouse-wheel scroll gesture.
@@ -748,6 +899,11 @@ impl IosWindowState {
     pub fn notify_active_status_change(&self, is_active: bool) {
         log::info!("GPUI iOS: Window active status changed to: {}", is_active);
 
+        if !is_active && self.key_responder.borrow().repeating_key().is_some() {
+            // A held key's up may never come once the window resigns (app switcher, backgrounding).
+            self.key_responder.borrow_mut().stop_repeat();
+            self.restart_key_repeat();
+        }
         self.active_status_callback
             .with(|callback| callback(is_active));
     }
@@ -808,6 +964,19 @@ impl IosWindowState {
 
         self.resize_callback
             .with(|callback| callback(new_size, new_scale));
+    }
+}
+
+/// A `UIPress`'s phase as keyboard.rs's.
+fn press_phase(phase: UIPressPhase) -> PressPhase {
+    match phase {
+        UIPressPhase::Began => PressPhase::Began,
+        UIPressPhase::Changed => PressPhase::Changed,
+        UIPressPhase::Ended => PressPhase::Ended,
+        UIPressPhase::Cancelled => PressPhase::Cancelled,
+        // objc2 makes `UIPressPhase` an open newtype, so a match needs this arm; `Stationary` and any phase UIKit
+        // adds later are UIKit's.
+        _ => PressPhase::Stationary,
     }
 }
 
@@ -904,8 +1073,7 @@ impl PlatformWindow for IosWindow {
     }
 
     fn capslock(&self) -> Capslock {
-        // Would need to check UIKeyModifierFlags
-        Capslock { on: false }
+        self.key_responder.borrow().capslock()
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
