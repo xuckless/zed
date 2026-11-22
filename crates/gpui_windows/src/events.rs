@@ -1,4 +1,4 @@
-use std::{cell::Cell, rc::Rc, sync::atomic::Ordering};
+use std::{cell::Cell, rc::Rc, sync::atomic::Ordering, time::Instant};
 
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -6,19 +6,55 @@ use windows::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
-        System::SystemServices::*,
+        System::{
+            Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
+            SystemInformation::GetTickCount,
+            SystemServices::*,
+        },
         UI::{
             Controls::*,
             HiDpi::*,
-            Input::{Ime::*, KeyboardAndMouse::*},
+            Input::{Ime::*, KeyboardAndMouse::*, Pointer::*},
             WindowsAndMessaging::*,
         },
     },
     core::PCWSTR,
 };
 
+use crate::pointer::{self, PointerInput};
 use crate::*;
 use gpui::*;
+
+// pointer.rs writes WinUser.h's values out so its tests build on any host; they must be the windows crate's.
+const _: () = {
+    assert!(pointer::PT_TOUCH == PT_TOUCH.0 && pointer::PT_PEN == PT_PEN.0);
+    assert!(pointer::POINTER_FLAG_INCONTACT == POINTER_FLAG_INCONTACT.0);
+    assert!(pointer::POINTER_FLAG_CANCELED == POINTER_FLAG_CANCELED.0);
+    assert!(pointer::POINTER_FLAG_DOWN == POINTER_FLAG_DOWN.0);
+    assert!(pointer::POINTER_FLAG_UPDATE == POINTER_FLAG_UPDATE.0);
+    assert!(pointer::POINTER_FLAG_UP == POINTER_FLAG_UP.0);
+    assert!(pointer::WM_MOUSEMOVE == WM_MOUSEMOVE);
+    assert!(pointer::WM_LBUTTONDOWN == WM_LBUTTONDOWN && pointer::WM_LBUTTONUP == WM_LBUTTONUP);
+    assert!(pointer::WM_RBUTTONDOWN == WM_RBUTTONDOWN && pointer::WM_RBUTTONUP == WM_RBUTTONUP);
+    assert!(pointer::WM_MBUTTONDOWN == WM_MBUTTONDOWN && pointer::WM_MBUTTONUP == WM_MBUTTONUP);
+    assert!(pointer::WM_XBUTTONDOWN == WM_XBUTTONDOWN && pointer::WM_XBUTTONUP == WM_XBUTTONUP);
+};
+
+/// One pointer's coalesced history (`GetPointerTouchInfoHistory`, `GetPointerPenInfoHistory`), newest first as
+/// Windows returns it.
+fn read_pointer_history<T: Clone + Default>(
+    pointer_id: u32,
+    read: unsafe fn(u32, *mut u32, Option<*mut T>) -> windows::core::Result<()>,
+) -> windows::core::Result<Vec<T>> {
+    let mut count = 0u32;
+    // SAFETY: a null buffer asks for the entry count only.
+    unsafe { read(pointer_id, &mut count, None) }?;
+    let mut entries = vec![T::default(); count as usize];
+    // SAFETY: `entries` holds `count` entries, the most Windows writes.
+    unsafe { read(pointer_id, &mut count, Some(entries.as_mut_ptr())) }?;
+    entries.truncate(count as usize);
+    Ok(entries)
+}
 
 pub(crate) const WM_GPUI_CURSOR_STYLE_CHANGED: u32 = WM_USER + 1;
 pub(crate) const WM_GPUI_CLOSE_ONE_WINDOW: u32 = WM_USER + 2;
@@ -85,6 +121,11 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        // Windows also makes mouse messages from touch and pen. GPUI takes those from WM_POINTER*, so the mouse
+        // copies skip GPUI and a tap fires once (Flutter's embedder drops them the same way).
+        if pointer::is_promoted_mouse_message(msg, unsafe { GetMessageExtraInfo() }.0) {
+            return unsafe { DefWindowProcW(handle, msg, wparam, lparam) };
+        }
         let handled = match msg {
             // `DefWindowProc` answers `MA_NOACTIVATE` for a left click on `HTCAPTION`.
             // The activation is only triggered when `DefWindowProc` handles the following `WM_NCLBUTTONDOWN`.
@@ -146,6 +187,11 @@ impl WindowsWindowInner {
             }
             WM_MOUSEWHEEL => self.handle_mouse_wheel_msg(handle, wparam, lparam),
             WM_MOUSEHWHEEL => self.handle_mouse_horizontal_wheel_msg(handle, wparam, lparam),
+            WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP => {
+                self.handle_pointer_msg(handle, wparam)
+            }
+            WM_POINTERCAPTURECHANGED => self.handle_pointer_capture_changed_msg(wparam),
+            WM_POINTERLEAVE => self.handle_pointer_leave_msg(handle, wparam),
             WM_SYSKEYUP => self.handle_syskeyup_msg(wparam, lparam),
             WM_KEYUP => self.handle_keyup_msg(wparam, lparam),
             WM_CHAR => self.handle_char_msg(wparam),
@@ -390,6 +436,178 @@ impl WindowsWindowInner {
         let handled = !func(input).propagate;
         self.state.callbacks.input.set(Some(func));
         if handled { Some(0) } else { Some(1) }
+    }
+
+    // Ported from rust-windowing/winit src/platform_impl/windows/event_loop.rs (`WM_POINTERDOWN | WM_POINTERUPDATE |
+    // WM_POINTERUP`) @ v0.30.13 (e9809ef54b18499bb4f2cac945719ecc2a61061b). Copyright the winit contributors.
+    // Apache-2.0. Its decisions are in pointer.rs.
+    /// Touch and pen: this message's pointer, its coalesced history oldest first, becomes GPUI touches (a pen's
+    /// hover, mouse moves) through `pointer::Contacts`. Only this pointer, as Flutter's embedder reads it: winit reads
+    /// the whole frame and skips the frame's other messages, which stopped Windows sending a two-finger gesture's
+    /// later frames. Mouse and touchpad pointers go to `DefWindowProc` as before: mouse input stays on WM_MOUSE* (no
+    /// `EnableMouseInPointer`). A touch or pen message is handled even when reading it fails: `DefWindowProc` would
+    /// turn it into mouse messages that the copy filter drops, so the sample would be lost twice over.
+    fn handle_pointer_msg(&self, handle: HWND, wparam: WPARAM) -> Option<isize> {
+        let pointer_id = wparam.loword() as u32;
+        let mut pointer_type = POINTER_INPUT_TYPE::default();
+        unsafe { GetPointerType(pointer_id, &mut pointer_type) }.ok()?;
+        let device = pointer::device(pointer_type.0)?;
+
+        // Each entry with its own pressure, from the device's own history.
+        let history = match device {
+            PointerDevice::Touch => read_pointer_history(pointer_id, GetPointerTouchInfoHistory)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| (entry.pointerInfo, entry.pressure))
+                        .collect::<Vec<_>>()
+                }),
+            PointerDevice::Pen => {
+                read_pointer_history(pointer_id, GetPointerPenInfoHistory).map(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| (entry.pointerInfo, entry.pressure))
+                        .collect()
+                })
+            }
+            // pointer::device leaves mouse pointers to the mouse messages.
+            PointerDevice::Mouse => return None,
+        };
+        let Some(history) = history.log_err() else {
+            return Some(0);
+        };
+
+        let mut performance_count = 0i64;
+        let mut performance_frequency = 0i64;
+        unsafe { QueryPerformanceCounter(&mut performance_count) }.log_err();
+        unsafe { QueryPerformanceFrequency(&mut performance_frequency) }.log_err();
+        let clock = pointer::Clock {
+            now: Instant::now(),
+            performance_count: performance_count as u64,
+            performance_frequency: performance_frequency as u64,
+            tick_count: unsafe { GetTickCount() },
+        };
+        let mut client_origin = POINT::default();
+        if unsafe { ClientToScreen(handle, &mut client_origin) }
+            .ok()
+            .log_err()
+            .is_none()
+        {
+            return Some(0);
+        }
+        let scale_factor = self.state.scale_factor.get();
+
+        // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getpointerinfohistory
+        // The information retrieved appears in reverse chronological order, with the most
+        // recent entry in the first row of the returned array
+        for (pointer_info, pressure) in history.iter().rev() {
+            let mut device_rect = RECT::default();
+            let mut display_rect = RECT::default();
+            let himetric = unsafe {
+                GetPointerDeviceRects(
+                    pointer_info.sourceDevice,
+                    &mut device_rect,
+                    &mut display_rect,
+                )
+            }
+            .ok()
+            .and_then(|()| {
+                let rect = |r: RECT| [r.left, r.top, r.right, r.bottom];
+                let location = pointer_info.ptHimetricLocation;
+                pointer::himetric_to_screen(
+                    [location.x, location.y],
+                    rect(device_rect),
+                    rect(display_rect),
+                )
+            });
+            let pixel = pointer_info.ptPixelLocation;
+            let [x, y] = himetric.unwrap_or([f64::from(pixel.x), f64::from(pixel.y)]);
+            let (x, y) = (
+                x - f64::from(client_origin.x),
+                y - f64::from(client_origin.y),
+            );
+
+            let sample = pointer::PointerSample {
+                pointer_id: pointer_info.pointerId,
+                pointer_type: pointer_info.pointerType.0,
+                pointer_flags: pointer_info.pointerFlags.0,
+                position: logical_point(x as f32, y as f32, scale_factor),
+                pressure: *pressure,
+                time_stamp: clock.at(pointer_info.PerformanceCount, pointer_info.dwTime),
+            };
+            let inputs = self.state.pointer_contacts.borrow_mut().input(sample);
+            for input in inputs {
+                match input {
+                    PointerInput::Touch(event) => self.dispatch_touch(event),
+                    PointerInput::Hover => {
+                        // WM_MOUSEMOVE's LPARAM: client x and y, signed, in its low and high words.
+                        let (x, y) = (
+                            x.round() as i16 as u16 as u32,
+                            y.round() as i16 as u16 as u32,
+                        );
+                        let lparam = LPARAM((y << 16 | x) as i32 as isize);
+                        self.handle_mouse_move_msg(handle, lparam, WPARAM(0));
+                    }
+                }
+            }
+        }
+        Some(0)
+    }
+
+    /// A pen that hovered off the window ends GPUI's hover, as the mouse leaving does (Flutter's `OnPointerLeave`),
+    /// unless the real cursor is still over the client area.
+    fn handle_pointer_leave_msg(&self, handle: HWND, wparam: WPARAM) -> Option<isize> {
+        let mut pointer_info = POINTER_INFO::default();
+        unsafe { GetPointerInfo(wparam.loword() as u32, &mut pointer_info) }.ok()?;
+        let mut cursor = POINT::default();
+        let mut client = RECT::default();
+        unsafe { GetCursorPos(&mut cursor) }.ok()?;
+        unsafe { ScreenToClient(handle, &mut cursor) }.ok().ok()?;
+        unsafe { GetClientRect(handle, &mut client) }.ok()?;
+        let cursor_in_client = unsafe { PtInRect(&client, cursor) }.as_bool();
+        if pointer::pen_leave_is_mouse_leave(
+            pointer_info.pointerType.0,
+            pointer_info.pointerFlags.0,
+            cursor_in_client,
+        ) {
+            self.handle_mouse_leave_msg()
+        } else {
+            None
+        }
+    }
+
+    /// A pointer this window lost while down (another window or the system took it) is cancelled.
+    fn handle_pointer_capture_changed_msg(&self, wparam: WPARAM) -> Option<isize> {
+        let pointer_id = wparam.loword() as u32;
+        let event = self
+            .state
+            .pointer_contacts
+            .borrow_mut()
+            .capture_lost(pointer_id)?;
+        self.dispatch_touch(event);
+        Some(0)
+    }
+
+    /// Hands `event` to GPUI through `pointer::TouchQueue`, so an end that arrives while GPUI's callback is busy
+    /// still reaches it.
+    fn dispatch_touch(&self, event: TouchEvent) {
+        let func = self.state.callbacks.input.take();
+        self.state
+            .touch_queue
+            .borrow_mut()
+            .push(event, func.is_some());
+        let Some(mut func) = func else {
+            return;
+        };
+        // Every touch waiting, those queued while `func` ran among them.
+        loop {
+            let next = self.state.touch_queue.borrow_mut().pop();
+            let Some(event) = next else {
+                break;
+            };
+            func(PlatformInput::Touch(event));
+        }
+        self.state.callbacks.input.set(Some(func));
     }
 
     fn handle_mouse_leave_msg(&self) -> Option<isize> {

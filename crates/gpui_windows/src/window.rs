@@ -91,6 +91,10 @@ pub struct WindowsWindowState {
     hwnd: HWND,
     pub(crate) a11y: RefCell<Option<A11yState>>,
     pub mouse_position: Cell<Point<Pixels>>,
+    /// The touches and pen strokes down in this window (pointer.rs).
+    pub(crate) pointer_contacts: RefCell<crate::pointer::Contacts>,
+    /// Touches waiting for the input callback (pointer.rs).
+    pub(crate) touch_queue: RefCell<crate::pointer::TouchQueue>,
 }
 
 pub(crate) struct WindowsWindowInner {
@@ -193,6 +197,8 @@ impl WindowsWindowState {
             direct_manipulation,
             a11y: RefCell::new(None),
             mouse_position: Cell::new(Point::default()),
+            pointer_contacts: RefCell::new(crate::pointer::Contacts::default()),
+            touch_queue: RefCell::new(crate::pointer::TouchQueue::default()),
         })
     }
 
