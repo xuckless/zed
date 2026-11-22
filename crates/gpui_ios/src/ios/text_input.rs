@@ -109,6 +109,28 @@ define_class!(
     }
 );
 
+define_class!(
+    // Ported from flutter/flutter FlutterTextInputPlugin.mm's `FlutterTokenizer` @ 3.50.1.
+    // Copyright 2014 The Flutter Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
+    #[unsafe(super(UITextInputStringTokenizer, objc2_foundation::NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "GPUITextInputTokenizer"]
+    #[ivars = Weak<TextInputView>]
+    struct Tokenizer;
+    unsafe impl NSObjectProtocol for Tokenizer {}
+    unsafe impl UITextInputTokenizer for Tokenizer {
+        #[unsafe(method_id(rangeEnclosingPosition:withGranularity:inDirection:))]
+        fn range_enclosing_position(&self, position: &UITextPosition, granularity: UITextGranularity, direction: UITextDirection) -> Option<Retained<UITextRange>> {
+            if granularity == UITextGranularity::Line {
+                // The default UITextInputStringTokenizer does not handle line granularity correctly.
+                self.ivars().load().and_then(|view| view.line_enclosing_position(position, direction))
+            } else {
+                unsafe { msg_send![super(self), rangeEnclosingPosition: position, withGranularity: granularity, inDirection: direction] }
+            }
+        }
+    }
+);
+
 pub(super) struct TextInputIvars {
     window: WindowReference,
     input_field: Cell<Option<gpui::FocusId>>,
@@ -124,6 +146,7 @@ pub(super) struct TextInputIvars {
     selection_changed: Cell<bool>,
     content_changed: Cell<bool>,
     native_edit: Cell<bool>,
+    temporarily_deleted_composed_character: RefCell<Option<Retained<NSString>>>,
 }
 
 define_class!(
@@ -200,10 +223,21 @@ define_class!(
         }
         #[unsafe(method(insertText:))]
         fn insert_text(&self, text: &NSString) {
-            self.edit(|handler| handler.replace_text_in_range(None, &text.to_string()));
+            // Workaround for https://github.com/flutter/flutter/issues/111494: after an emoji is deleted, iOS can
+            // insert only its first UTF-16 unit (no UTF-8 form); insert the whole deleted character instead.
+            let partial = |cached: &Retained<NSString>| {
+                text.length() == 1 && is_surrogate(text.characterAtIndex(0)) && text.characterAtIndex(0) == cached.characterAtIndex(0)
+            };
+            let cached = self.ivars().temporarily_deleted_composed_character.borrow().clone().filter(partial);
+            if cached.is_some() {
+                self.ivars().temporarily_deleted_composed_character.take();
+            }
+            let text = cached.map_or_else(|| lossy_string(text), |cached| lossy_string(&cached));
+            self.edit(|handler| handler.replace_text_in_range(None, &text));
         }
         #[unsafe(method(deleteBackward))]
         fn delete_backward(&self) {
+            let mut deleted_emoji = None;
             self.edit(|handler| {
                 let Some(selection) = handler.selected_text_range(false) else { return; };
                 let mut range = selection.range;
@@ -211,13 +245,26 @@ define_class!(
                     let start = handler.text_input_editable_range().map_or(0, |range| range.start);
                     if range.start <= start { return; }
                     let Some(text) = read_text(handler, start..range.start) else { return; };
-                    let Some(character) = composed_character_range(&text, text.length().saturating_sub(1)) else { return; };
-                    range.start = start + character.start;
+                    let last = text.length() - 1;
+                    let Some(character) = composed_character_range(&text, last) else { return; };
+                    // When deleting Thai vowel, delete only a part of grapheme cluster because it is the expected
+                    // behavior of Thai input (flutter/flutter#24203, #21745, #39399). If the last character is a
+                    // part of emoji, delete the entire emoji to prevent the text from being malformed.
+                    range.start = start + if is_emoji(&text, &character) { character.start } else { last_code_point(&text, last) };
                 }
-                if allowed_range(handler, &range) {
-                    handler.replace_text_in_range(Some(range), "");
+                if !allowed_range(handler, &range) { return; }
+                // Cache the last deleted emoji to use for an iOS bug where the next insertion corrupts the emoji
+                // characters. See: https://github.com/flutter/flutter/issues/111494#issuecomment-1248441346
+                if let Some(deleted) = read_text(handler, range.clone()) {
+                    if is_emoji(&deleted, &(0..deleted.length())) {
+                        deleted_emoji = Some(deleted.substringWithRange(deleted.rangeOfComposedCharacterSequenceAtIndex(0)));
+                    }
                 }
+                handler.replace_text_in_range(Some(range), "");
             });
+            if deleted_emoji.is_some() {
+                *self.ivars().temporarily_deleted_composed_character.borrow_mut() = deleted_emoji;
+            }
         }
     }
 
@@ -263,7 +310,12 @@ define_class!(
         fn text_in_range(&self, range: &UITextRange) -> Option<Retained<NSString>> {
             (|| {
             let range = self.validated_range(range)?;
-            self.with_handler(|handler| read_text(handler, range)).flatten()
+            self.with_handler(|handler| {
+                // Sanitize the range to prevent going out of bounds: UIKit keeps ranges across app edits.
+                let document = document_range(handler)?;
+                let start = range.start.clamp(document.start, document.end);
+                read_text(handler, start..range.end.clamp(start, document.end))
+            }).flatten()
             })()
         }
         #[unsafe(method(replaceRange:withText:))]
@@ -271,7 +323,7 @@ define_class!(
             if let Some(range) = self.validated_range(range) {
                 self.edit(|handler| {
                     if allowed_range(handler, &range) {
-                        handler.replace_text_in_range(Some(range), &text.to_string());
+                        handler.replace_text_in_range(Some(range), &lossy_string(text));
                     }
                 });
             }
@@ -308,12 +360,15 @@ define_class!(
         }
         #[unsafe(method(setMarkedText:selectedRange:))]
         fn set_marked_text(&self, text: Option<&NSString>, selection: NSRange) {
-            let text = text.map(|text| text.to_string()).unwrap_or_default();
+            let text = text.map(lossy_string).unwrap_or_default();
             let selection = checked_range(selection.location, selection.length, text.encode_utf16().count());
             self.edit(|handler| handler.replace_and_mark_text_in_range(None, &text, selection));
         }
         #[unsafe(method(unmarkText))]
-        fn unmark_text(&self) { self.edit(PlatformInputHandler::unmark_text); }
+        fn unmark_text(&self) {
+            // Nothing to commit without marked text: the app is left alone.
+            self.edit(|handler| if handler.marked_text_range().is_some() { handler.unmark_text() });
+        }
         #[unsafe(method_id(beginningOfDocument))]
         fn beginning_of_document(&self) -> Retained<UITextPosition> {
             self.new_position(self.document_range().map_or(0, |range| range.start))
@@ -381,7 +436,8 @@ define_class!(
         }
         #[unsafe(method_id(tokenizer))]
         fn input_tokenizer(&self) -> Retained<ProtocolObject<dyn UITextInputTokenizer>> {
-            let tokenizer = unsafe { UITextInputStringTokenizer::initWithTextInput(UITextInputStringTokenizer::alloc(self.mtm()), self) };
+            let tokenizer = Tokenizer::alloc(self.mtm()).set_ivars(Weak::new(self));
+            let tokenizer: Retained<Tokenizer> = unsafe { msg_send![super(tokenizer), initWithTextInput: self] };
             ProtocolObject::from_retained(tokenizer)
         }
         #[unsafe(method_id(positionWithinRange:farthestInDirection:))]
@@ -467,6 +523,13 @@ define_class!(
                 self.character_range(self.validated_offset(&position)?)
             })()
         }
+        #[unsafe(method(shouldChangeTextInRange:replacementText:))]
+        fn should_change_text(&self, _range: &UITextRange, _text: &NSString) -> bool {
+            // `temporarily_deleted_composed_character` should only be used during a single text change session.
+            // So it needs to be cleared at the start of each text editing session.
+            self.ivars().temporarily_deleted_composed_character.take();
+            true
+        }
         #[unsafe(method_id(textInputView))]
         fn text_input_view(&self) -> Retained<UIView> {
             // GPUI's bounds and hit testing use the rendering view's coordinate space,
@@ -494,6 +557,7 @@ impl TextInputView {
             selection_changed: Cell::new(false),
             content_changed: Cell::new(false),
             native_edit: Cell::new(false),
+            temporarily_deleted_composed_character: RefCell::new(None),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -552,6 +616,51 @@ impl TextInputView {
 
     fn document_range(&self) -> Option<Range<usize>> {
         self.with_handler(document_range).flatten()
+    }
+
+    // Ported from flutter/flutter FlutterTextInputPlugin.mm `-[FlutterTokenizer lineEnclosingPosition:inDirection:]`
+    // @ 3.50.1 (its iOS 17 branch). Copyright 2014 The Flutter Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
+    fn line_enclosing_position(
+        &self,
+        position: &UITextPosition,
+        direction: UITextDirection,
+    ) -> Option<Retained<UITextRange>> {
+        // According to the API doc if the text position is at a text-unit boundary, it is considered enclosed only
+        // if the next position in the given direction is entirely enclosed. Link:
+        // https://developer.apple.com/documentation/uikit/uitextinputtokenizer/1614464-rangeenclosingposition?language=objc
+        let index = self.validated_offset(position)?;
+        let end = self.validated_offset(&self.endOfDocument())?;
+        if index > end || (index == end && direction == UITextStorageDirection::Forward.0) {
+            return None;
+        }
+        // Gets the first line break position after the input position.
+        let after = self.textRangeFromPosition_toPosition(position, &self.endOfDocument())?;
+        let text_after = self.textInRange(&after)?;
+        let lines_after = lossy_string(&text_after);
+        let offset_to_line_break = lines_after
+            .split('\n')
+            .next()
+            .unwrap_or_default()
+            .encode_utf16()
+            .count();
+        let line_break_after = self
+            .positionFromPosition_offset(position, isize::try_from(offset_to_line_break).ok()?)?;
+        // Gets the first line break position before the input position.
+        let before =
+            self.textRangeFromPosition_toPosition(&self.beginningOfDocument(), position)?;
+        let text_before = self.textInRange(&before)?;
+        let lines_before = lossy_string(&text_before);
+        let offset_from_line_break = lines_before
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default()
+            .encode_utf16()
+            .count();
+        let line_break_before = self.positionFromPosition_offset(
+            position,
+            -isize::try_from(offset_from_line_break).ok()?,
+        )?;
+        self.textRangeFromPosition_toPosition(&line_break_before, &line_break_after)
     }
 
     fn bounds(&self, range: Range<usize>) -> Option<CGRect> {
@@ -697,6 +806,47 @@ fn read_text(
 fn checked_range(location: usize, length: usize, document_length: usize) -> Option<Range<usize>> {
     let end = location.checked_add(length)?;
     (end <= document_length).then_some(location..end)
+}
+
+/// UIKit's text as GPUI's: an NSString can hold half a surrogate pair, which has no UTF-8 form (objc2's `to_string`
+/// reads a NULL `UTF8String`), so it arrives as U+FFFD.
+fn lossy_string(text: &NSString) -> String {
+    String::from_utf16_lossy(
+        &(0..text.length())
+            .map(|index| text.characterAtIndex(index))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn is_surrogate(unit: u16) -> bool {
+    (0xD800..=0xDFFF).contains(&unit)
+}
+
+/// The start of the code point that ends at `last`: one UTF-16 unit, or two for a surrogate pair.
+fn last_code_point(text: &NSString, last: usize) -> usize {
+    let low = (0xDC00..=0xDFFF).contains(&text.characterAtIndex(last));
+    let pair = low && last > 0 && (0xD800..=0xDBFF).contains(&text.characterAtIndex(last - 1));
+    last - usize::from(pair)
+}
+
+#[link(name = "icucore")]
+unsafe extern "C" {
+    // ICU's property lookup, from the system's libicucore (Flutter's `IsEmoji` asks ICU too).
+    fn u_hasBinaryProperty(code_point: i32, property: i32) -> i8;
+}
+
+/// ICU's `UCHAR_EMOJI`.
+const UCHAR_EMOJI: i32 = 57;
+
+// Ported from flutter/flutter FlutterTextInputPlugin.mm `IsEmoji` @ 3.50.1: whether the first code point in `range`
+// has the Emoji property. Copyright 2014 The Flutter Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
+fn is_emoji(text: &NSString, range: &Range<usize>) -> bool {
+    let units = range.clone().map(|index| text.characterAtIndex(index));
+    let Some(Ok(code_point)) = char::decode_utf16(units).next() else {
+        return false;
+    };
+    // SAFETY: ICU answers for every code point; `property` is a valid `UProperty`.
+    unsafe { u_hasBinaryProperty(code_point as i32, UCHAR_EMOJI) != 0 }
 }
 
 fn composed_character_range(text: &NSString, offset: usize) -> Option<Range<usize>> {
