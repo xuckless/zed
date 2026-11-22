@@ -99,6 +99,8 @@ pub(crate) struct WindowsPlatformState {
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
     directx_devices: RefCell<Option<DirectXDevices>>,
     low_power_mode_enabled: Cell<bool>,
+    /// As last read; `WM_SETTINGCHANGE` reads them again.
+    accessibility_display: Cell<AccessibilityDisplaySettings>,
 }
 
 #[derive(Default)]
@@ -114,6 +116,7 @@ struct PlatformCallbacks {
     system_wake: Cell<Option<Box<dyn FnMut()>>>,
     low_power_mode_change: Cell<Option<Box<dyn FnMut()>>>,
     displays_changed: Cell<Option<Box<dyn FnMut()>>>,
+    accessibility_display_change: Cell<Option<Box<dyn FnMut(AccessibilityDisplaySettings)>>>,
 }
 
 impl WindowsPlatformState {
@@ -130,6 +133,7 @@ impl WindowsPlatformState {
             draw_coordinator: Rc::new(DrawCoordinator::new()),
             directx_devices: RefCell::new(directx_devices),
             low_power_mode_enabled: Cell::new(false),
+            accessibility_display: Cell::new(read_accessibility_display_settings()),
             menus: RefCell::new(Vec::new()),
         }
     }
@@ -876,6 +880,21 @@ impl Platform for WindowsPlatform {
         }
     }
 
+    fn accessibility_display_settings(&self) -> Option<AccessibilityDisplaySettings> {
+        Some(self.inner.state.accessibility_display.get())
+    }
+
+    fn on_accessibility_display_settings_change(
+        &self,
+        callback: Box<dyn FnMut(AccessibilityDisplaySettings)>,
+    ) {
+        self.inner
+            .state
+            .callbacks
+            .accessibility_display_change
+            .set(Some(callback));
+    }
+
     fn on_power_mode_change(&self, callback: Box<dyn FnMut()>) {
         self.inner
             .state
@@ -1216,8 +1235,10 @@ impl WindowsPlatformInner {
             | WM_GPUI_DOCK_MENU_ACTION
             | WM_GPUI_KEYBOARD_LAYOUT_CHANGED
             | WM_GPUI_DISPLAYS_CHANGED
+            | WM_GPUI_ACCESSIBILITY_DISPLAY_CHANGED
             | WM_GPUI_GPU_DEVICE_LOST => self.handle_gpui_events(msg, wparam, lparam),
             WM_POWERBROADCAST => self.handle_power_broadcast(wparam, lparam),
+            WM_SETTINGCHANGE => self.handle_setting_change(handle),
             WM_DISPLAYCHANGE => self.handle_display_change(handle),
             WM_QUERYENDSESSION => Some(1),
             WM_ENDSESSION if wparam.0 != 0 => self.handle_end_session(),
@@ -1244,6 +1265,7 @@ impl WindowsPlatformInner {
             WM_GPUI_DOCK_MENU_ACTION => self.handle_dock_action_event(lparam.0 as _),
             WM_GPUI_KEYBOARD_LAYOUT_CHANGED => self.handle_keyboard_layout_change(),
             WM_GPUI_DISPLAYS_CHANGED => self.handle_displays_changed(),
+            WM_GPUI_ACCESSIBILITY_DISPLAY_CHANGED => self.handle_accessibility_display_changed(),
             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
             _ => unreachable!(),
         }
@@ -1260,6 +1282,33 @@ impl WindowsPlatformInner {
                 LPARAM(0),
             )
             .log_err();
+        }
+        Some(0)
+    }
+
+    /// `WM_SETTINGCHANGE`, broadcast to every top-level window, this hidden one too: Animation effects sends it with
+    /// `SPI_SETCLIENTAREAANIMATION`, Transparency effects with "ImmersiveColorSet". Like a display change, it is
+    /// reported from the message loop, since a broadcast can arrive mid-update.
+    fn handle_setting_change(&self, handle: HWND) -> Option<isize> {
+        unsafe {
+            PostMessageW(
+                Some(handle),
+                WM_GPUI_ACCESSIBILITY_DISPLAY_CHANGED,
+                WPARAM(self.validation_number),
+                LPARAM(0),
+            )
+            .log_err();
+        }
+        Some(0)
+    }
+
+    fn handle_accessibility_display_changed(&self) -> Option<isize> {
+        let settings = read_accessibility_display_settings();
+        if self.state.accessibility_display.replace(settings) != settings {
+            self.with_callback(
+                |callbacks| &callbacks.accessibility_display_change,
+                |callback| callback(settings),
+            );
         }
         Some(0)
     }
@@ -1627,6 +1676,26 @@ fn file_open_dialog(
     }
 
     Ok(Some(paths))
+}
+
+fn read_accessibility_display_settings() -> AccessibilityDisplaySettings {
+    let mut animation = BOOL(1);
+    // SAFETY: SPI_GETCLIENTAREAANIMATION writes one BOOL through pvParam, which points at `animation`.
+    let animation = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some((&mut animation) as *mut BOOL as *mut std::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
+        )
+    }
+    .log_err()
+    .map(|()| animation.as_bool());
+    let transparency = windows_registry::CURRENT_USER
+        .open(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        .and_then(|key| key.get_u32("EnableTransparency"))
+        .ok();
+    accessibility_display::settings(animation, transparency)
 }
 
 fn file_save_dialog(

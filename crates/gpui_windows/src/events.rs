@@ -64,6 +64,8 @@ pub(crate) const WM_GPUI_FORCE_UPDATE_WINDOW: u32 = WM_USER + 5;
 pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
 pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
 pub(crate) const WM_GPUI_DISPLAYS_CHANGED: u32 = WM_USER + 10;
+// Parallax: WM_APP range, so upstream's next WM_USER id cannot collide with ours.
+pub(crate) const WM_GPUI_ACCESSIBILITY_DISPLAY_CHANGED: u32 = WM_APP + 1;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
 

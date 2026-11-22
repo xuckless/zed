@@ -1,5 +1,6 @@
 #![cfg(target_os = "windows")]
 
+mod accessibility_display;
 mod clipboard;
 mod destination_list;
 mod dialog;
