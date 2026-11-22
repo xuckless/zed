@@ -428,7 +428,11 @@ impl Interactivity {
     ) {
         self.back_gesture_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                // A back gesture carries its own position, so keyboard modality (which hides hover
+                // under a stale cursor) must not stop a claim: Android's back key arrives after typing.
+                if phase == DispatchPhase::Bubble
+                    && hitbox.id.is_hovered_ignoring_last_input(window)
+                {
                     (listener)(event, window, cx);
                     window.prevent_default();
                     cx.stop_propagation();

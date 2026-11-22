@@ -10184,6 +10184,62 @@ mod tests {
         assert_eq!(claims.borrow().as_slice(), ["inner", "outer"]);
     }
 
+    #[gpui::test]
+    fn back_gesture_is_claimed_whatever_the_last_input(cx: &mut TestAppContext) {
+        // One row per input that sets the modality before the back gesture; add a row per modality.
+        let key_down = PlatformInput::KeyDown(KeyDownEvent {
+            keystroke: Keystroke::parse("a").expect("valid keystroke"),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        let touch = TouchEvent {
+            id: TouchId(0),
+            phase: TouchPhase::Started,
+            position: point(px(140.), px(10.)),
+            predicted_position: None,
+            force: None,
+            device: PointerDevice::Touch,
+        }
+        .to_platform_input();
+        let rows = [
+            ("after a key press", key_down.clone(), 10., Some("inner")),
+            (
+                "after a key press, outer",
+                key_down.clone(),
+                80.,
+                Some("outer"),
+            ),
+            ("after a key press, unclaimed", key_down, 150., None),
+            ("after a touch", touch.clone(), 10., Some("inner")),
+            ("after a touch, unclaimed", touch, 150., None),
+        ];
+        for (name, before, x, claim) in rows {
+            let claims = Rc::new(RefCell::new(Vec::new()));
+            let window = cx.add_window({
+                let claims = claims.clone();
+                move |_, _| BackListeners { claims }
+            });
+            let prevented = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(before, cx);
+                    window
+                        .dispatch_event(
+                            BackGestureEvent {
+                                phase: BackGesturePhase::Started,
+                                start_position: point(px(x), px(10.)),
+                                progress: 0.,
+                            }
+                            .to_platform_input(),
+                            cx,
+                        )
+                        .default_prevented
+                })
+                .unwrap();
+            assert_eq!(prevented, claim.is_some(), "{name}");
+            assert_eq!(claims.borrow().first().copied(), claim, "{name}");
+        }
+    }
+
     struct BackListeners {
         claims: Rc<RefCell<Vec<&'static str>>>,
     }
