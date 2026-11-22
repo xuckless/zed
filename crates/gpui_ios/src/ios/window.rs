@@ -18,7 +18,7 @@ use super::keyboard_inset::{
     InsetSample, KeyboardInsetAction, KeyboardInsetManager, KeyboardNotification, KeyboardSpring,
     NotificationName, Rect, ViewGeometry,
 };
-use super::native_view_state::Rotation;
+use super::native_view_state::{KeyboardEvent, Rotation};
 use super::text_input::TextInputView;
 use super::{CallbackSlot, IosDisplay, platform::IosPlatformState};
 use gpui::{
@@ -1394,6 +1394,11 @@ impl PlatformWindow for IosWindow {
 
     fn native_view_input(&self) -> gpui::NativeViewInput {
         gpui::NativeViewInput::Window
+    }
+
+    fn set_focused_native_view(&self, id: Option<gpui::NativeViewId>) {
+        self.text_input_view
+            .move_keyboard_input(KeyboardEvent::Focused(id));
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

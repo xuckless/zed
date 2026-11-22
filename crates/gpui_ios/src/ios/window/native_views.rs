@@ -21,6 +21,7 @@ use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_ui_kit::UIView;
 use std::{any::Any, ffi::c_void, ptr::NonNull, rc::Weak};
 
+use super::super::native_view_state::KeyboardEvent;
 use super::{IosWindow, IosWindowState};
 use gpui_apple::native_view_placement::{Layout, Placement, YAxis, plan_layout};
 
@@ -105,6 +106,9 @@ impl Drop for Attachment {
         // Handles are dropped on the main thread: `gpui::NativeView` is not `Send`.
         attached.container.removeFromSuperview();
         attached.view.removeFromSuperview();
+        window
+            .text_input_view
+            .move_keyboard_input(KeyboardEvent::Dropped(self.id));
     }
 }
 

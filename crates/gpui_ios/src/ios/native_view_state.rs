@@ -1,5 +1,42 @@
-//! The lifecycle native views add to an iOS window, as a plain value: whether UIKit is turning the window. Pure,
-//! so scripts/patch-test.sh runs its tests on the host (`ios-pure`).
+//! The two lifecycles native views add to an iOS window, as plain values: who gets keyboard input, and whether
+//! UIKit is turning the window. Pure, so scripts/patch-test.sh runs its tests on the host (`ios-pure`).
+
+use gpui::NativeViewId;
+
+/// Who GPUI's focus gives keyboard input to. GPUI's text input view becomes first responder only for `Gpui`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum KeyboardInput {
+    /// GPUI's own content: its text input view becomes first responder while a GPUI field is focused.
+    Gpui,
+    /// This native view's focus handle is focused: GPUI's text input view never becomes first responder, so the
+    /// app can make its own `UIView` first responder.
+    NativeView(NativeViewId),
+}
+
+/// What moves keyboard input.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum KeyboardEvent {
+    /// GPUI's focus is on this native view's handle, or (`None`) on none (`PlatformWindow::set_focused_native_view`).
+    Focused(Option<NativeViewId>),
+    /// The last handle of this native view was dropped. A dropped view can't keep the keyboard, whether or not
+    /// GPUI tells the window its focus moved, or a GPUI field focused next could never take it back.
+    Dropped(NativeViewId),
+}
+
+impl KeyboardInput {
+    /// The one place keyboard input changes hands.
+    pub(super) fn next(self, event: KeyboardEvent) -> Self {
+        use KeyboardEvent::{Dropped, Focused};
+        use KeyboardInput::{Gpui, NativeView};
+        match (self, event) {
+            (Gpui | NativeView(_), Focused(None)) => Gpui,
+            (Gpui | NativeView(_), Focused(Some(id))) => NativeView(id),
+            (NativeView(focused), Dropped(id)) if focused == id => Gpui,
+            (NativeView(focused), Dropped(_)) => NativeView(focused),
+            (Gpui, Dropped(_)) => Gpui,
+        }
+    }
+}
 
 /// Whether UIKit is animating a rotation (`viewWillTransitionToSize:…` to its coordinator's completion), during
 /// which Core Animation resamples every pixel of the turning content.
@@ -34,6 +71,58 @@ impl Rotation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use KeyboardEvent::{Dropped, Focused};
+    use KeyboardInput::{Gpui, NativeView};
+
+    #[test]
+    fn keyboard_input_follows_focus_and_leaves_a_dropped_view() {
+        let (a, b) = (NativeViewId::for_test(1), NativeViewId::for_test(2));
+        // (name, state, event, next)
+        let cases = [
+            (
+                "GPUI to a focused view",
+                Gpui,
+                Focused(Some(a)),
+                NativeView(a),
+            ),
+            (
+                "GPUI stays without a focused view",
+                Gpui,
+                Focused(None),
+                Gpui,
+            ),
+            ("a view back to GPUI", NativeView(a), Focused(None), Gpui),
+            (
+                "one view to another",
+                NativeView(a),
+                Focused(Some(b)),
+                NativeView(b),
+            ),
+            (
+                "the same view again",
+                NativeView(a),
+                Focused(Some(a)),
+                NativeView(a),
+            ),
+            // M1: GPUI never says None once the last view is gone; a GPUI field must still get the keyboard.
+            (
+                "focused view dropped: back to GPUI",
+                NativeView(a),
+                Dropped(a),
+                Gpui,
+            ),
+            (
+                "another view dropped: the focused one keeps it",
+                NativeView(a),
+                Dropped(b),
+                NativeView(a),
+            ),
+            ("a view dropped while GPUI has it", Gpui, Dropped(a), Gpui),
+        ];
+        for (name, state, event, next) in cases {
+            assert_eq!(state.next(event), next, "{name}");
+        }
+    }
 
     #[test]
     fn the_screen_resamples_while_turning_and_under_display_zoom() {

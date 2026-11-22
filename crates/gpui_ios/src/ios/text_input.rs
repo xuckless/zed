@@ -1,3 +1,4 @@
+use super::native_view_state::{KeyboardEvent, KeyboardInput};
 use super::window::{IosWindowState, WindowReference};
 use gpui::{
     Autocapitalize, AutofillHint, KeyboardType, PlatformInputHandler, TextInputAction,
@@ -162,6 +163,7 @@ pub(super) struct TextInputIvars {
     marked_style: RefCell<Option<Retained<NSDictionary<NSAttributedStringKey, AnyObject>>>>,
     keyboard_desired: Cell<bool>,
     keyboard_eligible: Cell<bool>,
+    keyboard_input: Cell<KeyboardInput>,
     reconciling_responder: Cell<bool>,
     update_pending: Cell<bool>,
     configuration_changed: Cell<bool>,
@@ -187,6 +189,7 @@ define_class!(
         fn can_become_first_responder(&self) -> bool {
             self.ivars().keyboard_desired.get()
                 && self.ivars().keyboard_eligible.get()
+                && self.ivars().keyboard_input.get() == KeyboardInput::Gpui
         }
 
         // UIKit can make this view first responder itself (not only `reconcileTextInput`), so the selection UI comes
@@ -743,6 +746,7 @@ impl TextInputView {
             marked_style: RefCell::new(None),
             keyboard_desired: Cell::new(false),
             keyboard_eligible: Cell::new(false),
+            keyboard_input: Cell::new(KeyboardInput::Gpui),
             reconciling_responder: Cell::new(false),
             update_pending: Cell::new(false),
             configuration_changed: Cell::new(false),
@@ -963,6 +967,20 @@ impl TextInputView {
 
     pub(super) fn set_keyboard_visible(&self, visible: bool) {
         self.ivars().keyboard_desired.set(visible);
+        self.refresh_keyboard();
+    }
+
+    /// Moves keyboard input to a native view or back to GPUI (native_view_state.rs). Going to a native view, this
+    /// view resigns (its keyboard stays wanted); coming back, a field GPUI focused takes the keyboard again, even when
+    /// the app's view took first responder from this one, which UIKit counts as ending native editing.
+    pub(super) fn move_keyboard_input(&self, event: KeyboardEvent) {
+        let input = self.ivars().keyboard_input.get().next(event);
+        if self.ivars().keyboard_input.replace(input) == input {
+            return;
+        }
+        if input == KeyboardInput::Gpui && self.ivars().input_field.get().is_some() {
+            self.ivars().keyboard_desired.set(true);
+        }
         self.refresh_keyboard();
     }
 

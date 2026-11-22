@@ -2,6 +2,12 @@
 #[path = "../src/ios/text_input.rs"]
 mod text_input;
 
+// text_input.rs moves keyboard input with native_view_state.rs's pure transitions.
+#[cfg(target_os = "ios")]
+#[path = "../src/ios/native_view_state.rs"]
+#[allow(dead_code, unused_imports, reason = "text_input.rs uses only its keyboard transitions here; its tests run in scripts/patch-test.sh's ios-pure crate")]
+mod native_view_state;
+
 // Native protocol construction does not need a GPUI window, renderer, or a
 // second text model. This fixture deliberately has no registered input handler.
 #[cfg(target_os = "ios")]
