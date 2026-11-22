@@ -33,6 +33,8 @@ use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
+
+mod native_view;
 use crate::linux::{Globals, Output, PendingActivation, WaylandClientStatePtr, get_window};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Corners, Decorations, DevicePixels, ExternalDragPayload,
@@ -143,6 +145,7 @@ pub struct WaylandWindowState {
     client_inset: Option<Pixels>,
     client_corner_radii: Corners<Pixels>,
     accesskit_adapter: Option<accesskit_unix::Adapter>,
+    native_views: native_view::NativeViews,
 }
 
 pub enum WaylandSurfaceState {
@@ -645,6 +648,7 @@ impl WaylandWindowState {
             client_inset: None,
             client_corner_radii: Corners::default(),
             accesskit_adapter: None,
+            native_views: native_view::NativeViews::default(),
         })
     }
 
@@ -2048,7 +2052,23 @@ impl PlatformWindow for WaylandWindow {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
     }
 
+    unsafe fn attach_native_view(
+        &self,
+        id: gpui::NativeViewId,
+        view: NonNull<c_void>,
+    ) -> Option<Box<dyn std::any::Any>> {
+        // SAFETY: NativeView::new's caller passes a live wl_surface proxy made on this display.
+        unsafe { native_view::attach(&mut self.borrow_mut(), id, view) }
+    }
+
+    fn native_view_input(&self) -> gpui::NativeViewInput {
+        gpui::NativeViewInput::Window
+    }
+
     fn draw(&self, scene: &Scene) {
+        if native_view::place_views(&mut self.borrow_mut(), scene) {
+            update_window(self.borrow_mut());
+        }
         let mut state = self.borrow_mut();
         let state = &mut *state;
         let Some(renderer) = &mut state.renderer else {
@@ -2083,16 +2103,18 @@ impl PlatformWindow for WaylandWindow {
             let callback = state.surface.frame(&state.globals.qh, state.surface.id());
             state.pending_frame_callback = Some(callback);
         }
-        if renderer.draw(scene) {
+        let drawn = renderer.draw(scene);
+        if renderer.needs_redraw() {
+            state.redraw_requested = true;
+        }
+        if drawn {
             state.presentation = PresentationState::Presented;
             self.0.frame_loop.set(FrameLoop::AwaitingCallback);
+            native_view::frame_committed(&mut state.native_views);
         } else {
             state.presentation = state.presentation.failed();
             self.0.frame_loop.set(FrameLoop::PresentationFailed);
-        }
-
-        if renderer.needs_redraw() {
-            state.redraw_requested = true;
+            native_view::frame_failed(state);
         }
     }
 
@@ -2494,6 +2516,7 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
             area.size.width,
             area.size.height,
         );
+        native_view::subtract_holes(&state, &region);
 
         // Promise the compositor that this region of the window surface
         // contains no transparent pixels. This allows the compositor to skip
