@@ -6,6 +6,7 @@ use crate::http_client::FetchHttpClient;
 use crate::keyboard::WebKeyboardLayout;
 use crate::page_lifecycle::{Document, PageEvent, PageState};
 use crate::text_system::WebTextSystem;
+use crate::webgpu_canvas_probe;
 use crate::window::WebWindow;
 use anyhow::Result;
 use futures::channel::oneshot;
@@ -281,6 +282,18 @@ async fn initialize_graphics(
                 Err(anyhow::anyhow!(
                     "browser WebGPU probe did not return a usable adapter"
                 ))
+            };
+            // A working WebGPU device whose canvases show nothing (webgpu_canvas_probe.rs) falls back to WebGL2.
+            let webgpu_result = match webgpu_result {
+                Ok(prepared) if !webgpu_canvas_probe::shows_drawing(&prepared.context) => {
+                    return webgpu_canvas_probe::fall_back_to_webgl2(
+                        browser_window,
+                        webgpu_canvas,
+                        prepared,
+                    )
+                    .await;
+                }
+                result => result,
             };
             match webgpu_result {
                 Ok(PreparedWebGraphics { context, surface }) => {
