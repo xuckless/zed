@@ -1,3 +1,5 @@
+#[cfg(any(feature = "wayland", feature = "x11"))]
+mod clock;
 mod dispatcher;
 mod display_connection;
 mod headless;
@@ -31,6 +33,53 @@ pub(crate) use x11::*;
 use std::rc::Rc;
 
 use gpui::WindowingModes;
+
+/// Whether `input` reaches a window a modal child blocks. A touch's end or cancel does, or GPUI's touch would stay
+/// open once the child closes; other input is dropped, as upstream drops all of it.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+pub(crate) fn reaches_blocked_window(input: &gpui::PlatformInput) -> bool {
+    use gpui::{PlatformInput, TouchEvent, TouchPhase};
+    matches!(
+        input,
+        PlatformInput::Touch(TouchEvent {
+            phase: TouchPhase::Ended | TouchPhase::Cancelled,
+            ..
+        })
+    )
+}
+
+#[cfg(all(test, any(feature = "wayland", feature = "x11")))]
+mod tests {
+    use gpui::{PlatformInput, TouchEvent, TouchPhase};
+
+    #[test]
+    fn blocked_window_input() {
+        let touch = |phase| {
+            PlatformInput::Touch(TouchEvent {
+                phase,
+                ..TouchEvent::default()
+            })
+        };
+        let rows = [
+            ("a touch ends", touch(TouchPhase::Ended), true),
+            ("a touch is cancelled", touch(TouchPhase::Cancelled), true),
+            (
+                "rejected: a touch starts",
+                touch(TouchPhase::Started),
+                false,
+            ),
+            ("rejected: a touch moves", touch(TouchPhase::Moved), false),
+            (
+                "rejected: a key",
+                PlatformInput::ModifiersChanged(Default::default()),
+                false,
+            ),
+        ];
+        for (name, input, reaches) in rows {
+            assert_eq!(super::reaches_blocked_window(&input), reaches, "{name}");
+        }
+    }
+}
 
 /// Returns the default platform implementation for the current OS.
 ///

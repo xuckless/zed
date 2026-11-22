@@ -1608,7 +1608,8 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn handle_input(&self, input: PlatformInput) {
-        if self.is_blocked() {
+        // A touch's end still gets through, so a modal child opening mid-touch leaves no touch open.
+        if self.is_blocked() && !crate::linux::reaches_blocked_window(&input) {
             return;
         }
         let callback = self.callbacks.borrow_mut().input.take();

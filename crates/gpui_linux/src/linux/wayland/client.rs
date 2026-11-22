@@ -38,7 +38,7 @@ use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
     protocol::{
         wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
-        wl_shm_pool, wl_surface,
+        wl_shm_pool, wl_surface, wl_touch,
     },
 };
 use wayland_protocols::ext::background_effect::v1::client::{
@@ -87,6 +87,7 @@ use super::{
     window::{ImeInput, WaylandWindowStatePtr},
 };
 
+use crate::linux::clock::Clock;
 use crate::linux::{
     DOUBLE_CLICK_INTERVAL, LinuxCommon, LinuxKeyboardLayout, PIPE_READ_TIMEOUT, SCROLL_LINES,
     capslock_from_xkb, cursor_style_to_icon_names, get_xkb_compose_state, is_within_click_distance,
@@ -97,6 +98,7 @@ use crate::linux::{
         cursor::Cursor,
         serial::{ActivationContext, Serial, SerialKind, SerialTracker},
         to_shape,
+        touch::{Touches, WlTouchEvent},
         window::WaylandWindow,
     },
     xdg_desktop_portal::{Event as XDPEvent, XDPEventSource},
@@ -107,8 +109,8 @@ use gpui::{
     KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
     MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay,
     PlatformFrameSignal, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta,
-    ScrollEvent, ScrollSource, SharedString, Size, TouchPhase, WindowButtonLayout, WindowKind,
-    WindowParams, point, px, size,
+    ScrollEvent, ScrollSource, SharedString, Size, TouchEvent, TouchPhase, WindowButtonLayout,
+    WindowKind, WindowParams, point, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -367,6 +369,8 @@ pub(crate) struct WaylandClientState {
     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
     pinch_scale: f32,
     wl_keyboard: Option<wl_keyboard::WlKeyboard>,
+    wl_touch: Option<wl_touch::WlTouch>,
+    touches: Touches<ObjectId>,
     cursor_shape_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
     data_device: Option<wl_data_device::WlDataDevice>,
     primary_selection: Option<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1>,
@@ -1070,6 +1074,8 @@ impl WaylandConnection {
             wl_seat: seat,
             wl_pointer: None,
             wl_keyboard: None,
+            wl_touch: None,
+            touches: Touches::default(),
             pinch_gesture: None,
             pinch_scale: 1.0,
             cursor_shape_device: None,
@@ -1618,8 +1624,14 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                     if let Some(wl_keyboard) = state.wl_keyboard.take() {
                         wl_keyboard.release();
                     }
+                    if let Some(wl_touch) = state.wl_touch.take() {
+                        wl_touch.release();
+                    }
                     state.wl_seat.release();
                     state.wl_seat = registry.bind::<wl_seat::WlSeat, _, _>(name, version, qh, ());
+                    // The old seat's touches never end.
+                    let touches = state.touches.event(WlTouchEvent::Cancel, None);
+                    dispatch_touches(state, touches);
                 }
                 "wl_output" => {
                     let Ok(version) = wl_output_version(version) else {
@@ -1709,6 +1721,18 @@ pub(crate) fn get_window(
     surface_id: &ObjectId,
 ) -> Option<WaylandWindowStatePtr> {
     state.windows.get(surface_id).cloned()
+}
+
+/// Hands each touch to the window on its surface, with the client state released, as other input is.
+fn dispatch_touches(mut state: RefMut<WaylandClientState>, touches: Vec<(ObjectId, TouchEvent)>) {
+    let touches: Vec<_> = touches
+        .into_iter()
+        .filter_map(|(surface, touch)| Some((get_window(&mut state, &surface)?, touch)))
+        .collect();
+    drop(state);
+    for (window, touch) in touches {
+        window.handle_input(PlatformInput::Touch(touch));
+    }
 }
 
 impl Dispatch<wl_surface::WlSurface, ()> for WaylandClientStatePtr {
@@ -2005,7 +2029,79 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
 
                 state.wl_pointer = Some(pointer);
             }
+            // As winit binds touch: once, while the seat has it; a seat that loses it cancels its touches.
+            let has_touch = capabilities.contains(wl_seat::Capability::Touch);
+            match (has_touch, state.wl_touch.take()) {
+                (true, None) => state.wl_touch = Some(seat.get_touch(qh, ())),
+                (true, Some(wl_touch)) => state.wl_touch = Some(wl_touch),
+                (false, Some(wl_touch)) => {
+                    wl_touch.release();
+                    let touches = state.touches.event(WlTouchEvent::Cancel, None);
+                    dispatch_touches(state, touches);
+                }
+                (false, None) => {}
+            }
         }
+    }
+}
+
+impl Dispatch<wl_touch::WlTouch, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _: &wl_touch::WlTouch,
+        event: wl_touch::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+        let (event, time) = match event {
+            wl_touch::Event::Down {
+                serial,
+                time,
+                surface,
+                id,
+                x,
+                y,
+            } => {
+                // winit drops a down on a surface that isn't a window (and so the rest of that touch).
+                if get_window(&mut state, &surface.id()).is_none() {
+                    return;
+                }
+                // Wayland takes a touch down's serial wherever it takes a button press (moves, popup grabs,
+                // selections), and GPUI turns a tap into a mouse press.
+                state.serial_tracker.update_with_focused_surface(
+                    SerialKind::MousePress,
+                    serial,
+                    Some(surface.clone()),
+                );
+                let location = point(px(x as f32), px(y as f32));
+                (
+                    WlTouchEvent::Down {
+                        id,
+                        surface: surface.id(),
+                        location,
+                    },
+                    Some(time),
+                )
+            }
+            wl_touch::Event::Up { time, id, .. } => (WlTouchEvent::Up { id }, Some(time)),
+            wl_touch::Event::Motion { time, id, x, y } => {
+                let location = point(px(x as f32), px(y as f32));
+                (WlTouchEvent::Motion { id, location }, Some(time))
+            }
+            wl_touch::Event::Cancel => (WlTouchEvent::Cancel, None),
+            // Delivered event by event, as winit does; shape and orientation are blank in winit too.
+            wl_touch::Event::Frame
+            | wl_touch::Event::Shape { .. }
+            | wl_touch::Event::Orientation { .. } => return,
+            // The generated enum is non-exhaustive; an event a later wl_touch version adds is ignored.
+            _ => return,
+        };
+        let time_stamp = time.and_then(|time| Clock::read().at(time));
+        let touches = state.touches.event(event, time_stamp);
+        dispatch_touches(state, touches);
     }
 }
 
