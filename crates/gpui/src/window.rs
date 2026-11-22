@@ -1290,6 +1290,8 @@ pub struct Window {
     next_hitbox_id: HitboxId,
     native_views: Vec<std::rc::Weak<NativeViewState>>,
     next_native_view_id: u64,
+    /// The native view last given keyboard input (`sync_native_view_focus`).
+    focused_native_view_sent: Option<NativeViewId>,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
@@ -1599,6 +1601,15 @@ impl PendingInputTimeout {
             paused,
         }
     }
+}
+
+/// Whether a key event's key listeners have heard it before key bindings did,
+/// which only a focused native view's element does
+/// (`Window::native_view_key_order`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum KeyListeners {
+    NotHeard,
+    Heard,
 }
 
 #[derive(Default, Debug)]
@@ -2546,6 +2557,7 @@ impl Window {
             next_hitbox_id: HitboxId(0),
             native_views: Vec::new(),
             next_native_view_id: 0,
+            focused_native_view_sent: None,
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
@@ -4097,6 +4109,7 @@ impl Window {
         if self.platform_window.prepare_frame() {
             self.refresh();
         }
+        self.sync_native_view_focus();
         // A field that focus left (blur, another element) ends its IME composition before this
         // draw drops its input handler, so its marked text becomes plain text and no stale composing
         // range reaches the next input session; the platform then ends its IME's side. A tap's
@@ -7016,9 +7029,27 @@ impl Window {
                 InputPreference::KeyBindings,
                 dispatch_path,
                 self.context_stack(),
+                KeyListeners::NotHeard,
                 cx,
             );
             return;
+        };
+
+        // Where the window gets a focused native view's keys, the view's element
+        // hears each first, as the view itself does on macOS, and key bindings
+        // get what it leaves (`native_view_key_order`).
+        let key_listeners = if event.is::<KeyDownEvent>()
+            && self.platform_window.native_view_input() == NativeViewInput::Window
+            && self.native_view_key_order(&keystroke, cx) == Some(native_view::KeyOrder::ViewFirst)
+        {
+            cx.propagate_event = true;
+            self.dispatch_key_down_up_event(event, &dispatch_path, cx);
+            if !cx.propagate_event {
+                return;
+            }
+            KeyListeners::Heard
+        } else {
+            KeyListeners::NotHeard
         };
 
         let input_preference = self.input_preference(event, cx);
@@ -7037,6 +7068,7 @@ impl Window {
                 input_preference,
                 dispatch_path,
                 self.context_stack(),
+                key_listeners,
                 cx,
             );
             return;
@@ -7123,6 +7155,7 @@ impl Window {
             input_preference,
             dispatch_path,
             match_result.context_stack,
+            key_listeners,
             cx,
         );
         self.pending_input_changed(cx);
@@ -7183,11 +7216,18 @@ impl Window {
         input_preference: InputPreference,
         dispatch_path: SmallVec<[DispatchNodeId; 32]>,
         context_stack: Vec<KeyContext>,
+        key_listeners: KeyListeners,
         cx: &mut App,
     ) {
-        self.dispatch_key_down_up_event(event, &dispatch_path, cx);
-        if !cx.propagate_event {
-            return;
+        // key listeners → whether they hear the key now.
+        match key_listeners {
+            KeyListeners::NotHeard => {
+                self.dispatch_key_down_up_event(event, &dispatch_path, cx);
+                if !cx.propagate_event {
+                    return;
+                }
+            }
+            KeyListeners::Heard => {}
         }
 
         self.dispatch_modifiers_changed_event(event, &dispatch_path, cx);

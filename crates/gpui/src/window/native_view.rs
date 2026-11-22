@@ -1,4 +1,4 @@
-use crate::{Action, KeyBinding, KeyDownEvent, PlatformInput};
+use crate::{Action, KeyBinding, KeyDownEvent, Keystroke, PlatformInput};
 use crate::{
     AnyWindowHandle, App, Bounds, Element, ElementId, FocusHandle, FocusId, Focusable,
     GlobalElementId, Hitbox, HitboxId, Hsla, InspectorElementId, InteractiveElement, IntoElement,
@@ -13,6 +13,18 @@ use std::{
     ptr::NonNull,
     rc::{Rc, Weak},
 };
+
+/// Who hears a key press first while a native view is focused
+/// (`Window::native_view_key_order`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum KeyOrder {
+    /// Key bindings, then the view (or, where the window gets the view's keys,
+    /// the view's element) with what they leave.
+    BindingsFirst,
+    /// The view, or the view's element where the window gets its keys; key
+    /// bindings get what it leaves.
+    ViewFirst,
+}
 
 /// Identifies a [`NativeView`] within its window.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -40,8 +52,11 @@ impl NativeViewId {
 /// and its ancestors hear it, elements painted before the view hear nothing
 /// over it, elements painted after the view take theirs, and
 /// [`bounds`](Self::bounds) makes positions view-relative. Keys pressed while
-/// the view's [`FocusHandle`] is focused are dispatched from that element like
-/// any other key press, so the app forwards the ones it wants to the view.
+/// the view's [`FocusHandle`] is focused reach that element's key listeners
+/// before key bindings, as they reach the view itself on macOS, so the app
+/// forwards the ones it wants to the view and stops their propagation; key
+/// bindings get the rest. Bindings for reserved actions and the rest of a
+/// pending binding apply first, as described below.
 /// The rest of this comment describes macOS ([`crate::NativeViewInput::View`]).
 ///
 /// The view is composited beneath the window's GPUI content and shows through
@@ -298,16 +313,18 @@ impl Element for NativeViewElement {
 }
 
 impl Window {
-    /// Tells the platform which native view, if any, the focused handle belongs to.
+    /// Tells the platform which native view, if any, the focused handle belongs
+    /// to, whenever that changes: on a focus change, and on a frame drawn after
+    /// the focused view's last handle was dropped, even with no view left.
     pub(super) fn sync_native_view_focus(&mut self) {
         self.native_views.retain(|view| view.strong_count() > 0);
-        if self.native_views.is_empty() {
-            return;
-        }
         let focused = self
             .focus
             .and_then(|focus| self.native_view_for_focus(focus));
-        self.platform_window.set_focused_native_view(focused);
+        if focused != self.focused_native_view_sent {
+            self.focused_native_view_sent = focused;
+            self.platform_window.set_focused_native_view(focused);
+        }
     }
 
     /// Ends an unfinished composition in the window's own content when keyboard
@@ -361,14 +378,34 @@ impl Window {
         event: KeyDownEvent,
         cx: &mut App,
     ) -> bool {
-        let Some(view) = self
+        match self.native_view_key_order(&event.keystroke, cx) {
+            None | Some(KeyOrder::ViewFirst) => false,
+            Some(KeyOrder::BindingsFirst) => {
+                // The key is GPUI's whether or not anything acts on it. Leaving it to
+                // the view as well would have it dispatched again when the view left it.
+                self.dispatch_event(PlatformInput::KeyDown(event), cx);
+                true
+            }
+        }
+    }
+
+    /// Who hears a key press first while a native view's handle is focused, the
+    /// rule macOS's views follow: key bindings, for a key that continues a
+    /// pending binding or starts one bound to an action the view reserved; the
+    /// view for every other key. `None` while no native view is focused. A
+    /// pending binding the key doesn't continue ends here, as it would in the
+    /// window's own content; left pending, it would be completed by a later key
+    /// even after the view had used this one.
+    pub(super) fn native_view_key_order(
+        &mut self,
+        keystroke: &Keystroke,
+        cx: &mut App,
+    ) -> Option<KeyOrder> {
+        let view = self
             .native_views
             .iter()
             .filter_map(Weak::upgrade)
-            .find(|view| Some(view.focus_handle.id) == self.focus)
-        else {
-            return false;
-        };
+            .find(|view| Some(view.focus_handle.id) == self.focus)?;
         let node_id = self.focus_node_id_in_rendered_frame(self.focus);
         let dispatch_path = self.rendered_frame.dispatch_tree.dispatch_path(node_id);
         let dispatch_tree = &self.rendered_frame.dispatch_tree;
@@ -376,13 +413,13 @@ impl Window {
         let is_pending = pending.is_some();
         let continues_pending = pending.is_some_and(|pending| {
             let mut input = pending.to_vec();
-            input.push(event.keystroke.clone());
+            input.push(keystroke.clone());
             let (bindings, is_pending, _) =
                 dispatch_tree.bindings_for_input(&input, &dispatch_path);
             is_pending || !bindings.is_empty()
         });
         let is_reserved = !continues_pending && {
-            let input = std::slice::from_ref(&event.keystroke);
+            let input = std::slice::from_ref(keystroke);
             let (bindings, _, context_stack) =
                 dispatch_tree.bindings_for_input(input, &dispatch_path);
             let reserved_actions = view.reserved_actions.borrow();
@@ -398,20 +435,13 @@ impl Window {
                     .any(is_reserved)
         };
         if is_pending && !continues_pending {
-            // The pending binding ends here, as it would in the window's own
-            // content. Left pending, it would be completed by a later key even
-            // after the view had used this one.
             self.flush_pending_input(cx);
         }
-        if !continues_pending && !is_reserved {
-            // The key is left for the view like any other. Dispatching it here
-            // as well would dispatch it twice when the view then leaves it.
-            return false;
-        }
-        // The key is GPUI's whether or not anything acts on it. Leaving it to
-        // the view as well would have it dispatched again when the view left it.
-        self.dispatch_event(PlatformInput::KeyDown(event), cx);
-        true
+        // (continues a pending binding, reserved) → order.
+        Some(match (continues_pending, is_reserved) {
+            (true, _) | (false, true) => KeyOrder::BindingsFirst,
+            (false, false) => KeyOrder::ViewFirst,
+        })
     }
 
     /// Focuses the handle of a native view that the platform gave keyboard input to.
@@ -432,10 +462,12 @@ mod tests {
     use super::*;
     use crate::{
         Context, Entity, FocusHandle, InputHandler, KeyBinding, Keystroke, Modifiers, MouseButton,
-        Render, ScaledPixels, TestAppContext, UTF16Selection, VisualTestContext, WindowHandle,
-        canvas, point, prelude::*, px, rgb,
+        MouseDownEvent, MouseMoveEvent, Render, ScaledPixels, ScrollEvent, TestAppContext,
+        UTF16Selection, VisualTestContext, WindowHandle, canvas, point, prelude::*, px, rgb,
     };
     use std::ops::Range;
+
+    mod window_input;
 
     #[gpui::test]
     fn focusing_a_native_view_gives_it_keyboard_input(cx: &mut TestAppContext) {
@@ -462,6 +494,62 @@ mod tests {
             })
             .unwrap();
         assert_eq!(platform_window.focused_native_view(), None);
+    }
+
+    #[gpui::test]
+    fn the_platform_hears_every_change_of_the_focused_native_view(cx: &mut TestAppContext) {
+        let window = open_window(cx);
+        let other_window = open_window(cx);
+        let platform_window = cx.test_window(window.into());
+        let id = window
+            .update(cx, |view, _, _| view.native_view.0.id)
+            .unwrap();
+        type Step = Box<dyn Fn(&mut TestAppContext)>;
+        // (row name, step, the view the platform was last told is focused)
+        let rows: [(&str, Step, Option<NativeViewId>); 3] = [
+            (
+                "focusing the view gives it keyboard input",
+                Box::new(move |cx| {
+                    window
+                        .update(cx, |view, window, cx| {
+                            window.focus(&view.native_view.focus_handle(cx), cx)
+                        })
+                        .unwrap()
+                }),
+                Some(id),
+            ),
+            (
+                // The window's only view goes: its handle is swapped for one of
+                // another window's views. No view is left to compare against.
+                "dropping the focused view's last handle gives the keyboard back",
+                Box::new(move |cx| {
+                    let elsewhere = other_window
+                        .update(cx, |view, _, _| view.native_view.clone())
+                        .unwrap();
+                    window
+                        .update(cx, |view, _, cx| {
+                            view.native_view = elsewhere;
+                            cx.notify();
+                        })
+                        .unwrap();
+                    cx.run_until_parked();
+                }),
+                None,
+            ),
+            (
+                "moving focus with no view left changes nothing",
+                Box::new(move |cx| {
+                    window
+                        .update(cx, |view, window, cx| window.focus(&view.other_focus, cx))
+                        .unwrap()
+                }),
+                None,
+            ),
+        ];
+        for (name, step, focused) in rows {
+            step(cx);
+            assert_eq!(platform_window.focused_native_view(), focused, "{name}");
+        }
     }
 
     #[gpui::test]
@@ -722,7 +810,9 @@ mod tests {
             actions: Vec::new(),
             keys: Vec::new(),
             presses: Vec::new(),
+            view_events: Vec::new(),
             paints_native_view_twice: false,
+            paints_under_view: false,
             unmark_count: 0,
         });
         cx.run_until_parked();
@@ -767,7 +857,13 @@ mod tests {
         /// The key presses dispatched to the window's content.
         keys: Vec<String>,
         presses: Vec<&'static str>,
+        /// The input the native view's own element hears, with positions
+        /// relative to the view.
+        view_events: Vec<String>,
         paints_native_view_twice: bool,
+        /// Paints an element before the view's container, under the view,
+        /// which a view that occludes keeps from the input over it.
+        paints_under_view: bool,
         /// How many times the input handler of the "cover" element was told to
         /// end its composition.
         unmark_count: usize,
@@ -782,10 +878,26 @@ mod tests {
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, _| {
                     this.keys.push(event.keystroke.key.clone())
                 }))
+                .when(self.paints_under_view, |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .top(px(10.))
+                            .left_0()
+                            .size(px(100.))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, _| this.presses.push("under view")),
+                            )
+                            .on_scroll(
+                                cx.listener(|this, _, _, _| this.presses.push("scroll under view")),
+                            ),
+                    )
+                })
                 .child(
                     div()
                         .absolute()
-                        .top_0()
+                        .top(px(10.))
                         .left_0()
                         .size(px(100.))
                         .bg(rgb(0xff0000))
@@ -793,7 +905,35 @@ mod tests {
                             MouseButton::Left,
                             cx.listener(|this, _, _, _| this.presses.push("behind view")),
                         )
-                        .child(self.native_view.clone()),
+                        .child(
+                            self.native_view
+                                .clone()
+                                .into_element()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &MouseDownEvent, window, _| {
+                                        this.view_event("down", event.position, window)
+                                    }),
+                                )
+                                .on_mouse_move(cx.listener(
+                                    |this, event: &MouseMoveEvent, window, _| {
+                                        this.view_event("move", event.position, window)
+                                    },
+                                ))
+                                .on_scroll(cx.listener(|this, event: &ScrollEvent, window, _| {
+                                    this.view_event("scroll", event.position, window)
+                                }))
+                                .on_key_down(cx.listener(
+                                    |this, event: &KeyDownEvent, _, cx| {
+                                        this.view_events
+                                            .push(format!("key {}", event.keystroke.key));
+                                        // The view uses "q" and leaves every other key.
+                                        if event.keystroke.key == "q" {
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                )),
+                        ),
                 )
                 .when(self.paints_native_view_twice, |this| {
                     this.child(
@@ -917,7 +1057,9 @@ mod tests {
             actions: Vec::new(),
             keys: Vec::new(),
             presses: Vec::new(),
+            view_events: Vec::new(),
             paints_native_view_twice: false,
+            paints_under_view: false,
             unmark_count: 0,
         })
     }
