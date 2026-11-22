@@ -11,6 +11,7 @@ use wasm_bindgen::prelude::*;
 use web_time::Instant;
 
 use crate::ime_mirror::ImeMirror;
+use crate::native_view_layout::PointerTarget;
 use crate::window::WebWindowInner;
 
 pub struct WebEventListeners {
@@ -27,6 +28,25 @@ pub(crate) struct EventListenerHandle {
     target: web_sys::EventTarget,
     event_name: &'static str,
     closure: Closure<dyn FnMut(JsValue)>,
+    /// The phase it was registered for, which removal must match.
+    phase: Phase,
+}
+
+/// Which phase of an event's dispatch a listener runs in.
+#[derive(Clone, Copy)]
+pub(crate) enum Phase {
+    Bubble,
+    /// Before the event's target sees it (native views decide who takes the pointer there).
+    Capture,
+}
+
+impl Phase {
+    fn is_capture(self) -> bool {
+        match self {
+            Phase::Bubble => false,
+            Phase::Capture => true,
+        }
+    }
 }
 
 impl EventListenerHandle {
@@ -43,6 +63,7 @@ impl EventListenerHandle {
             target: target.clone(),
             event_name,
             closure,
+            phase: Phase::Bubble,
         }
     }
 
@@ -55,11 +76,22 @@ impl EventListenerHandle {
         event_name: &'static str,
         handler: impl FnMut(JsValue) + 'static,
     ) -> Self {
+        Self::add_non_passive_in(target, event_name, Phase::Bubble, handler)
+    }
+
+    /// [`EventListenerHandle::add_non_passive`] in either phase.
+    pub(crate) fn add_non_passive_in(
+        target: &web_sys::EventTarget,
+        event_name: &'static str,
+        phase: Phase,
+        handler: impl FnMut(JsValue) + 'static,
+    ) -> Self {
         let closure = Closure::<dyn FnMut(JsValue)>::new(handler);
         let target_js: &JsValue = target.as_ref();
         let callback_js: &JsValue = closure.as_ref();
         let options = js_sys::Object::new();
         js_sys::Reflect::set(&options, &"passive".into(), &false.into()).ok();
+        js_sys::Reflect::set(&options, &"capture".into(), &phase.is_capture().into()).ok();
         if let Ok(add_fn_val) = js_sys::Reflect::get(target_js, &"addEventListener".into()) {
             if let Ok(add_fn) = add_fn_val.dyn_into::<js_sys::Function>() {
                 add_fn
@@ -71,6 +103,7 @@ impl EventListenerHandle {
             target: target.clone(),
             event_name,
             closure,
+            phase,
         }
     }
 }
@@ -78,9 +111,10 @@ impl EventListenerHandle {
 impl Drop for EventListenerHandle {
     fn drop(&mut self) {
         self.target
-            .remove_event_listener_with_callback(
+            .remove_event_listener_with_callback_and_bool(
                 self.event_name,
                 self.closure.as_ref().unchecked_ref(),
+                self.phase.is_capture(),
             )
             .ok();
     }
@@ -620,6 +654,10 @@ impl WebWindowInner {
     fn register_pointer_leave(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
         self.listen("pointerleave", move |event: JsValue| {
+            // The canvas let the pointer through to a native view's element: it is still over the window.
+            if this.native_views.target() == PointerTarget::Views {
+                return;
+            }
             let event: web_sys::PointerEvent = event.unchecked_into();
 
             let position = pointer_position_in_element(&event);

@@ -410,6 +410,7 @@ impl WebWindow {
                     })
                 },
             );
+            inner.update_native_view_shields();
         })
     }
 }
@@ -499,6 +500,7 @@ impl WebWindowInner {
                     })
                 },
             );
+            this.update_native_view_shields();
         });
 
         let js_func: js_sys::Function =
@@ -1111,6 +1113,17 @@ impl PlatformWindow for WebWindow {
         // SAFETY: `NativeView::new`'s contract on the web: `view` points to a live `web_sys::HtmlElement`.
         let content = unsafe { view.cast::<web_sys::HtmlElement>().as_ref() }.clone();
         self.inner.attach_native_view(id, content)
+    }
+
+    fn on_hit_test_native_view(
+        &self,
+        callback: Box<dyn FnMut(Point<Pixels>) -> Option<gpui::NativeViewId>>,
+    ) {
+        self.inner.native_views.set_hit_test(callback);
+    }
+
+    fn on_native_view_occluders(&self, callback: Box<dyn FnMut() -> Vec<Bounds<Pixels>>>) {
+        self.inner.native_views.set_occluders(callback);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

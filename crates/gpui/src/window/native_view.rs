@@ -57,7 +57,9 @@ impl NativeViewId {
 /// forwards the ones it wants to the view and stops their propagation; key
 /// bindings get the rest. Bindings for reserved actions and the rest of a
 /// pending binding apply first, as described below.
-/// The rest of this comment describes macOS ([`crate::NativeViewInput::View`]).
+/// The rest of this comment describes macOS and the web
+/// ([`crate::NativeViewInput::View`]), where the browser gives pointer input
+/// over an uncovered view to its element.
 ///
 /// The view is composited beneath the window's GPUI content and shows through
 /// wherever this handle is used as an element, so elements painted after it

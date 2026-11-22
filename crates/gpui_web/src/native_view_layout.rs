@@ -1,5 +1,5 @@
-//! Native views on the web, the decisions: where a view's DOM element goes under the canvas. Pure, so it is tested
-//! on any host; `native_views.rs` is the DOM shell.
+//! Native views on the web, the decisions: where a view's DOM element goes under the canvas, and whether the canvas
+//! or the element under it takes the pointer. Pure, so it is tested on any host; `native_views.rs` is the DOM shell.
 
 use gpui::{Bounds, PaintNativeView, Pixels, ScaledPixels, native_view_placement, point, px, size};
 
@@ -31,6 +31,119 @@ pub(crate) fn placement(native_view: &PaintNativeView, scale_factor: f32) -> Opt
             native_view.bounds.size,
         ),
     })
+}
+
+/// Who the browser hit-tests the pointer to while a view shows: GPUI's canvas, or what is under it (the canvas's
+/// `pointer-events: none`), where an uncovered view's element takes trusted events of its own (an iframe's clicks
+/// and scrolls, a video's controls) and the native view layer and its shields take the rest back for GPUI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PointerTarget {
+    /// The canvas's own `pointer-events: auto`, before any view shows.
+    #[default]
+    Canvas,
+    Views,
+}
+
+/// A pointer event seen by the document's capture listener, or a frame that placed views.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PointerKind {
+    /// `pointermove` with no button pressed.
+    Hover,
+    /// `pointermove` with a button pressed: the press's target keeps it.
+    Drag,
+    Press,
+    Wheel,
+    /// A mouse or pen `pointerup` / `pointercancel`.
+    Release,
+    /// A touch `pointerup` / `pointercancel`: a touch has no hover to switch on, so the next one must find the
+    /// view's element, and the layer and shields send it back if it lands on GPUI's content.
+    TouchRelease,
+    /// A frame placed views while no button is pressed: content may have moved a view under a still pointer, whose
+    /// next wheel tick must already find the element.
+    Placed,
+}
+
+/// What GPUI's hit test says is at the pointer (`hit_test_native_view`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Over {
+    /// A view with no GPUI hitbox above it there.
+    View,
+    Window,
+}
+
+/// What the browser gave the event to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Hit {
+    Canvas,
+    /// The native view layer itself or a shield: GPUI's, standing in for the canvas.
+    Cover,
+    /// Inside a view's slot: the app's element.
+    Element,
+    /// Page content outside the window, none of GPUI's business.
+    Outside,
+}
+
+/// Where the capture listener sends a copy of the event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Send {
+    Nothing,
+    /// GPUI's content is there, but the browser gave the event to the layer or a shield.
+    Canvas,
+    /// A view is there, but a shield from an earlier frame took the event: the shields are refreshed and the copy
+    /// goes to the element now under the pointer.
+    ElementUnder,
+}
+
+/// What the capture listener does with an event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Step {
+    pub(crate) target: PointerTarget,
+    pub(crate) send: Send,
+}
+
+/// `current × event → step`. Every arm is explicit: extend by adding a `PointerKind`, `Over` or `Hit` and its arms.
+pub(crate) fn step(current: PointerTarget, kind: PointerKind, over: Over, hit: Hit) -> Step {
+    use PointerKind::*;
+    let to = |target, send| Step { target, send };
+    match (kind, over, hit) {
+        (
+            Drag,
+            Over::View | Over::Window,
+            Hit::Canvas | Hit::Cover | Hit::Element | Hit::Outside,
+        ) => to(current, Send::Nothing),
+        (
+            Hover | Press | Wheel | Release | TouchRelease,
+            Over::View | Over::Window,
+            Hit::Outside,
+        ) => to(current, Send::Nothing),
+        (TouchRelease, Over::View | Over::Window, Hit::Canvas | Hit::Cover | Hit::Element) => {
+            to(PointerTarget::Views, Send::Nothing)
+        }
+        (Hover | Press | Wheel | Release, Over::View, Hit::Canvas | Hit::Element) => {
+            to(PointerTarget::Views, Send::Nothing)
+        }
+        (Hover | Press | Wheel | Release, Over::View, Hit::Cover) => {
+            to(PointerTarget::Views, Send::ElementUnder)
+        }
+        (Hover | Press | Wheel, Over::Window, Hit::Cover) => {
+            to(PointerTarget::Canvas, Send::Canvas)
+        }
+        // The element keeps this one event; the canvas takes the next (the shield goes up after the frame).
+        (Hover | Press | Wheel, Over::Window, Hit::Canvas | Hit::Element) => {
+            to(PointerTarget::Canvas, Send::Nothing)
+        }
+        // A release off the canvas ends a press GPUI never had (the press's target captured it otherwise).
+        (Release, Over::Window, Hit::Canvas | Hit::Cover | Hit::Element) => {
+            to(PointerTarget::Canvas, Send::Nothing)
+        }
+        (Placed, Over::View, Hit::Canvas | Hit::Cover | Hit::Element | Hit::Outside) => {
+            to(PointerTarget::Views, Send::Nothing)
+        }
+        // A touch's views keep the pointer; a mouse over GPUI's content lands on the layer, which sends it back.
+        (Placed, Over::Window, Hit::Canvas | Hit::Cover | Hit::Element | Hit::Outside) => {
+            to(current, Send::Nothing)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -80,6 +193,58 @@ mod tests {
                 view: css(view),
             });
             assert_eq!(placement(&view(bounds, mask), scale), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn pointer_target_steps() {
+        use Hit::{Canvas as OnCanvas, Cover, Element, Outside};
+        use Over::{View, Window};
+        use PointerKind::*;
+        use PointerTarget::{Canvas, Views};
+        // (row name, current, event, over, what the browser hit, next target, copy sent). One row per
+        // (state, event), rejected ones included.
+        #[rustfmt::skip]
+        let rows = [
+            ("hover onto an uncovered view", Canvas, Hover, View, OnCanvas, Views, Send::Nothing),
+            ("hover within a view's element", Views, Hover, View, Element, Views, Send::Nothing),
+            ("hover onto GPUI's content from a view", Views, Hover, Window, Cover, Canvas, Send::Canvas),
+            ("hover over GPUI's content", Canvas, Hover, Window, OnCanvas, Canvas, Send::Nothing),
+            ("hover where GPUI's content covers an element before its shield", Views, Hover, Window, Element, Canvas, Send::Nothing),
+            ("hover on a stale shield over a view", Views, Hover, View, Cover, Views, Send::ElementUnder),
+            ("drag from the canvas over a view", Canvas, Drag, Window, OnCanvas, Canvas, Send::Nothing),
+            ("drag from a view over GPUI's content", Views, Drag, Window, Cover, Views, Send::Nothing),
+            ("drag outside the window", Views, Drag, Window, Outside, Views, Send::Nothing),
+            ("press on a view the canvas still had", Canvas, Press, View, OnCanvas, Views, Send::Nothing),
+            ("press on a view's element", Views, Press, View, Element, Views, Send::Nothing),
+            ("press on a shield over a view", Views, Press, Window, Cover, Canvas, Send::Canvas),
+            ("press on a stale shield over a view", Views, Press, View, Cover, Views, Send::ElementUnder),
+            ("press on GPUI's content", Canvas, Press, Window, OnCanvas, Canvas, Send::Nothing),
+            ("wheel over a view's element", Views, Wheel, View, Element, Views, Send::Nothing),
+            ("wheel over a shield", Views, Wheel, Window, Cover, Canvas, Send::Canvas),
+            ("wheel over a stale shield", Views, Wheel, View, Cover, Views, Send::ElementUnder),
+            ("wheel over GPUI's content", Canvas, Wheel, Window, OnCanvas, Canvas, Send::Nothing),
+            ("mouse release over a view", Canvas, Release, View, OnCanvas, Views, Send::Nothing),
+            ("mouse release on a stale shield", Views, Release, View, Cover, Views, Send::ElementUnder),
+            ("mouse release on the layer", Views, Release, Window, Cover, Canvas, Send::Nothing),
+            ("mouse release on the canvas", Canvas, Release, Window, OnCanvas, Canvas, Send::Nothing),
+            ("touch release on GPUI's content", Canvas, TouchRelease, Window, OnCanvas, Views, Send::Nothing),
+            ("touch release on a view", Views, TouchRelease, View, Element, Views, Send::Nothing),
+            ("hover outside the window", Views, Hover, Window, Outside, Views, Send::Nothing),
+            ("press outside the window", Canvas, Press, Window, Outside, Canvas, Send::Nothing),
+            ("wheel outside the window", Views, Wheel, Window, Outside, Views, Send::Nothing),
+            ("mouse release outside the window", Views, Release, Window, Outside, Views, Send::Nothing),
+            ("touch release outside the window", Canvas, TouchRelease, Window, Outside, Canvas, Send::Nothing),
+            ("content moved a view under a still pointer", Canvas, Placed, View, OnCanvas, Views, Send::Nothing),
+            ("content moved over a touch's views", Views, Placed, Window, OnCanvas, Views, Send::Nothing),
+            ("a frame with the pointer on GPUI's content", Canvas, Placed, Window, OnCanvas, Canvas, Send::Nothing),
+        ];
+        for (name, current, kind, over, hit, target, send) in rows {
+            assert_eq!(
+                step(current, kind, over, hit),
+                Step { target, send },
+                "{name}"
+            );
         }
     }
 }
