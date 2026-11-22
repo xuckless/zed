@@ -115,6 +115,16 @@ impl CosmicTextSystem {
         Ok((gpui::FontWeight(face.weight.0 as f32), style))
     }
 
+    /// The font database face a `FontId` was loaded from, so an outer text system can tell which
+    /// font file a shaped run's glyphs come from (fallback faces included).
+    pub fn font_database_id(&self, font_id: FontId) -> Option<cosmic_text::fontdb::ID> {
+        self.0
+            .read()
+            .loaded_fonts
+            .get(font_id.0)
+            .map(|loaded_font| loaded_font.font.id())
+    }
+
     /// Builds reports for unresolved source indices after an outer text system
     /// has applied its own fallback.
     pub fn missing_glyphs(
