@@ -1526,6 +1526,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 
     fn play_system_bell(&self) {}
 
+    /// Plays a haptic ([`Window::perform_haptic`](crate::Window::perform_haptic)).
+    /// The default plays nothing, as on desktops, where Flutter plays none.
+    fn perform_haptic(&self, _haptic: crate::Haptic) {}
+
     /// Initialize the accessibility adapter with callbacks.
     fn a11y_init(&self, _callbacks: A11yCallbacks) {}
 

@@ -58,6 +58,15 @@ use std::{
 
 const KEYBOARD_DISMISS_DISTANCE: Pixels = px(24.);
 
+// AudioToolbox's system sounds, for `Haptic::Vibrate` (no objc2 crate is
+// vendored for AudioToolbox; the one function is declared here).
+#[link(name = "AudioToolbox", kind = "framework")]
+unsafe extern "C" {
+    fn AudioServicesPlaySystemSound(sound: u32);
+}
+/// `kSystemSoundID_Vibrate` (AudioServices.h).
+const K_SYSTEM_SOUND_ID_VIBRATE: u32 = 0x0000_0FFF;
+
 #[derive(Clone, Copy)]
 struct KeyboardDismissTouch {
     id: TouchId,
@@ -1040,6 +1049,47 @@ impl PlatformWindow for IosWindow {
 
     fn hide_soft_keyboard(&self) {
         self.hide_keyboard();
+    }
+
+    // Ported from flutter/flutter engine/src/flutter/shell/platform/darwin/ios/
+    // framework/Source/FlutterPlatformPlugin.mm (`vibrateHapticFeedback:`) @ 3.50.1
+    // (ae9b586f34a8443573f82ef57c3bf914a908cbf7). Copyright 2014 The Flutter
+    // Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
+    // A fresh generator per call, as Flutter's; the match is exhaustive, one arm
+    // per Flutter branch.
+    #[allow(
+        deprecated,
+        reason = "Flutter's initWithStyle:, deprecated by iOS 17.5's feedbackGeneratorWithStyle:forView:"
+    )]
+    fn perform_haptic(&self, haptic: gpui::Haptic) {
+        use gpui::Haptic;
+        use objc2_ui_kit::{
+            UIImpactFeedbackGenerator, UIImpactFeedbackStyle, UINotificationFeedbackGenerator,
+            UINotificationFeedbackType, UISelectionFeedbackGenerator,
+        };
+        let main_thread = self.view.mtm();
+        let impact = |style| {
+            UIImpactFeedbackGenerator::initWithStyle(
+                UIImpactFeedbackGenerator::alloc(main_thread),
+                style,
+            )
+            .impactOccurred()
+        };
+        let notification =
+            |kind| UINotificationFeedbackGenerator::new(main_thread).notificationOccurred(kind);
+        match haptic {
+            // SAFETY: a C call taking a system sound id; it has no other inputs.
+            Haptic::Vibrate => unsafe { AudioServicesPlaySystemSound(K_SYSTEM_SOUND_ID_VIBRATE) },
+            Haptic::LightImpact => impact(UIImpactFeedbackStyle::Light),
+            Haptic::MediumImpact => impact(UIImpactFeedbackStyle::Medium),
+            Haptic::HeavyImpact => impact(UIImpactFeedbackStyle::Heavy),
+            Haptic::SelectionClick => {
+                UISelectionFeedbackGenerator::new(main_thread).selectionChanged()
+            }
+            Haptic::SuccessNotification => notification(UINotificationFeedbackType::Success),
+            Haptic::WarningNotification => notification(UINotificationFeedbackType::Warning),
+            Haptic::ErrorNotification => notification(UINotificationFeedbackType::Error),
+        }
     }
 
     fn text_input_state_changed(&self, change: TextInputStateChange) {

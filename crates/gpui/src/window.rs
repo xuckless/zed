@@ -3971,6 +3971,14 @@ impl Window {
             .fling_velocity(cx.background_executor().now())
     }
 
+    /// Plays a haptic on the platform (Flutter's `HapticFeedback` calls); a
+    /// platform without haptics, such as a desktop, plays nothing. GPUI plays
+    /// [`GestureTuning::long_press_haptic`](crate::GestureTuning) itself when
+    /// a long press is claimed.
+    pub fn perform_haptic(&self, haptic: crate::Haptic) {
+        self.platform_window.perform_haptic(haptic);
+    }
+
     /// Restarts touch recognition with the tuning a test passes, in place of
     /// the platform's.
     #[cfg(test)]
@@ -6728,6 +6736,12 @@ impl Window {
                     self.touch_gestures.resolve_long_press(claimed);
                     if !claimed {
                         self.long_press_capture = None;
+                    }
+                    // Flutter's widgets play `Feedback.forLongPress` when they
+                    // handle a long press; claiming it is GPUI's handling.
+                    if claimed && let Some(haptic) = self.touch_gestures.tuning().long_press_haptic
+                    {
+                        self.perform_haptic(haptic);
                     }
                 }
                 if ended {
@@ -10766,6 +10780,57 @@ mod tests {
             } else {
                 assert_eq!(phases.as_slice(), [TouchPhase::Started]);
             }
+        }
+    }
+
+    #[gpui::test]
+    fn claimed_long_press_plays_the_tuning_haptic_once(cx: &mut TestAppContext) {
+        use crate::Haptic;
+        // (name, how the element answers the long press, the tuning's
+        // `long_press_haptic`, haptics played over the whole press).
+        let rows = [
+            (
+                "claimed, Android's Feedback.forLongPress: vibrate once",
+                LongPressResponse::PreventDefault,
+                Some(Haptic::Vibrate),
+                vec![Haptic::Vibrate],
+            ),
+            (
+                "claimed, iOS's Feedback.forLongPress: heavy impact once",
+                LongPressResponse::PreventDefault,
+                Some(Haptic::HeavyImpact),
+                vec![Haptic::HeavyImpact],
+            ),
+            (
+                "unclaimed: no element handled it, nothing plays",
+                LongPressResponse::None,
+                Some(Haptic::Vibrate),
+                vec![],
+            ),
+            (
+                "claimed, a desktop's none: nothing plays",
+                LongPressResponse::PreventDefault,
+                None,
+                vec![],
+            ),
+        ];
+        for (name, response, long_press_haptic, expected) in rows {
+            cx.update(|cx| {
+                cx.set_gesture_tuning(GestureTuning {
+                    long_press_haptic,
+                    ..GestureTuning::default()
+                })
+            });
+            let window = cx.add_window(move |_, _| LongPressListener {
+                phases: Rc::default(),
+                response,
+            });
+            dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 0.);
+            cx.executor().advance_clock(Duration::from_millis(501));
+            cx.executor().run_until_parked();
+            dispatch_touch(window, cx, TouchId(1), TouchPhase::Moved, 2.);
+            dispatch_touch(window, cx, TouchId(1), TouchPhase::Ended, 2.);
+            assert_eq!(cx.test_window(window.into()).haptics(), expected, "{name}");
         }
     }
 

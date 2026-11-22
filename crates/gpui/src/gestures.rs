@@ -163,6 +163,33 @@ pub struct GestureTuning {
     /// edge, unless a container sets its own
     /// ([`StatefulInteractiveElement::overscroll`](crate::StatefulInteractiveElement::overscroll)).
     pub overscroll: Overscroll,
+    /// The haptic the window plays when an element claims a long press
+    /// (Flutter's `Feedback.forLongPress`, which its widgets call when they
+    /// handle one), or `None` for none.
+    pub long_press_haptic: Option<Haptic>,
+}
+
+/// A haptic the platform plays through [`Window::perform_haptic`](crate::Window::perform_haptic):
+/// one of Flutter's `HapticFeedback` calls (services/haptic_feedback.dart).
+/// Each backend maps every kind to its own feedback; desktops play none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Haptic {
+    /// `HapticFeedback.vibrate`: a short vibration.
+    Vibrate,
+    /// `HapticFeedback.lightImpact`.
+    LightImpact,
+    /// `HapticFeedback.mediumImpact`.
+    MediumImpact,
+    /// `HapticFeedback.heavyImpact`.
+    HeavyImpact,
+    /// `HapticFeedback.selectionClick`: a selection moved by one value.
+    SelectionClick,
+    /// `HapticFeedback.successNotification`.
+    SuccessNotification,
+    /// `HapticFeedback.warningNotification`.
+    WarningNotification,
+    /// `HapticFeedback.errorNotification`.
+    ErrorNotification,
 }
 
 // Flutter's gesture constants (constants.rs), whose recognizer tests these
@@ -186,6 +213,8 @@ impl Default for GestureTuning {
             velocity_tracker: VelocityTrackerKind::IOSScrollViewFling,
             // GPUI's hard stop at the edge; platforms that overscroll set it.
             overscroll: Overscroll::None,
+            // Platform feel, not a constant: a platform or app that wants one sets it.
+            long_press_haptic: None,
         }
     }
 }

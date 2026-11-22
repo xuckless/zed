@@ -825,6 +825,41 @@ impl PlatformWindow for WebWindow {
         }
     }
 
+    // Ported from flutter/flutter engine/src/flutter/lib/web_ui/lib/src/engine/
+    // platform_dispatcher.dart (`HapticFeedback.vibrate`, `_getHapticFeedbackDuration`)
+    // and safe_browser_api.dart (`vibrate`) @ 3.50.1
+    // (ae9b586f34a8443573f82ef57c3bf914a908cbf7). Copyright 2014 The Flutter
+    // Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
+    // Browsers without `navigator.vibrate` (Safari) play nothing, as in Flutter web.
+    fn perform_haptic(&self, haptic: gpui::Haptic) {
+        use gpui::Haptic;
+        #[allow(non_upper_case_globals, reason = "Flutter's names")]
+        const vibrateLongPress: u32 = 50;
+        #[allow(non_upper_case_globals, reason = "Flutter's names")]
+        const vibrateLightImpact: u32 = 10;
+        #[allow(non_upper_case_globals, reason = "Flutter's names")]
+        const vibrateMediumImpact: u32 = 20;
+        #[allow(non_upper_case_globals, reason = "Flutter's names")]
+        const vibrateHeavyImpact: u32 = 30;
+        #[allow(non_upper_case_globals, reason = "Flutter's names")]
+        const vibrateSelectionClick: u32 = 10;
+        // Kind -> milliseconds; exhaustive, so a new kind can't be missed.
+        let duration_ms = match haptic {
+            Haptic::LightImpact => vibrateLightImpact,
+            Haptic::MediumImpact => vibrateMediumImpact,
+            Haptic::HeavyImpact => vibrateHeavyImpact,
+            Haptic::SelectionClick => vibrateSelectionClick,
+            Haptic::SuccessNotification => vibrateMediumImpact,
+            Haptic::WarningNotification => vibrateMediumImpact,
+            Haptic::ErrorNotification => vibrateHeavyImpact,
+            Haptic::Vibrate => vibrateLongPress,
+        };
+        let navigator = self.inner.browser_window.navigator();
+        if js_sys::Reflect::has(&navigator, &JsValue::from_str("vibrate")).unwrap_or(false) {
+            navigator.vibrate_with_duration(duration_ms);
+        }
+    }
+
     fn visual_viewport_bounds(&self) -> Bounds<Pixels> {
         self.inner.viewport.borrow().visible_bounds
     }

@@ -49,6 +49,7 @@ pub(crate) struct TestWindowState {
     insets_callback: Option<Box<dyn FnMut(WindowInsets)>>,
     virtual_keyboard_requests: usize,
     virtual_keyboard_dismissals: usize,
+    haptics: Vec<crate::Haptic>,
     composition_ends: usize,
     moved_callback: Option<Box<dyn FnMut()>>,
     display_changed_callback: Option<Box<dyn FnMut()>>,
@@ -125,6 +126,7 @@ impl TestWindow {
             insets: WindowInsets::default(),
             insets_callback: None,
             virtual_keyboard_requests: 0,
+            haptics: Vec::new(),
             virtual_keyboard_dismissals: 0,
             composition_ends: 0,
             moved_callback: None,
@@ -236,6 +238,11 @@ impl TestWindow {
 
     pub fn virtual_keyboard_dismissals(&self) -> usize {
         self.0.lock().virtual_keyboard_dismissals
+    }
+
+    /// The haptics GPUI played on this window, oldest first.
+    pub fn haptics(&self) -> Vec<crate::Haptic> {
+        self.0.lock().haptics.clone()
     }
 
     /// How many times GPUI ended a composition on the platform ([`PlatformWindow::end_composition`]).
@@ -411,6 +418,10 @@ impl PlatformWindow for TestWindow {
 
     fn hide_soft_keyboard(&self) {
         self.0.lock().virtual_keyboard_dismissals += 1;
+    }
+
+    fn perform_haptic(&self, haptic: crate::Haptic) {
+        self.0.lock().haptics.push(haptic);
     }
 
     fn bounds(&self) -> Bounds<Pixels> {
