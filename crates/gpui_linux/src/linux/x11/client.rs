@@ -628,6 +628,10 @@ impl X11Client {
                         XDPEvent::CursorTheme(_) | XDPEvent::CursorSize(_) => {
                             // noop, X11 manages this for us.
                         }
+                        XDPEvent::Motion(report) => {
+                            let common = client.0.borrow().common.clone();
+                            LinuxCommon::handle_portal_motion(&common, report);
+                        }
                     }
                 }
             })

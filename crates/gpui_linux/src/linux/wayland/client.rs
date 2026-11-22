@@ -1201,6 +1201,12 @@ impl WaylandConnection {
                             client.cursor.set_size(size);
                         }
                     }
+                    XDPEvent::Motion(report) => {
+                        if let Some(client) = client.0.upgrade() {
+                            let common = client.borrow().common.clone();
+                            LinuxCommon::handle_portal_motion(&common, report);
+                        }
+                    }
                 }
             }),
             "failed to register desktop portal source",

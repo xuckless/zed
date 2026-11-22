@@ -10,6 +10,8 @@ use smol::stream::StreamExt;
 
 use gpui::{BackgroundExecutor, Task, WindowAppearance};
 
+use crate::linux::{MotionReport, MotionSetting, PortalMotion};
+
 pub enum Event {
     WindowAppearance(WindowAppearance),
     #[cfg_attr(feature = "x11", allow(dead_code))]
@@ -17,6 +19,7 @@ pub enum Event {
     #[cfg_attr(feature = "x11", allow(dead_code))]
     CursorSize(u32),
     ButtonLayout(String),
+    Motion(MotionReport),
 }
 
 /// Forwards desktop settings from the portal to the event loop.
@@ -73,6 +76,22 @@ async fn listen(sender: Sender<Event>) -> anyhow::Result<()> {
         sender.send(Event::ButtonLayout(initial_layout))?;
     }
 
+    // Both motion keys in one startup report, sent even when the portal has neither.
+    let mut motion = PortalMotion::default();
+    if let Ok(initial) = settings
+        .read::<u32>("org.freedesktop.appearance", "reduced-motion")
+        .await
+    {
+        motion = motion.with(MotionSetting::ReducedMotion(initial));
+    }
+    if let Ok(initial) = settings
+        .read::<bool>("org.gnome.desktop.interface", "enable-animations")
+        .await
+    {
+        motion = motion.with(MotionSetting::EnableAnimations(initial));
+    }
+    sender.send(Event::Motion(MotionReport::Read(motion)))?;
+
     // Each listener runs until its stream or the channel closes. They're joined rather than
     // spawned, so that cancelling this future cancels them all.
     let mut listeners: Vec<BoxFuture<'_, anyhow::Result<()>>> = Vec::new();
@@ -111,6 +130,39 @@ async fn listen(sender: Sender<Event>) -> anyhow::Result<()> {
         listeners.push(Box::pin(async move {
             while let Some(layout) = button_layout_changed.next().await {
                 sender.send(Event::ButtonLayout(layout?))?;
+            }
+            anyhow::Ok(())
+        }));
+    }
+
+    if let Ok(mut reduced_motion_changed) = settings
+        .receive_setting_changed_with_args::<u32>("org.freedesktop.appearance", "reduced-motion")
+        .await
+    {
+        let sender = sender.clone();
+        listeners.push(Box::pin(async move {
+            while let Some(value) = reduced_motion_changed.next().await {
+                sender.send(Event::Motion(MotionReport::Changed(
+                    MotionSetting::ReducedMotion(value?),
+                )))?;
+            }
+            anyhow::Ok(())
+        }));
+    }
+
+    if let Ok(mut enable_animations_changed) = settings
+        .receive_setting_changed_with_args::<bool>(
+            "org.gnome.desktop.interface",
+            "enable-animations",
+        )
+        .await
+    {
+        let sender = sender.clone();
+        listeners.push(Box::pin(async move {
+            while let Some(value) = enable_animations_changed.next().await {
+                sender.send(Event::Motion(MotionReport::Changed(
+                    MotionSetting::EnableAnimations(value?),
+                )))?;
             }
             anyhow::Ok(())
         }));
