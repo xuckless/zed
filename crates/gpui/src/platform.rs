@@ -555,6 +555,27 @@ pub trait Platform: 'static {
     /// Registers a callback invoked when the reported power mode changes.
     fn on_power_mode_change(&self, _callback: Box<dyn FnMut()>) {}
 
+    /// The OS's reduce-motion and reduce-transparency settings now. GPUI's app reads them at startup into
+    /// [`App::reduce_motion`](crate::App::reduce_motion) and
+    /// [`App::reduce_transparency`](crate::App::reduce_transparency). A platform that does not read them reports
+    /// neither; one that reads them asynchronously returns `None` until it has, and reports them once through the
+    /// change callback, which the app takes as the startup value.
+    fn accessibility_display_settings(&self) -> Option<AccessibilityDisplaySettings> {
+        Some(AccessibilityDisplaySettings {
+            reduce_motion: false,
+            reduce_transparency: false,
+        })
+    }
+    /// Registers a callback invoked with the settings when the user changes one (a backend may report both when
+    /// either moves, or on a notification for another setting: the app applies only what moved). Backends call it
+    /// outside any GPUI borrow: where the OS may notify inside another platform callback, they defer it to the
+    /// foreground executor.
+    fn on_accessibility_display_settings_change(
+        &self,
+        _callback: Box<dyn FnMut(AccessibilityDisplaySettings)>,
+    ) {
+    }
+
     /// Sets the application's process-wide identity and user-visible name.
     ///
     /// The identifier is used for platform identity mechanisms such as the
@@ -744,6 +765,17 @@ pub struct SystemNotificationResponse {
     /// The pressed action button's [`SystemNotificationAction::id`], or
     /// `None` when the user activated the notification body itself.
     pub action_id: Option<SharedString>,
+}
+
+/// The OS's accessibility display settings that GPUI follows ([`Platform::accessibility_display_settings`]): Apple
+/// calls them "Reduce motion" and "Reduce transparency", Android "Remove animations", the web
+/// `prefers-reduced-motion` and `prefers-reduced-transparency`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccessibilityDisplaySettings {
+    /// The user asked for less motion: non-essential animations render a static frame.
+    pub reduce_motion: bool,
+    /// The user asked for less transparency: translucent materials draw opaque.
+    pub reduce_transparency: bool,
 }
 
 /// The operating system's preference for energy use versus performance.

@@ -45,16 +45,16 @@ use crate::InspectorElementRegistry;
 use crate::asset_cache::CachedLoad;
 use crate::subscription::SingleSubscriberSet;
 use crate::{
-    Action, ActionBuildError, ActionRegistry, ActivationPolicy, ActivityGuard, Any, AnyView,
-    AnyWindowHandle, AppContext, AppLifecyclePhase, Arena, ArenaBox, Asset, AssetSource,
-    BackgroundExecutor, Bounds, ClipboardItem, ClipboardReadError, CursorStyle, DispatchPhase,
-    DisplayChanges, DisplayEvent, DisplayId, EventEmitter, ExternalDragPayload, FocusHandle,
-    FocusMap, ForegroundExecutor, GestureTuning, Global, KeyBinding, KeyContext, Keymap, Keystroke,
-    LayoutId, Menu, MenuItem, MissingGlyph, OwnedMenu, PathPromptOptions, Pixels, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point, PowerMode, Priority,
-    PromptBuilder, PromptButton, PromptHandle, PromptLevel, Render, RenderImage,
-    RenderablePromptHandle, Reservation, ScreenCaptureSource, SharedString, SubscriberSet,
-    Subscription, SvgRenderer, SystemNotification, SystemNotificationResponse, Task,
+    AccessibilityDisplaySettings, Action, ActionBuildError, ActionRegistry, ActivationPolicy,
+    ActivityGuard, Any, AnyView, AnyWindowHandle, AppContext, AppLifecyclePhase, Arena, ArenaBox,
+    Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, ClipboardReadError, CursorStyle,
+    DispatchPhase, DisplayChanges, DisplayEvent, DisplayId, EventEmitter, ExternalDragPayload,
+    FocusHandle, FocusMap, ForegroundExecutor, GestureTuning, Global, KeyBinding, KeyContext,
+    Keymap, Keystroke, LayoutId, Menu, MenuItem, MissingGlyph, OwnedMenu, PathPromptOptions,
+    Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point,
+    PowerMode, Priority, PromptBuilder, PromptButton, PromptHandle, PromptLevel, Render,
+    RenderImage, RenderablePromptHandle, Reservation, ScreenCaptureSource, SharedString,
+    SubscriberSet, Subscription, SvgRenderer, SystemNotification, SystemNotificationResponse, Task,
     TextRenderingMode, TextSystem, ThermalState, Window, WindowAppearance, WindowBounds,
     WindowButtonLayout, WindowHandle, WindowId, WindowInvalidator, WindowingRequest,
     colors::{Colors, GlobalColors},
@@ -975,6 +975,9 @@ pub struct App {
     pub(crate) mode: GpuiMode,
     pub(crate) cursor_hide_mode: CursorHideMode,
     pub(crate) reduce_motion: bool,
+    reduce_transparency: bool,
+    /// What the app follows of the OS's display settings ([`App::follow_os_display`]).
+    os_display: OsDisplay,
     /// The app's override of the platform's gesture tuning, set by [`App::set_gesture_tuning`].
     gesture_tuning: Option<GestureTuning>,
     /// Origin of the shared clock that phase-locks synced repeating animations.
@@ -1000,6 +1003,34 @@ pub(crate) struct WindowUpdateEntry {
     display_id: Option<DisplayId>,
 }
 
+/// Who last set one of the OS display settings the app follows (`App::reduce_motion`, `App::reduce_transparency`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SetBy {
+    Os,
+    /// The app's own `set_reduce_*`.
+    App,
+}
+
+/// The OS display settings as the app follows them: the platform's last report (`None` while a platform that reads
+/// them late, Linux's desktop portal, has not answered) and who set each of the app's values.
+struct OsDisplay {
+    last: Option<AccessibilityDisplaySettings>,
+    motion: SetBy,
+    transparency: SetBy,
+}
+
+/// Whether an OS report sets one followed setting, from the OS's last value (`None`: this report is the late
+/// startup value), its value now and who set the app's. A change does when the OS's value moved, so a notification
+/// for another setting (macOS posts one for every display option) leaves the app's override alone; the late startup
+/// value does unless the app set its own since (in its launch, say), as a startup read before the app ran would.
+pub(crate) fn os_report_applies(previous: Option<bool>, reported: bool, set_by: SetBy) -> bool {
+    match (previous, set_by) {
+        (Some(previous), SetBy::Os | SetBy::App) => previous != reported,
+        (None, SetBy::Os) => true,
+        (None, SetBy::App) => false,
+    }
+}
+
 impl App {
     pub(crate) fn new_app(
         platform: Rc<dyn Platform>,
@@ -1021,6 +1052,11 @@ impl App {
         let keyboard_layout = platform.keyboard_layout();
         let keyboard_mapper = platform.keyboard_mapper();
         let power_mode = platform.power_mode();
+        let accessibility_display = platform.accessibility_display_settings();
+        let startup_display = accessibility_display.unwrap_or(AccessibilityDisplaySettings {
+            reduce_motion: false,
+            reduce_transparency: false,
+        });
 
         #[cfg(any(test, gpui_leak_detection))]
         let _ref_counts = entities.ref_counts_drop_handle();
@@ -1094,7 +1130,13 @@ impl App {
                 quit_mode: QuitMode::default(),
                 quitting: false,
                 cursor_hide_mode: CursorHideMode::default(),
-                reduce_motion: false,
+                reduce_motion: startup_display.reduce_motion,
+                reduce_transparency: startup_display.reduce_transparency,
+                os_display: OsDisplay {
+                    last: accessibility_display,
+                    motion: SetBy::Os,
+                    transparency: SetBy::Os,
+                },
                 gesture_tuning: None,
                 synced_animation_epoch,
                 power_mode,
@@ -1206,6 +1248,15 @@ impl App {
                 if let Some(app) = app.upgrade() {
                     let power_mode = app.borrow().platform.power_mode();
                     app.borrow_mut().power_mode = power_mode;
+                }
+            }
+        }));
+
+        platform.on_accessibility_display_settings_change(Box::new({
+            let app = Rc::downgrade(&app);
+            move |settings| {
+                if let Some(app) = app.upgrade() {
+                    app.borrow_mut().update(|cx| cx.follow_os_display(settings));
                 }
             }
         }));
@@ -1410,7 +1461,8 @@ impl App {
     }
 
     /// Returns whether non-essential animations (e.g. loading spinners) should
-    /// be rendered in a static state instead of animating.
+    /// be rendered in a static state instead of animating. Starts as the OS's
+    /// reduce-motion setting and follows it when the user changes it.
     pub fn reduce_motion(&self) -> bool {
         self.reduce_motion
     }
@@ -1435,8 +1487,57 @@ impl App {
     /// Sets whether non-essential animations (e.g. loading spinners) should be
     /// rendered in a static state instead of animating.
     pub fn set_reduce_motion(&mut self, reduce_motion: bool) {
+        self.os_display.motion = SetBy::App;
         if self.reduce_motion != reduce_motion {
             self.reduce_motion = reduce_motion;
+            self.refresh_windows();
+        }
+    }
+
+    /// Returns whether translucent materials (blur, glass, vibrancy) should
+    /// draw opaque. Starts as the OS's reduce-transparency setting and follows
+    /// it when the user changes it.
+    pub fn reduce_transparency(&self) -> bool {
+        self.reduce_transparency
+    }
+
+    /// Sets whether translucent materials (blur, glass, vibrancy) should draw
+    /// opaque.
+    pub fn set_reduce_transparency(&mut self, reduce_transparency: bool) {
+        self.os_display.transparency = SetBy::App;
+        if self.reduce_transparency != reduce_transparency {
+            self.reduce_transparency = reduce_transparency;
+            self.refresh_windows();
+        }
+    }
+
+    /// The platform's report of the OS's display settings: each setting it applies to (`os_report_applies`)
+    /// takes the OS's value, and is the OS's again.
+    fn follow_os_display(&mut self, report: AccessibilityDisplaySettings) {
+        let previous = self.os_display.last.replace(report);
+        // (the OS's last value, its value now, who set the app's, the app's): a row per followed setting.
+        let rows = [
+            (
+                previous.map(|previous| previous.reduce_motion),
+                report.reduce_motion,
+                &mut self.os_display.motion,
+                &mut self.reduce_motion,
+            ),
+            (
+                previous.map(|previous| previous.reduce_transparency),
+                report.reduce_transparency,
+                &mut self.os_display.transparency,
+                &mut self.reduce_transparency,
+            ),
+        ];
+        let mut changed = false;
+        for (previous, reported, set_by, value) in rows {
+            if os_report_applies(previous, reported, *set_by) {
+                *set_by = SetBy::Os;
+                changed |= std::mem::replace(value, reported) != reported;
+            }
+        }
+        if changed {
             self.refresh_windows();
         }
     }

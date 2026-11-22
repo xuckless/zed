@@ -57,6 +57,8 @@ pub(crate) struct TestPlatform {
     menus: RefCell<Vec<OwnedMenu>>,
     pub(crate) app_lifecycle_callback: RefCell<Option<Box<dyn FnMut(AppLifecyclePhase)>>>,
     pub(crate) memory_warning_callback: RefCell<Option<Box<dyn FnMut()>>>,
+    pub(crate) accessibility_display_callback:
+        RefCell<Option<Box<dyn FnMut(crate::AccessibilityDisplaySettings)>>>,
 }
 
 #[derive(Clone)]
@@ -266,6 +268,7 @@ impl TestPlatform {
             menus: Default::default(),
             app_lifecycle_callback: Default::default(),
             memory_warning_callback: Default::default(),
+            accessibility_display_callback: Default::default(),
         })
     }
 
@@ -708,6 +711,13 @@ impl Platform for TestPlatform {
 
     fn on_memory_warning(&self, callback: Box<dyn FnMut()>) {
         *self.memory_warning_callback.borrow_mut() = Some(callback);
+    }
+
+    fn on_accessibility_display_settings_change(
+        &self,
+        callback: Box<dyn FnMut(crate::AccessibilityDisplaySettings)>,
+    ) {
+        *self.accessibility_display_callback.borrow_mut() = Some(callback);
     }
 
     fn set_app_identity(&self, identifier: &str, name: &str) {

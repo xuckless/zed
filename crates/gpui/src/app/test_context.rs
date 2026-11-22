@@ -1376,6 +1376,118 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_os_accessibility_display_settings(cx: &mut TestAppContext) {
+        use crate::AccessibilityDisplaySettings;
+
+        enum Step {
+            /// The user changes the OS settings.
+            Os(bool, bool),
+            /// The app calls `set_reduce_motion` and `set_reduce_transparency`.
+            App(bool, bool),
+        }
+        // Each step, then the app's (reduce_motion, reduce_transparency). Extend with a row per new rule.
+        let rows = [
+            ("both on", Step::Os(true, true), (true, true)),
+            (
+                "the app turns motion off",
+                Step::App(false, true),
+                (false, true),
+            ),
+            (
+                "an OS change to transparency alone keeps the app's motion",
+                Step::Os(true, false),
+                (false, false),
+            ),
+            ("the app turns both on", Step::App(true, true), (true, true)),
+            (
+                "an OS change to motion wins over the app's; transparency stays the app's",
+                Step::Os(false, false),
+                (false, true),
+            ),
+            (
+                "a notification that changes nothing keeps both",
+                Step::Os(false, false),
+                (false, true),
+            ),
+        ];
+        assert_eq!(
+            cx.update(|cx| (cx.reduce_motion(), cx.reduce_transparency())),
+            (false, false),
+            "the test platform reads neither"
+        );
+        let mut callback = cx
+            .test_platform
+            .accessibility_display_callback
+            .borrow_mut()
+            .take()
+            .expect("App registers the accessibility display callback");
+        for (name, step, expected) in rows {
+            match step {
+                Step::Os(reduce_motion, reduce_transparency) => {
+                    callback(AccessibilityDisplaySettings {
+                        reduce_motion,
+                        reduce_transparency,
+                    })
+                }
+                Step::App(motion, transparency) => cx.update(|cx| {
+                    cx.set_reduce_motion(motion);
+                    cx.set_reduce_transparency(transparency);
+                }),
+            }
+            assert_eq!(
+                cx.update(|cx| (cx.reduce_motion(), cx.reduce_transparency())),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_os_report_applies() {
+        use crate::app::{SetBy, os_report_applies};
+        // (rule, the OS's last value, its value now, who set the app's, applies)
+        let rows = [
+            (
+                "late startup value: the OS's own",
+                None,
+                true,
+                SetBy::Os,
+                true,
+            ),
+            (
+                "late startup value: the app set its own",
+                None,
+                true,
+                SetBy::App,
+                false,
+            ),
+            (
+                "the OS's value moved: wins over the app's",
+                Some(false),
+                true,
+                SetBy::App,
+                true,
+            ),
+            ("the OS's value moved", Some(false), true, SetBy::Os, true),
+            (
+                "unchanged: keeps the app's",
+                Some(true),
+                true,
+                SetBy::App,
+                false,
+            ),
+            ("unchanged", Some(true), true, SetBy::Os, false),
+        ];
+        for (name, previous, reported, set_by, applies) in rows {
+            assert_eq!(
+                os_report_applies(previous, reported, set_by),
+                applies,
+                "{name}"
+            );
+        }
+    }
+
+    #[gpui::test]
     async fn test_system_notifications_require_identity_and_replace_matching_tags(
         cx: &mut TestAppContext,
     ) {
