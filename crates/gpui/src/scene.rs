@@ -64,6 +64,10 @@ pub struct Scene {
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     pub native_views: Vec<PaintNativeView>,
+    /// Whether the window has native views attached, shown or not. A renderer keeps
+    /// what showing one needs (a blending alpha mode, its hole pipeline) while this is
+    /// true, so a view that hides and shows again rebuilds nothing.
+    pub native_views_attached: bool,
     animations: Vec<SpriteAnimation>,
 }
 

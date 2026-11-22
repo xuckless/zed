@@ -4163,6 +4163,10 @@ impl Window {
 
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
+        self.next_frame.scene.native_views_attached = self
+            .native_views
+            .iter()
+            .any(|view| view.strong_count() > 0);
         self.next_frame.finish(&mut self.rendered_frame);
 
         self.invalidator.set_phase(DrawPhase::Focus);

@@ -12,4 +12,6 @@ pub use wgpu_context::*;
     any(test, feature = "bench-support", feature = "test-support")
 ))]
 pub use wgpu_renderer::WgpuHeadlessRenderer;
-pub use wgpu_renderer::{GpuContext, WgpuRenderer, WgpuSurfaceConfig};
+pub use wgpu_renderer::{
+    GpuContext, NativeViewSupport, NativeViewsUnsupported, WgpuRenderer, WgpuSurfaceConfig,
+};
