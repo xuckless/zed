@@ -2640,6 +2640,68 @@ pub struct TextInputConfiguration {
     pub suggestions: bool,
     /// The action advertised on a software keyboard's confirm ("enter") key.
     pub input_action: TextInputAction,
+    /// Which software keyboard layout the platform should show.
+    pub keyboard_type: KeyboardType,
+    /// Whether the text is a secret (a password): the platform hides it and
+    /// keeps it out of suggestions, dictionaries and screenshots.
+    pub secure: bool,
+    /// What the field holds, for the platform's autofill; `None` offers none.
+    pub autofill: Option<AutofillHint>,
+}
+
+/// The software keyboard layout requested for a text input.
+///
+/// The variants are the HTML `inputmode` attribute's value set
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#input-modalities:-the-inputmode-attribute>),
+/// which also maps onto Android's `InputType` classes and iOS's
+/// `UIKeyboardType`. `inputmode=none` is not a variant: hiding the keyboard
+/// is not a layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyboardType {
+    /// Free text.
+    #[default]
+    Text,
+    /// Digits only.
+    Number,
+    /// Digits and a decimal separator.
+    Decimal,
+    /// A telephone number.
+    Phone,
+    /// An email address.
+    Email,
+    /// A URL.
+    Url,
+    /// A search query.
+    Search,
+}
+
+/// What a text input holds, so the platform can offer to fill it.
+///
+/// Each variant maps onto an HTML `autocomplete` token, an Android
+/// `View.AUTOFILL_HINT_*` (or androidx `HintConstants`) value and an iOS
+/// `UITextContentType`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutofillHint {
+    /// An account name or login.
+    Username,
+    /// An existing password.
+    Password,
+    /// A password being chosen.
+    NewPassword,
+    /// A one-time code, e.g. from an SMS.
+    OneTimeCode,
+    /// An email address.
+    Email,
+    /// A telephone number.
+    Phone,
+    /// A person's full name.
+    Name,
+    /// A full street address.
+    PostalAddress,
+    /// A postal code.
+    PostalCode,
+    /// A payment card number.
+    CreditCardNumber,
 }
 
 /// Automatic capitalization applied by software keyboards.

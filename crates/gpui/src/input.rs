@@ -322,9 +322,9 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
 mod tests {
     use super::*;
     use crate::{
-        AnyWindowHandle, AppContext as _, FocusHandle, InteractiveElement as _, IntoElement,
-        ParentElement as _, Render, Styled as _, TestAppContext, TextInputAction,
-        TextInputStateChange, canvas, div,
+        AnyWindowHandle, AppContext as _, AutofillHint, FocusHandle, InteractiveElement as _,
+        IntoElement, KeyboardType, ParentElement as _, Render, Styled as _, TestAppContext,
+        TextInputAction, TextInputStateChange, canvas, div,
     };
 
     #[gpui::test]
@@ -332,6 +332,9 @@ mod tests {
         let custom = TextInputConfiguration {
             autocorrect: true,
             input_action: TextInputAction::Send,
+            keyboard_type: KeyboardType::Email,
+            secure: true,
+            autofill: Some(AutofillHint::Username),
             ..Default::default()
         };
         let window = cx.add_window({
