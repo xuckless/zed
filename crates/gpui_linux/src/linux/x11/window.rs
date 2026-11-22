@@ -33,7 +33,7 @@ use std::{
     cell::RefCell, ffi::c_void, fmt::Display, num::NonZeroU32, ptr::NonNull, rc::Rc, sync::Arc,
 };
 
-use super::{X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES};
+use super::{X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES, XinputVersion};
 
 x11rb::atom_manager! {
     pub XcbAtoms: AtomsCookie {
@@ -476,7 +476,7 @@ impl X11WindowState {
         scale_factor: f32,
         appearance: WindowAppearance,
         parent_window: Option<X11WindowStatePtr>,
-        supports_xinput_gestures: bool,
+        xinput_version: XinputVersion,
         is_bgr: bool,
     ) -> anyhow::Result<Self> {
         // Native popups are not implemented on X11 yet. Rejecting lets callers fall back to
@@ -721,27 +721,13 @@ impl X11WindowState {
                 ),
             )?;
 
-            let mut xi_event_mask = xinput::XIEventMask::MOTION
-                | xinput::XIEventMask::BUTTON_PRESS
-                | xinput::XIEventMask::BUTTON_RELEASE
-                | xinput::XIEventMask::ENTER
-                | xinput::XIEventMask::LEAVE;
-            if supports_xinput_gestures {
-                // x11rb 0.13 doesn't define XIEventMask constants for gesture
-                // events, so we construct them from the event opcodes (each
-                // XInput event type N maps to mask bit N).
-                xi_event_mask |=
-                    xinput::XIEventMask::from(1u32 << xinput::GESTURE_PINCH_BEGIN_EVENT)
-                        | xinput::XIEventMask::from(1u32 << xinput::GESTURE_PINCH_UPDATE_EVENT)
-                        | xinput::XIEventMask::from(1u32 << xinput::GESTURE_PINCH_END_EVENT);
-            }
             check_reply(
                 || "X11 XiSelectEvents failed.",
                 xcb.xinput_xi_select_events(
                     x_window,
                     &[xinput::EventMask {
                         deviceid: XINPUT_ALL_DEVICE_GROUPS,
-                        mask: vec![xi_event_mask],
+                        mask: vec![xinput_version.window_events()],
                     }],
                 ),
             )?;
@@ -938,7 +924,7 @@ impl X11Window {
         scale_factor: f32,
         appearance: WindowAppearance,
         parent_window: Option<X11WindowStatePtr>,
-        supports_xinput_gestures: bool,
+        xinput_version: XinputVersion,
         is_bgr: bool,
     ) -> anyhow::Result<Self> {
         let ptr = X11WindowStatePtr {
@@ -957,7 +943,7 @@ impl X11Window {
                 scale_factor,
                 appearance,
                 parent_window,
-                supports_xinput_gestures,
+                xinput_version,
                 is_bgr,
             )?)),
             callbacks: Rc::new(RefCell::new(Callbacks::default())),
@@ -1216,7 +1202,8 @@ impl X11WindowStatePtr {
     }
 
     pub fn handle_input(&self, input: PlatformInput) {
-        if self.is_blocked() {
+        // A touch's end still gets through, so a modal child opening mid-touch leaves no touch open.
+        if self.is_blocked() && !crate::linux::reaches_blocked_window(&input) {
             return;
         }
         let callback = self.callbacks.borrow_mut().input.take();

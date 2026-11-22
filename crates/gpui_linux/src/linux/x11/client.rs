@@ -40,12 +40,14 @@ use xim::{AttributeName, Client, InputStyle, x11rb::X11rbClient};
 use xkbc::x11::ffi::{XKB_X11_MIN_MAJOR_XKB_VERSION, XKB_X11_MIN_MINOR_XKB_VERSION};
 use xkbcommon::xkb::{self as xkbc, STATE_LAYOUT_EFFECTIVE};
 
+use crate::linux::clock::Clock;
+
 use super::{
     ButtonOrScroll, ScrollDirection, X11Display, X11WindowStatePtr, XcbAtoms, XimCallbackEvent,
-    XimHandler, button_or_scroll_from_event_detail, check_reply,
+    XimHandler, XinputVersion, button_or_scroll_from_event_detail, check_reply,
     clipboard::{self, Clipboard},
-    get_reply, get_valuator_axis_index, handle_connection_error, modifiers_from_state,
-    pressed_button_from_mask, xcb_flush,
+    get_reply, get_valuator_axis_index, handle_connection_error, is_pointer_emulated,
+    modifiers_from_state, pressed_button_from_mask, touch_from_xinput, xcb_flush,
 };
 
 use crate::linux::{
@@ -233,7 +235,7 @@ pub struct X11ClientState {
 
     pointer_device_states: BTreeMap<xinput::DeviceId, PointerDeviceState>,
 
-    pub(crate) supports_xinput_gestures: bool,
+    pub(crate) xinput_version: XinputVersion,
 
     pub(crate) common: Rc<RefCell<LinuxCommon>>,
     pub(crate) clipboard: Clipboard,
@@ -387,9 +389,9 @@ impl X11Connection {
         xcb_connection.prefetch_extension_information(xinput::X11_EXTENSION_NAME)?;
 
         // Announce to X server that XInput up to 2.4 is supported.
-        // Version 2.4 is needed for gesture events (GesturePinchBegin/Update/End).
-        // The server responds with the highest version it supports; if < 2.4,
-        // we must not request gesture event masks in XISelectEvents.
+        // Version 2.2 is needed for touch events, 2.4 for gesture events (GesturePinchBegin/Update/End).
+        // The server responds with the highest version it supports; windows must not
+        // request masks it lacks in XISelectEvents (`XinputVersion::window_events`).
         let xinput_version = get_reply(
             || "XInput XiQueryVersion failed",
             xcb_connection.xinput_xi_query_version(2, 4),
@@ -398,13 +400,14 @@ impl X11Connection {
             xinput_version.major_version >= 2,
             "XInput version >= 2 required."
         );
-        let supports_xinput_gestures = xinput_version.major_version > 2
-            || (xinput_version.major_version == 2 && xinput_version.minor_version >= 4);
+        let xinput_version =
+            XinputVersion(xinput_version.major_version, xinput_version.minor_version);
         log::info!(
-            "XInput version: {}.{}, gesture support: {}",
-            xinput_version.major_version,
-            xinput_version.minor_version,
-            supports_xinput_gestures,
+            "XInput version: {}.{}, touch support: {}, gesture support: {}",
+            xinput_version.0,
+            xinput_version.1,
+            xinput_version >= XinputVersion(2, 2),
+            xinput_version >= XinputVersion(2, 4),
         );
 
         let pointer_device_states =
@@ -549,7 +552,7 @@ impl X11Connection {
 
                 pointer_device_states,
 
-                supports_xinput_gestures,
+                xinput_version,
 
                 clipboard,
                 clipboard_item: None,
@@ -1228,6 +1231,11 @@ impl X11Client {
                 drop(state);
                 window.handle_input(PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke }));
             }
+            // Pointer events the server emulates from a touch are dropped: the touch arrives as an
+            // XinputTouch* event, so a tap clicks once (winit's `xinput2_button_input`).
+            Event::XinputButtonPress(event) if is_pointer_emulated(event.flags) => {}
+            Event::XinputButtonRelease(event) if is_pointer_emulated(event.flags) => {}
+            Event::XinputMotion(event) if is_pointer_emulated(event.flags) => {}
             Event::XinputButtonPress(event) => {
                 let window = self.get_window(event.event)?;
                 let mut state = self.0.borrow_mut();
@@ -1283,24 +1291,19 @@ impl X11Client {
                     }
                     Some(ButtonOrScroll::Scroll(direction)) => {
                         drop(state);
-                        // Emulated scroll button presses are sent simultaneously with smooth scrolling XinputMotion events.
-                        // Since handling those events does the scrolling, they are skipped here.
-                        if !event
-                            .flags
-                            .contains(xinput::PointerEventFlags::POINTER_EMULATED)
-                        {
-                            let scroll_delta = match direction {
-                                ScrollDirection::Up => Point::new(0.0, SCROLL_LINES),
-                                ScrollDirection::Down => Point::new(0.0, -SCROLL_LINES),
-                                ScrollDirection::Left => Point::new(SCROLL_LINES, 0.0),
-                                ScrollDirection::Right => Point::new(-SCROLL_LINES, 0.0),
-                            };
-                            window.handle_input(PlatformInput::Scroll(make_scroll_wheel_event(
-                                position,
-                                scroll_delta,
-                                modifiers,
-                            )));
-                        }
+                        // Emulated scroll button presses, sent with smooth scrolling XinputMotion
+                        // events, were dropped above: those motion events do the scrolling.
+                        let scroll_delta = match direction {
+                            ScrollDirection::Up => Point::new(0.0, SCROLL_LINES),
+                            ScrollDirection::Down => Point::new(0.0, -SCROLL_LINES),
+                            ScrollDirection::Left => Point::new(SCROLL_LINES, 0.0),
+                            ScrollDirection::Right => Point::new(-SCROLL_LINES, 0.0),
+                        };
+                        window.handle_input(PlatformInput::Scroll(make_scroll_wheel_event(
+                            position,
+                            scroll_delta,
+                            modifiers,
+                        )));
                     }
                     None => {
                         log::error!("Unknown x11 button: {}", event.detail);
@@ -1444,6 +1447,14 @@ impl X11Client {
                 if let Some(pointer) = state.pointer_device_states.get_mut(&event.sourceid) {
                     reset_pointer_device_scroll_positions(pointer);
                 }
+            }
+            Event::XinputTouchBegin(event)
+            | Event::XinputTouchUpdate(event)
+            | Event::XinputTouchEnd(event) => {
+                let window = self.get_window(event.event)?;
+                let scale_factor = self.0.borrow().scale_factor;
+                let touch = touch_from_xinput(&event, scale_factor, Clock::read())?;
+                window.handle_input(PlatformInput::Touch(touch));
             }
             Event::XinputGesturePinchBegin(event) => {
                 let window = self.get_window(event.event)?;
@@ -1706,7 +1717,7 @@ impl X11Client {
         let scale_factor = state.scale_factor;
         let appearance = state.common.borrow().appearance;
         let compositor_gpu = state.compositor_gpu.take();
-        let supports_xinput_gestures = state.supports_xinput_gestures;
+        let xinput_version = state.xinput_version;
         let is_bgr = state
             .resource_database
             .get_string("Xft.rgba", "Xft.Rgba")
@@ -1726,7 +1737,7 @@ impl X11Client {
             scale_factor,
             appearance,
             parent_window,
-            supports_xinput_gestures,
+            xinput_version,
             is_bgr,
         )?;
         check_reply(
