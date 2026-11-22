@@ -1,7 +1,7 @@
 use super::window::{IosWindowState, WindowReference};
 use gpui::{
-    Autocapitalize, KeyboardType, PlatformInputHandler, TextInputAction, TextInputConfiguration,
-    TextInputStateChange, px,
+    Autocapitalize, AutofillHint, KeyboardType, PlatformInputHandler, TextInputAction,
+    TextInputConfiguration, TextInputStateChange, px,
 };
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
@@ -347,6 +347,30 @@ define_class!(
                 KeyboardType::Url => UIKeyboardType::URL,
                 KeyboardType::Search => UIKeyboardType::WebSearch,
             }
+        }
+        // Ported from flutter/flutter FlutterTextInputPlugin.mm's `ToUITextContentType` @ 3.50.1, for GPUI's hints
+        // under Flutter's names (`username` is UIKit's own value, which Flutter passes through). No hint is Flutter's
+        // `autofill == nil`: "", which turns autofill off. Copyright 2014 The Flutter Authors. BSD-3-Clause, see
+        // third_party/flutter/LICENSE.
+        #[unsafe(method_id(textContentType))]
+        fn text_content_type(&self) -> Retained<NSString> {
+            // SAFETY: UIKit's content type constants are immutable strings.
+            let content_type: &NSString = unsafe {
+                match self.ivars().configuration.borrow().autofill {
+                    None => ns_string!(""),
+                    Some(AutofillHint::Username) => UITextContentTypeUsername,
+                    Some(AutofillHint::Password) => UITextContentTypePassword,
+                    Some(AutofillHint::NewPassword) => UITextContentTypeNewPassword,
+                    Some(AutofillHint::OneTimeCode) => UITextContentTypeOneTimeCode,
+                    Some(AutofillHint::Email) => UITextContentTypeEmailAddress,
+                    Some(AutofillHint::Phone) => UITextContentTypeTelephoneNumber,
+                    Some(AutofillHint::Name) => UITextContentTypeName,
+                    Some(AutofillHint::PostalAddress) => UITextContentTypeFullStreetAddress,
+                    Some(AutofillHint::PostalCode) => UITextContentTypePostalCode,
+                    Some(AutofillHint::CreditCardNumber) => UITextContentTypeCreditCardNumber,
+                }
+            };
+            content_type.copy()
         }
         #[unsafe(method(isSecureTextEntry))]
         fn is_secure_text_entry(&self) -> bool { self.ivars().configuration.borrow().secure }

@@ -326,6 +326,8 @@ enum Step {
     RespondsTo(&'static str, bool),
     KeyboardType(UIKeyboardType),
     Secure(bool),
+    /// `textContentType`, compared as a string.
+    ContentType(&'static str),
     Autocorrection(UITextAutocorrectionType),
     SpellChecking(UITextSpellCheckingType),
     InlinePrediction(UITextInlinePredictionType),
@@ -706,6 +708,18 @@ fn rows() -> Vec<Row> {
             configuration(|c| c.keyboard_type = gpui::KeyboardType::Search),
             KeyboardType(UIKeyboardType::WebSearch),
         ]),
+        row("testDisablingAutofillOnInputClient", vec![
+            configuration(|c| c.secure = true),
+            ContentType(""),
+        ]),
+        // Not a Flutter test: Flutter's `ToUITextContentType` for each GPUI hint, as UIKit's constant values.
+        row("ToUITextContentType for GPUI's hints", [
+            (AutofillHint::Username, "username"), (AutofillHint::Password, "password"),
+            (AutofillHint::NewPassword, "new-password"), (AutofillHint::OneTimeCode, "one-time-code"),
+            (AutofillHint::Email, "email"), (AutofillHint::Phone, "tel"), (AutofillHint::Name, "name"),
+            (AutofillHint::PostalAddress, "street-address"), (AutofillHint::PostalCode, "postal-code"),
+            (AutofillHint::CreditCardNumber, "cc-number"),
+        ].into_iter().flat_map(|(hint, content_type)| [configuration(|c| c.autofill = Some(hint)), ContentType(content_type)]).collect()),
         row("testUpdateSecureTextEntry", vec![
             configuration(|c| c.secure = true),
             Secure(true),
@@ -999,6 +1013,9 @@ fn run_step(view: &TextInputView, field: &Rc<RefCell<Field>>, step: &Step) -> Re
         }
         Step::KeyboardType(want) => check("keyboardType", view.keyboardType(), *want)?,
         Step::Secure(want) => check("isSecureTextEntry", view.isSecureTextEntry(), *want)?,
+        Step::ContentType(want) => {
+            check("textContentType", view.textContentType().to_string(), want.to_string())?
+        }
         Step::Autocorrection(want) => {
             check("autocorrectionType", view.autocorrectionType(), *want)?
         }
