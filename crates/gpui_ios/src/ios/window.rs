@@ -12,11 +12,13 @@
 use super::events::*;
 
 mod native_views;
+mod rotation;
 use super::keyboard::{KeyResponder, Press, PressPhase, Primary};
 use super::keyboard_inset::{
     InsetSample, KeyboardInsetAction, KeyboardInsetManager, KeyboardNotification, KeyboardSpring,
     NotificationName, Rect, ViewGeometry,
 };
+use super::native_view_state::Rotation;
 use super::text_input::TextInputView;
 use super::{CallbackSlot, IosDisplay, platform::IosPlatformState};
 use gpui::{
@@ -118,6 +120,16 @@ define_class!(
             } else {
                 UIStatusBarStyle::DarkContent
             }
+        }
+
+        // Marks a rotation's turn (rotation.rs).
+        #[unsafe(method(viewWillTransitionToSize:withTransitionCoordinator:))]
+        fn view_will_transition_to_size(&self, size: CGSize, coordinator: &AnyObject) {
+            // SAFETY: UIViewController's own method, with UIKit's arguments; the coordinator is live for the call.
+            let _: () = unsafe {
+                msg_send![super(self), viewWillTransitionToSize: size, withTransitionCoordinator: coordinator]
+            };
+            rotation::will_transition(self.ivars().0.borrow().clone(), coordinator);
         }
 
         #[unsafe(method(viewDidLayoutSubviews))]
@@ -380,6 +392,8 @@ pub(crate) struct IosWindowState {
     renderer: Mutex<MetalRenderer>,
     /// The app's views shown beneath GPUI's (native_views.rs).
     native_views: RefCell<native_views::NativeViews>,
+    /// Whether UIKit is turning the window (`viewWillTransitionToSize:…` to its completion).
+    rotation: Cell<Rotation>,
 }
 
 impl IosWindow {
@@ -491,7 +505,8 @@ impl IosWindow {
         view.addGestureRecognizer(&back_recognizer);
 
         let view_controller = ViewController::new(main_thread);
-        view_controller.setView(Some(&view));
+        // In a host view, where native views go beneath it (rotation.rs).
+        view_controller.setView(Some(&rotation::nest(&view, metal_frame, main_thread)));
         window.setRootViewController(Some(&view_controller));
 
         // Make the window visible
@@ -550,6 +565,7 @@ impl IosWindow {
             key_repeat_timer: RefCell::default(),
             renderer: Mutex::new(renderer),
             native_views: RefCell::default(),
+            rotation: Cell::new(Rotation::Settled),
         };
 
         Ok(Self {
@@ -1077,12 +1093,14 @@ impl IosWindowState {
     }
 
     pub fn handle_layout_change(&self) {
+        self.follow_root();
         let view_bounds = self.view.bounds();
         let display = IosDisplay::from_screen(self.window.screen());
         if self.display_id.replace(display.id()) != display.id() {
             self.display_changed_callback.with(|callback| callback());
         }
         let scale = display.scale() as f64;
+        self.update_hole_inset();
 
         let width = view_bounds.size.width as f32;
         let height = view_bounds.size.height as f32;
@@ -1125,6 +1143,7 @@ impl IosWindowState {
 
         self.resize_callback
             .with(|callback| callback(new_size, new_scale));
+        self.draw_resized_frame();
     }
 }
 

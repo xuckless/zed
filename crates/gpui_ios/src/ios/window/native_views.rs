@@ -2,7 +2,7 @@
 //! while one shows (gpui_apple's `MetalRenderer` clears a hole over each).
 //!
 //! Each view sits in a clipping container, a sibling below GPUI's view in its
-//! superview, so GPUI's view stays on top and takes every
+//! host view (window.rs), so GPUI's view stays on top and takes every
 //! touch ([`gpui::NativeViewInput::Window`]); the app forwards touches into its
 //! view if it wants them. A scene that moves, resizes, shows or hides a view is
 //! presented with the Core Animation transaction that places it, so hole and
@@ -178,11 +178,13 @@ fn apply_layout(
     let to_rect = |[x, y, width, height]: [f64; 4]| {
         CGRect::new(CGPoint::new(x, y), CGSize::new(width, height))
     };
-    // The colour goes on GPUI's view's superview, right behind GPUI's view and
-    // the views.
+    // The colour goes on GPUI's host view, right behind GPUI's view and the
+    // views, not on the window: through a rotation the window shows around the
+    // turning content, as in any app, and only a hole that left its view shows it.
     let host = gpui_view.superview();
-    // A scene can be drawn inside one of UIKit's animations, which must not
-    // animate the views away from their holes, nor the colour behind them.
+    // A scene can be drawn inside one of UIKit's animations (a rotation's
+    // layout, rotation.rs), which must not animate the views away from their
+    // holes, nor the colour behind them.
     let place = block2::RcBlock::new(|| {
         for (view, container, placement) in &placements {
             match placement {
@@ -195,21 +197,7 @@ fn apply_layout(
             }
         }
         if let (Some(background), Some(host)) = (background, &host) {
-            // SAFETY: `+[UIColor colorWithRed:green:blue:alpha:]` returns a
-            // UIColor; the host is live, on the main thread. Nil clears it.
-            unsafe {
-                let color: *mut AnyObject = match background {
-                    Some(Rgba { r, g, b, .. }) => msg_send![
-                        objc2::class!(UIColor),
-                        colorWithRed: r as f64,
-                        green: g as f64,
-                        blue: b as f64,
-                        alpha: 1.0f64
-                    ],
-                    None => std::ptr::null_mut(),
-                };
-                let _: () = msg_send![&**host, setBackgroundColor: color];
-            }
+            colour_host(host, background.filter(|_| window.rotation.get().shows_background()));
         }
     });
     UIView::performWithoutAnimation(&place, objc2::MainThreadMarker::from(gpui_view));
@@ -223,4 +211,35 @@ fn apply_layout(
             };
         }
     }
+}
+
+/// Gives GPUI's host view the views' gap colour, or none.
+fn colour_host(host: &UIView, colour: Option<Rgba>) {
+    // SAFETY: `+[UIColor colorWithRed:green:blue:alpha:]` returns a
+    // UIColor; the host is live, on the main thread. Nil clears it.
+    unsafe {
+        let color: *mut AnyObject = match colour {
+            Some(Rgba { r, g, b, .. }) => msg_send![
+                objc2::class!(UIColor),
+                colorWithRed: r as f64,
+                green: g as f64,
+                blue: b as f64,
+                alpha: 1.0f64
+            ],
+            None => std::ptr::null_mut(),
+        };
+        let _: () = msg_send![host, setBackgroundColor: color];
+    }
+}
+
+/// The window starts or ends turning: the host shows the gap colour only while settled (`Rotation::shows_background`).
+pub(super) fn rotation_changed(window: &IosWindowState) {
+    let Some(host) = window.view.superview() else {
+        return;
+    };
+    let colour = window.native_views.borrow().background;
+    let recolour = block2::RcBlock::new(|| {
+        colour_host(&host, colour.filter(|_| window.rotation.get().shows_background()))
+    });
+    UIView::performWithoutAnimation(&recolour, objc2::MainThreadMarker::from(&*host));
 }

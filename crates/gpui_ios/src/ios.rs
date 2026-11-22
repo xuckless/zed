@@ -5,6 +5,7 @@ mod display;
 mod events;
 mod keyboard;
 mod keyboard_inset;
+mod native_view_state;
 mod platform;
 mod spring_animation;
 mod text_input;
