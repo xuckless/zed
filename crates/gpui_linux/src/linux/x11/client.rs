@@ -1456,12 +1456,12 @@ impl X11Client {
                     px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
                 );
                 drop(state);
-                window.handle_input(PlatformInput::Pinch(gpui::PinchEvent {
+                window.handle_input(PlatformInput::Pinch(gpui::PinchEvent::new(
                     position,
-                    delta: 0.0,
+                    0.0,
                     modifiers,
-                    phase: gpui::TouchPhase::Started,
-                }));
+                    gpui::TouchPhase::Started,
+                )));
             }
             Event::XinputGesturePinchUpdate(event) => {
                 let window = self.get_window(event.event)?;
@@ -1478,12 +1478,12 @@ impl X11Client {
                 let zoom_delta = new_absolute_scale - previous_scale;
                 state.pinch_scale = new_absolute_scale;
                 drop(state);
-                window.handle_input(PlatformInput::Pinch(gpui::PinchEvent {
+                window.handle_input(PlatformInput::Pinch(gpui::PinchEvent::new(
                     position,
-                    delta: zoom_delta,
+                    zoom_delta,
                     modifiers,
-                    phase: gpui::TouchPhase::Moved,
-                }));
+                    gpui::TouchPhase::Moved,
+                )));
             }
             Event::XinputGesturePinchEnd(event) => {
                 let window = self.get_window(event.event)?;
@@ -1496,12 +1496,12 @@ impl X11Client {
                     px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
                 );
                 drop(state);
-                window.handle_input(PlatformInput::Pinch(gpui::PinchEvent {
+                window.handle_input(PlatformInput::Pinch(gpui::PinchEvent::new(
                     position,
-                    delta: 0.0,
+                    0.0,
                     modifiers,
-                    phase: gpui::TouchPhase::Ended,
-                }));
+                    gpui::TouchPhase::Ended,
+                )));
             }
             _ => {}
         };

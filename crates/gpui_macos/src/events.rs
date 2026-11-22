@@ -256,15 +256,15 @@ pub(crate) unsafe fn platform_input_from_native(
 
                 let magnification = native_event.magnification() as f32;
 
-                PlatformInput::Pinch(PinchEvent {
-                    position: point(
+                PlatformInput::Pinch(PinchEvent::new(
+                    point(
                         px(native_event.locationInWindow().x as f32),
                         window_height - px(native_event.locationInWindow().y as f32),
                     ),
-                    delta: magnification,
-                    modifiers: read_modifiers(native_event),
+                    magnification,
+                    read_modifiers(native_event),
                     phase,
-                })
+                ))
             }),
             NSEventType::ScrollWheel => window_height.map(|window_height| {
                 let phase = match native_event.phase() {

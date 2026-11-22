@@ -406,13 +406,20 @@ impl Interactivity {
         self.on_scroll(listener);
     }
 
-    /// Bind the given callback to pinch gesture events during the bubble phase.
+    /// Bind the given callback to pinch gesture events during the bubble phase: trackpad pinches over
+    /// this element and, with an element id, touch pinches of two or more fingers that started on it
+    /// (the deepest `on_pinch` element under the fingers gets it, or the outer one when they started on
+    /// two nested ones, wherever the fingers move; [`PinchEvent::touch`] carries their details, the local
+    /// focal point relative to this element).
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_pinch(&mut self, listener: impl Fn(&PinchEvent, &mut Window, &mut App) + 'static) {
         self.pinch_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                // A touch pinch reaches only its element (the paint filter), wherever its fingers are.
+                if phase == DispatchPhase::Bubble
+                    && (event.touch.is_some() || hitbox.is_hovered(window))
+                {
                     (listener)(event, window, cx);
                 }
             }));
@@ -1115,7 +1122,8 @@ pub trait InteractiveElement: Sized {
         self.on_scroll(listener)
     }
 
-    /// Bind the given callback to pinch gesture events during the bubble phase.
+    /// Bind the given callback to pinch gesture events during the bubble phase: trackpad pinches over
+    /// this element and, with an element id, touch pinches that started on it.
     /// The fluent API equivalent to [`Interactivity::on_pinch`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
@@ -2907,6 +2915,8 @@ impl Interactivity {
             || self.scroll_offset.is_some()
             || self.drag_listener.is_some();
         let touch_listeners = mem::take(&mut self.touch_listeners);
+        // Touch pinches need an id: later fingers and phases find the element by it.
+        let pinch_owner = global_id.filter(|_| self.has_pinch_listeners()).cloned();
         if let Some(owner) = global_id.filter(|_| !touch_listeners.is_empty()) {
             let (hitbox, owner) = (hitbox.clone(), owner.clone());
             window.on_mouse_event(move |event: &TouchEvent, phase, window, cx| {
@@ -2923,14 +2933,17 @@ impl Interactivity {
                     }
                 }
             })
-        } else if handles_gestures {
-            let hitbox = hitbox.clone();
+        } else if handles_gestures || pinch_owner.is_some() {
+            let (hitbox, pinch_owner) = (hitbox.clone(), pinch_owner.clone());
             window.on_mouse_event(move |event: &TouchEvent, phase, window, _| {
                 if phase == DispatchPhase::Bubble
                     && event.phase == TouchPhase::Started
                     && hitbox.is_hovered(window)
                 {
-                    window.leave_touch_to_gestures(event.id);
+                    match &pinch_owner {
+                        Some(owner) => window.join_pinch(event.id, owner),
+                        None => window.leave_touch_to_gestures(event.id),
+                    }
                 }
             })
         }
@@ -3009,9 +3022,21 @@ impl Interactivity {
         }
 
         for listener in self.pinch_listeners.drain(..) {
-            let hitbox = hitbox.clone();
+            let (hitbox, pinch_owner) = (hitbox.clone(), pinch_owner.clone());
             window.on_mouse_event(move |event: &PinchEvent, phase, window, cx| {
-                listener(event, phase, &hitbox, window, cx);
+                let Some(touch) = &event.touch else {
+                    return listener(event, phase, &hitbox, window, cx);
+                };
+                if pinch_owner.is_none() || event.touch_owner() != pinch_owner.as_ref() {
+                    return;
+                }
+                let mut touch = touch.clone();
+                touch.localize(hitbox.bounds.origin);
+                let event = PinchEvent {
+                    touch: Some(touch),
+                    ..event.clone()
+                };
+                listener(&event, phase, &hitbox, window, cx);
             })
         }
 

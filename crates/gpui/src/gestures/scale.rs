@@ -12,7 +12,8 @@
 //!
 //! Dropped from Flutter: pointer pan/zoom events (trackpad gestures; GPUI reports them as `PinchEvent` and
 //! `ScrollEvent`) and with them `trackpadScrollCausesScale`, `trackpadScrollToScaleFactor` and the pan/zoom
-//! factors; event transforms and `localFocalPoint` (GPUI positions are window coordinates); `allowedButtonsFilter`
+//! factors; event transforms (GPUI positions are window coordinates, so `local_focal_point` starts as the focal
+//! point and the element that receives the pinch makes it local); `allowedButtonsFilter`
 //! (touches carry no buttons); synthesized moves (GPUI never synthesizes touches).
 
 use std::mem;
@@ -65,6 +66,8 @@ enum ScaleState {
 pub struct ScaleStartDetails {
     /// The initial focal point of the pointers in contact with the screen.
     pub focal_point: Point<Pixels>,
+    /// The initial focal point of the pointers in contact with the screen, in the receiving element's coordinates.
+    pub local_focal_point: Point<Pixels>,
     /// The number of pointers being tracked by the gesture recognizer.
     pub pointer_count: usize,
     /// Recorded timestamp of the source pointer event that triggered the scale event.
@@ -81,6 +84,8 @@ pub struct ScaleUpdateDetails {
     pub focal_point_delta: Point<Pixels>,
     /// The focal point of the pointers in contact with the screen.
     pub focal_point: Point<Pixels>,
+    /// The focal point of the pointers in contact with the screen, in the receiving element's coordinates.
+    pub local_focal_point: Point<Pixels>,
     /// The scale implied by the average distance between the pointers in contact with the screen.
     pub scale: f32,
     /// The scale implied by the average distance along the horizontal axis between the pointers.
@@ -526,14 +531,16 @@ impl ScaleGestureRecognizer {
             if let Some(tracker) = self.scale_velocity_tracker.as_mut() {
                 tracker.add_position(time_stamp, point(px(scale_factor), px(0.0)));
             }
+            let focal_point = self
+                .current_focal_point
+                .expect("update sets the focal point before the state machine runs")
+                .map(px);
             out.push(ScaleOutput::Update(ScaleUpdateDetails {
                 scale: scale_factor,
                 horizontal_scale: self.pointer_horizontal_scale_factor(),
                 vertical_scale: self.pointer_vertical_scale_factor(),
-                focal_point: self
-                    .current_focal_point
-                    .expect("update sets the focal point before the state machine runs")
-                    .map(px),
+                focal_point,
+                local_focal_point: focal_point,
                 rotation: self.compute_rotation_factor(),
                 pointer_count: self.pointer_count(),
                 focal_point_delta: self.delta.map(px),
@@ -543,11 +550,13 @@ impl ScaleGestureRecognizer {
     }
 
     fn dispatch_on_start_callback_if_needed(&mut self, out: &mut Vec<ScaleOutput>) {
+        let focal_point = self
+            .current_focal_point
+            .expect("a pointer event set the focal point before the gesture starts")
+            .map(px);
         out.push(ScaleOutput::Start(ScaleStartDetails {
-            focal_point: self
-                .current_focal_point
-                .expect("a pointer event set the focal point before the gesture starts")
-                .map(px),
+            focal_point,
+            local_focal_point: focal_point,
             pointer_count: self.pointer_count(),
             source_time_stamp: self.initial_event_timestamp,
             kind: self

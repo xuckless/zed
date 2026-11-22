@@ -181,12 +181,12 @@ impl DirectManipulationEventHandler {
             GestureKind::Pinch => {
                 self.pending_events
                     .borrow_mut()
-                    .push(PlatformInput::Pinch(PinchEvent {
+                    .push(PlatformInput::Pinch(PinchEvent::new(
                         position,
-                        delta: 0.0,
+                        0.0,
                         modifiers,
-                        phase: TouchPhase::Ended,
-                    }));
+                        TouchPhase::Ended,
+                    )));
             }
             GestureKind::None => {}
         }
@@ -305,12 +305,12 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
                 self.gesture_kind.set(GestureKind::Pinch);
                 self.pending_events
                     .borrow_mut()
-                    .push(PlatformInput::Pinch(PinchEvent {
+                    .push(PlatformInput::Pinch(PinchEvent::new(
                         position,
-                        delta: 0.0,
+                        0.0,
                         modifiers,
-                        phase: TouchPhase::Started,
-                    }));
+                        TouchPhase::Started,
+                    )));
             }
         } else if self.gesture_kind.get() == GestureKind::None {
             self.gesture_kind.set(GestureKind::Scroll);
@@ -337,12 +337,12 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
                 let scale_delta = scale / last_scale;
                 self.pending_events
                     .borrow_mut()
-                    .push(PlatformInput::Pinch(PinchEvent {
+                    .push(PlatformInput::Pinch(PinchEvent::new(
                         position,
-                        delta: scale_delta - 1.0,
+                        scale_delta - 1.0,
                         modifiers,
-                        phase: TouchPhase::Moved,
-                    }));
+                        TouchPhase::Moved,
+                    )));
             }
             GestureKind::None => {}
         }

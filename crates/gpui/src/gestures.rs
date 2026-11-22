@@ -36,7 +36,10 @@ use crate::{
     ScrollEvent, ScrollSource, TouchEvent, TouchId, TouchPhase, point, px, seal::Sealed,
 };
 
+mod pinch;
 pub mod scale;
+pub(crate) use pinch::{PinchArena, PinchChange};
+pub use pinch::TouchPinch;
 
 const SCROLL_EVENT_SEPARATION: Duration = Duration::from_millis(28);
 
@@ -416,8 +419,8 @@ impl PlatformGestures for NullPlatformGestures {}
 /// [`ClickEvent::Touch`](crate::ClickEvent), which keeps every existing
 /// mouse-driven behavior (click listeners, caret placement, double-tap
 /// selection) working before elements grow a direct tap-delivery path.
-/// Pinch recognition is not implemented yet, and additional touches are ignored
-/// while one is being recognized.
+/// Additional touches are ignored while one is being recognized; two or more
+/// on an element with `on_pinch` may become a pinch ([`TouchPinch`]).
 pub(crate) struct TouchGestureRecognizer {
     tuning: GestureTuning,
     state: TouchGestureState,
@@ -439,6 +442,21 @@ pub(crate) enum RecognizedTouchGesture {
     },
     TouchDrag(TouchDragEvent),
     LongPress(LongPressEvent),
+}
+
+/// The touch recognizer's hold on its touch, in Flutter's arena terms: what
+/// the pinch arena competes with.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum TouchClaim {
+    /// It has no touch.
+    None,
+    /// It has this touch, still a tap or a pan to be.
+    Possible(TouchId),
+    /// Its pan won this touch, and takes any touch that joins it (Flutter's
+    /// drag accepts a joining pointer).
+    Pan(TouchId),
+    /// An element claimed this touch's long press or touch drag.
+    Press(TouchId),
 }
 
 enum TouchGestureState {
@@ -521,6 +539,24 @@ struct Momentum {
 }
 
 impl TouchGestureRecognizer {
+    pub(crate) fn tuning(&self) -> GestureTuning {
+        self.tuning
+    }
+
+    /// The touch this recognizer has, and whether it won it.
+    pub(crate) fn claim(&self) -> TouchClaim {
+        match &self.state {
+            TouchGestureState::Idle => TouchClaim::None,
+            TouchGestureState::Pending { touch, .. } | TouchGestureState::Caught(touch) => {
+                TouchClaim::Possible(touch.id)
+            }
+            TouchGestureState::Panning { touch, .. } => TouchClaim::Pan(touch.id),
+            TouchGestureState::LongPressing(touch) | TouchGestureState::TouchDragging(touch) => {
+                TouchClaim::Press(touch.id)
+            }
+        }
+    }
+
     pub(crate) fn new(tuning: GestureTuning) -> Self {
         Self {
             tuning,

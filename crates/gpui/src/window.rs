@@ -27,8 +27,12 @@ use crate::{
     WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
-use crate::gestures::{BackGestureSource, RecognizedTouchGesture, TouchGestureRecognizer};
-use crate::interactive::{PointerDevice, PointerSource, TouchEvent, TouchId, TouchPhase};
+use crate::gestures::{
+    BackGestureSource, PinchArena, PinchChange, RecognizedTouchGesture, TouchGestureRecognizer,
+};
+use crate::interactive::{
+    PinchEvent, PointerDevice, PointerSource, TouchEvent, TouchId, TouchPhase,
+};
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 use derive_more::{Deref, DerefMut};
@@ -1307,6 +1311,8 @@ pub struct Window {
     pointer_source: Option<PointerSource>,
     /// Where each touch in progress goes, decided when it started.
     touch_routes: FxHashMap<TouchId, TouchRoute>,
+    /// Which touches the element pinching now has (Flutter's arena for its scale recognizer).
+    pinch: PinchArena,
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
@@ -1652,8 +1658,12 @@ fn default_bounds(
 enum TouchRoute {
     /// Its started event is being dispatched and nobody has decided yet.
     Deciding,
-    /// The gesture recognizer, which turns it into mouse and scroll events.
-    Gestures,
+    /// The gesture recognizer, which turns it into mouse and scroll events,
+    /// and the pinches of the elements that joined it, deepest first
+    /// ([`Window::join_pinch`]).
+    Gestures {
+        pinch: SmallVec<[GlobalElementId; 1]>,
+    },
     /// The element that claimed it: every later phase goes to its touch
     /// listeners wherever it is drawn now, and no events are synthesized.
     Claimed(GlobalElementId),
@@ -2544,6 +2554,7 @@ impl Window {
             touch_prediction_enabled: true,
             pointer_source: None,
             touch_routes: FxHashMap::default(),
+            pinch: PinchArena::Idle,
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
@@ -3861,7 +3872,7 @@ impl Window {
     pub fn touch_owner(&self, touch: TouchId) -> Option<&GlobalElementId> {
         match self.touch_routes.get(&touch) {
             Some(TouchRoute::Claimed(owner)) => Some(owner),
-            Some(TouchRoute::Deciding | TouchRoute::Gestures) | None => None,
+            Some(TouchRoute::Deciding | TouchRoute::Gestures { .. }) | None => None,
         }
     }
 
@@ -3872,13 +3883,46 @@ impl Window {
     /// it: an ancestor's `on_touch` then cannot take the touch, as for a div
     /// with `on_click` or `on_scroll` (which calls this for you).
     pub fn leave_touch_to_gestures(&mut self, touch: TouchId) {
-        self.decide_touch(touch, TouchRoute::Gestures);
+        self.decide_touch(
+            touch,
+            TouchRoute::Gestures {
+                pinch: SmallVec::new(),
+            },
+        );
     }
 
-    /// The one transition out of [`TouchRoute::Deciding`]; decided routes stay.
+    /// Adds a touch to `owner`'s pinch while the touch's
+    /// [`TouchPhase::Started`] is dispatched, and leaves its taps and pans to
+    /// the gesture recognizer as [`Window::leave_touch_to_gestures`] does,
+    /// unless a deeper element claimed it. A deeper element that left it to
+    /// gestures (a button) keeps its taps, and a deeper pinch element keeps
+    /// it too: in Flutter's arena every scale recognizer under the touch
+    /// holds it. The deepest pinches, unless an earlier touch is pinching
+    /// `owner` already. The pinch's [`PinchEvent`]s go to the mouse listeners
+    /// with [`PinchEvent::touch_owner`] naming `owner`. `on_pinch` does this
+    /// for you.
+    pub fn join_pinch(&mut self, touch: TouchId, owner: &GlobalElementId) {
+        self.decide_touch(
+            touch,
+            TouchRoute::Gestures {
+                pinch: smallvec::smallvec![owner.clone()],
+            },
+        );
+    }
+
+    /// The deepest decision wins: transitions leave only
+    /// [`TouchRoute::Deciding`], except that pinches join a touch left to
+    /// gestures (Flutter's arena holds its tap and every scale).
     fn decide_touch(&mut self, touch: TouchId, decided: TouchRoute) {
-        if let Some(route @ TouchRoute::Deciding) = self.touch_routes.get_mut(&touch) {
-            *route = decided;
+        let Some(route) = self.touch_routes.get_mut(&touch) else {
+            return;
+        };
+        match (route, decided) {
+            (route @ TouchRoute::Deciding, decided) => *route = decided,
+            (TouchRoute::Gestures { pinch }, TouchRoute::Gestures { pinch: joins }) => {
+                pinch.extend(joins)
+            }
+            (TouchRoute::Gestures { .. } | TouchRoute::Claimed(_), _) => {}
         }
     }
 
@@ -6453,11 +6497,12 @@ impl Window {
             let mouse_position = mem::replace(&mut self.mouse_position, event.position);
             self.dispatch_mouse_event(event, cx);
             self.mouse_position = mouse_position;
-            self.decide_touch(event.id, TouchRoute::Gestures);
+            self.leave_touch_to_gestures(event.id);
         }
-        let claimed = match self.touch_routes.get(&event.id) {
-            Some(TouchRoute::Claimed(_)) => true,
-            Some(TouchRoute::Deciding | TouchRoute::Gestures) | None => false,
+        let (claimed, pinch) = match self.touch_routes.get(&event.id) {
+            Some(TouchRoute::Claimed(_)) => (true, SmallVec::new()),
+            Some(TouchRoute::Gestures { pinch }) => (false, pinch.clone()),
+            Some(TouchRoute::Deciding) | None => (false, SmallVec::new()),
         };
         if claimed && event.phase != TouchPhase::Started {
             self.dispatch_mouse_event(event, cx);
@@ -6469,6 +6514,25 @@ impl Window {
             if event.phase == TouchPhase::Ended {
                 self.draw_before_touch_release(cx);
             }
+            return;
+        }
+        let now = cx.background_executor().now();
+        let step = self.pinch.handle_event(
+            event,
+            &pinch,
+            self.touch_gestures.claim(),
+            now,
+            self.touch_gestures.tuning().touch_slop,
+        );
+        for cancelled in &step.won {
+            for (device, gesture) in self.touch_gestures.handle_event(cancelled, now, None) {
+                self.dispatch_recognized_touch_gesture(gesture, device, cx);
+            }
+        }
+        if let Some((owner, changes)) = step.pinch {
+            self.dispatch_touch_pinch(owner, changes, event.device, cx);
+        }
+        if !step.to_recognizer {
             return;
         }
         let mut event = event.clone();
@@ -6536,6 +6600,38 @@ impl Window {
         }
     }
 
+    /// Dispatches a touch pinch's events for `owner` to the mouse listeners,
+    /// synthesized from `device`, each hit-tested at its focal point; the
+    /// mouse stays where it was.
+    fn dispatch_touch_pinch(
+        &mut self,
+        owner: GlobalElementId,
+        changes: Vec<PinchChange>,
+        device: PointerDevice,
+        cx: &mut App,
+    ) {
+        let outer_pointer_source = self.pointer_source.replace(PointerSource {
+            device,
+            synthesized: true,
+        });
+        let mouse_position = self.mouse_position;
+        for change in changes {
+            let event = PinchEvent {
+                position: change.position,
+                delta: change.delta,
+                modifiers: self.modifiers,
+                phase: change.touch.phase(),
+                touch: Some(change.touch),
+                touch_owner: Some(owner.clone()),
+            };
+            self.mouse_position = event.position;
+            cx.propagate_event = true;
+            self.dispatch_mouse_event(&event, cx);
+        }
+        self.mouse_position = mouse_position;
+        self.pointer_source = outer_pointer_source;
+    }
+
     /// `device` is that of the touch the gesture was recognized from, so a pen
     /// and a finger down together each label their own gestures.
     fn dispatch_recognized_touch_gesture(
@@ -6599,6 +6695,10 @@ impl Window {
                 }
             }
         }
+        // A pan, or a long press or touch drag an element claimed, wins the
+        // touch from the scale recognizer too.
+        self.pinch
+            .touch_recognizer_claimed(self.touch_gestures.claim());
         self.pointer_source = outer_pointer_source;
     }
 

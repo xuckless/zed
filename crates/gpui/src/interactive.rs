@@ -614,8 +614,9 @@ impl Default for ScrollDelta {
     }
 }
 
-/// A pinch gesture event from the platform, generated when the user performs
-/// a pinch-to-zoom gesture (typically on a trackpad).
+/// A pinch gesture event, generated when the user performs a pinch-to-zoom
+/// gesture: on a trackpad (from the platform) or with two or more fingers on a
+/// touch screen (recognized by GPUI, see [`TouchPinch`](crate::TouchPinch)).
 ///
 #[derive(Clone, Debug, Default)]
 pub struct PinchEvent {
@@ -632,6 +633,39 @@ pub struct PinchEvent {
 
     /// The phase of the pinch gesture.
     pub phase: TouchPhase,
+
+    /// A touch pinch's details (Flutter's scale callbacks), `None` for a
+    /// trackpad pinch. Its variant matches `phase`.
+    pub touch: Option<crate::TouchPinch>,
+
+    /// The element a touch pinch is for (`Some` exactly when `touch` is).
+    pub(crate) touch_owner: Option<crate::GlobalElementId>,
+}
+
+impl PinchEvent {
+    /// A pinch the platform recognized, such as a trackpad's.
+    pub fn new(
+        position: Point<Pixels>,
+        delta: f32,
+        modifiers: Modifiers,
+        phase: TouchPhase,
+    ) -> Self {
+        Self {
+            position,
+            delta,
+            modifiers,
+            phase,
+            touch: None,
+            touch_owner: None,
+        }
+    }
+
+    /// The element a touch pinch is for: the one that joined its touches
+    /// ([`Window::join_pinch`](crate::Window::join_pinch)). `None` for a
+    /// trackpad pinch.
+    pub fn touch_owner(&self) -> Option<&crate::GlobalElementId> {
+        self.touch_owner.as_ref()
+    }
 }
 
 impl Sealed for PinchEvent {}

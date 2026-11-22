@@ -2750,12 +2750,12 @@ impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()>
                 fingers: _,
             } => {
                 state.pinch_scale = 1.0;
-                let input = PlatformInput::Pinch(PinchEvent {
-                    position: state.mouse_location.unwrap_or(point(px(0.0), px(0.0))),
-                    delta: 0.0,
-                    modifiers: state.modifiers,
-                    phase: TouchPhase::Started,
-                });
+                let input = PlatformInput::Pinch(PinchEvent::new(
+                    state.mouse_location.unwrap_or(point(px(0.0), px(0.0))),
+                    0.0,
+                    state.modifiers,
+                    TouchPhase::Started,
+                ));
                 drop(state);
                 window.handle_input(input);
             }
@@ -2765,12 +2765,12 @@ impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()>
                 let zoom_delta = new_absolute_scale - previous_scale;
                 state.pinch_scale = new_absolute_scale;
 
-                let input = PlatformInput::Pinch(PinchEvent {
-                    position: state.mouse_location.unwrap_or(point(px(0.0), px(0.0))),
-                    delta: zoom_delta,
-                    modifiers: state.modifiers,
-                    phase: TouchPhase::Moved,
-                });
+                let input = PlatformInput::Pinch(PinchEvent::new(
+                    state.mouse_location.unwrap_or(point(px(0.0), px(0.0))),
+                    zoom_delta,
+                    state.modifiers,
+                    TouchPhase::Moved,
+                ));
                 drop(state);
                 window.handle_input(input);
             }
@@ -2780,12 +2780,12 @@ impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()>
                 cancelled: _,
             } => {
                 state.pinch_scale = 1.0;
-                let input = PlatformInput::Pinch(PinchEvent {
-                    position: state.mouse_location.unwrap_or(point(px(0.0), px(0.0))),
-                    delta: 0.0,
-                    modifiers: state.modifiers,
-                    phase: TouchPhase::Ended,
-                });
+                let input = PlatformInput::Pinch(PinchEvent::new(
+                    state.mouse_location.unwrap_or(point(px(0.0), px(0.0))),
+                    0.0,
+                    state.modifiers,
+                    TouchPhase::Ended,
+                ));
                 drop(state);
                 window.handle_input(input);
             }
