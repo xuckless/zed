@@ -1420,6 +1420,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     ) -> Option<Box<dyn std::any::Any>> {
         None
     }
+    /// Who gets pointer input over a shown native view: the view itself
+    /// (macOS), or the window's own content (iOS, Windows, Wayland).
+    fn native_view_input(&self) -> crate::NativeViewInput {
+        crate::NativeViewInput::View
+    }
     /// Gives keyboard input to the native view, or back to the window's own
     /// content for `None`.
     fn set_focused_native_view(&self, _id: Option<crate::NativeViewId>) {}

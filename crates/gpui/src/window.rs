@@ -79,6 +79,9 @@ mod prompts;
 pub use a11y::A11ySubtreeBuilder;
 use native_view::NativeViewState;
 pub use native_view::{NativeView, NativeViewId};
+mod native_view_input;
+use native_view_input::Occlusion;
+pub use native_view_input::NativeViewInput;
 
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
@@ -963,6 +966,13 @@ pub enum HitboxBehavior {
     /// inconsistent UI where clicks and moves interact with elements that are not considered to
     /// be hovered.
     BlockMouseExceptScroll,
+
+    /// Like [`HitboxBehavior::BlockMouse`], except that the hitboxes of the
+    /// element's ancestors still hear the mouse: everything painted behind the
+    /// element that does not contain it is ignored. A native view whose input
+    /// reaches the window sets this (`NativeViewInput::Window`), so it occludes
+    /// like a solid element while its element's listeners hear the input.
+    BlockMouseExceptAncestors,
 }
 
 /// An identifier for a tooltip.
@@ -1189,9 +1199,11 @@ impl Frame {
     pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
+        let mut occlusion = Occlusion::None;
         for hitbox in self.hitboxes.iter().rev() {
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
-            if bounds.contains(&position) {
+            if bounds.contains(&position) && !occlusion.hides(hitbox) {
+                occlusion = occlusion.behind(hitbox, &self.dispatch_tree);
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll

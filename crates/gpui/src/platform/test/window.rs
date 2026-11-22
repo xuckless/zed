@@ -1,8 +1,8 @@
 use crate::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, DispatchEventResult, DisplayId, GpuSpecs,
-    HeadlessAtlas, KeyDownEvent, NativeViewId, Pixels, Platform, PlatformAtlas, PlatformDisplay,
-    PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, RequestFrameOptions, Scene, Size, TestDisplay, TestPlatform,
+    HeadlessAtlas, KeyDownEvent, NativeViewId, NativeViewInput, Pixels, Platform, PlatformAtlas,
+    PlatformDisplay, PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow,
+    Point, PromptButton, RequestFrameOptions, Scene, Size, TestDisplay, TestPlatform,
     TextInputConfiguration, TextInputStateChange, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControlArea, WindowInsets, WindowParams, WindowVisibility,
 };
@@ -34,6 +34,7 @@ pub(crate) struct TestWindowState {
     hit_test_window_control_callback: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
     attached_native_views: Rc<Cell<usize>>,
     focused_native_view: Option<NativeViewId>,
+    native_view_input: NativeViewInput,
     hit_test_native_view_callback: Option<Box<dyn FnMut(Point<Pixels>) -> Option<NativeViewId>>>,
     native_view_focused_callback: Option<Box<dyn FnMut(NativeViewId)>>,
     key_down_before_native_view_callback: Option<Box<dyn FnMut(KeyDownEvent) -> bool>>,
@@ -134,6 +135,7 @@ impl TestWindow {
             appearance_change_callback: None,
             attached_native_views: Rc::new(Cell::new(0)),
             focused_native_view: None,
+            native_view_input: NativeViewInput::View,
             hit_test_native_view_callback: None,
             native_view_focused_callback: None,
             key_down_before_native_view_callback: None,
@@ -280,6 +282,12 @@ impl TestWindow {
             lock.bounds.size
         };
         self.simulate_resize(size);
+    }
+
+    /// Makes native views attached from now on take pointer input as `input`
+    /// says, as Wayland's do with [`NativeViewInput::Window`].
+    pub fn set_native_view_input(&self, input: NativeViewInput) {
+        self.0.lock().native_view_input = input;
     }
 
     /// How many native views are attached to the window.
@@ -668,6 +676,10 @@ impl PlatformWindow for TestWindow {
         let attached_native_views = self.0.lock().attached_native_views.clone();
         attached_native_views.set(attached_native_views.get() + 1);
         Some(Box::new(Attachment(attached_native_views)))
+    }
+
+    fn native_view_input(&self) -> NativeViewInput {
+        self.0.lock().native_view_input
     }
 
     fn set_focused_native_view(&self, id: Option<NativeViewId>) {

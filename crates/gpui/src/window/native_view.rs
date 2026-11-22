@@ -1,9 +1,8 @@
 use crate::{Action, KeyBinding, KeyDownEvent, PlatformInput};
 use crate::{
     AnyWindowHandle, App, Bounds, Element, ElementId, FocusHandle, FocusId, Focusable,
-    GlobalElementId, Hitbox, HitboxBehavior, HitboxId, Hsla, InspectorElementId,
-    InteractiveElement, IntoElement, LayoutId, PaintNativeView, ParentElement, Pixels, Point,
-    Style, Styled, Window, div,
+    GlobalElementId, Hitbox, HitboxId, Hsla, InspectorElementId, InteractiveElement, IntoElement,
+    LayoutId, PaintNativeView, ParentElement, Pixels, Point, Style, Styled, Window, div,
 };
 use anyhow::{Context as _, Result};
 use collections::HashSet;
@@ -29,8 +28,21 @@ impl NativeViewId {
 
 /// A view owned by the platform's UI toolkit, shown inside a GPUI window.
 ///
-/// Only macOS shows native views so far, where the view is an `NSView`.
-/// [`NativeView::new`] fails on every other platform.
+/// macOS shows an `NSView`, iOS a `UIView`, Windows DirectComposition
+/// content (usually a composition swap chain), and Wayland a `wl_surface` the
+/// app created on GPUI's own connection. [`NativeView::new`] fails on every
+/// other platform.
+///
+/// On a platform whose native views take no input of their own
+/// ([`crate::NativeViewInput::Window`]: iOS, Windows, Wayland), pointer input
+/// over the view is hit-tested like any solid element's: listeners added to
+/// the element this handle becomes (`view.into_element().on_mouse_move(…)`)
+/// and its ancestors hear it, elements painted before the view hear nothing
+/// over it, elements painted after the view take theirs, and
+/// [`bounds`](Self::bounds) makes positions view-relative. Keys pressed while
+/// the view's [`FocusHandle`] is focused are dispatched from that element like
+/// any other key press, so the app forwards the ones it wants to the view.
+/// The rest of this comment describes macOS ([`crate::NativeViewInput::View`]).
 ///
 /// The view is composited beneath the window's GPUI content and shows through
 /// wherever this handle is used as an element, so elements painted after it
@@ -92,7 +104,13 @@ impl NativeView {
     ///
     /// `view` must point to a live view of the kind the window's platform
     /// embeds, which is an `NSView` on macOS, and that view must not be in
-    /// another view hierarchy.
+    /// another view hierarchy. On iOS it is a `UIView`. On Windows it is a
+    /// COM object (`IUnknown`) that `IDCompositionVisual::SetContent` takes,
+    /// usually a composition swap chain the app presents to on its own.
+    /// On Wayland it is a `wl_proxy` of a `wl_surface`
+    /// made on the window's own `wl_display`, with no role, no `wp_viewport`
+    /// and no subsurfaces of its own; GPUI makes it a subsurface of the window
+    /// and places it, and the app attaches and commits its buffers.
     ///
     /// GPUI retains the view and puts it inside a view of its own, until the
     /// last clone of the returned handle is dropped. Until then GPUI decides the
@@ -137,6 +155,22 @@ impl NativeView {
         cx.defer(move |cx| {
             window.update(cx, |_, window, _| window.refresh()).ok();
         });
+    }
+
+    /// Where the view showed in the frame last drawn, in window coordinates,
+    /// which turns a pointer position into one relative to the view.
+    pub fn bounds(&self, window: &Window) -> Option<Bounds<Pixels>> {
+        let frame = &window.rendered_frame;
+        let shown = frame
+            .scene
+            .native_views
+            .iter()
+            .find(|native_view| native_view.id == self.0.id)?;
+        frame
+            .hitboxes
+            .iter()
+            .find(|hitbox| hitbox.id == shown.hitbox_id)
+            .map(|hitbox| hitbox.bounds)
     }
 
     /// Makes key bindings for `A` apply before the view sees the key.
@@ -225,11 +259,10 @@ impl Element for NativeViewElement {
                 .any(|hitbox| hitbox.id == shown)
         });
         let shows_view = is_visible && !is_shown_elsewhere;
-        let behavior = if shows_view {
-            HitboxBehavior::BlockMouse
-        } else {
-            HitboxBehavior::Normal
-        };
+        let behavior = window
+            .platform_window
+            .native_view_input()
+            .hitbox_behavior(shows_view);
         let hitbox = window.insert_hitbox(bounds, behavior);
         if shows_view {
             state.shown_hitbox.set(Some(hitbox.id));
