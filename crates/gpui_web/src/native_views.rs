@@ -72,6 +72,8 @@ impl<T> CallbackSlot<T> {
 
 type HitTest = Box<dyn FnMut(Point<Pixels>) -> Option<NativeViewId>>;
 type Occluders = Box<dyn FnMut() -> Vec<Bounds<Pixels>>>;
+/// GPUI's callback that turns DOM focus inside a view into GPUI focus.
+type Focused = CallbackSlot<Box<dyn FnMut(NativeViewId)>>;
 
 #[derive(Default)]
 pub(crate) struct NativeViews {
@@ -79,6 +81,7 @@ pub(crate) struct NativeViews {
     layer: RefCell<Option<Layer>>,
     hit_test: CallbackSlot<HitTest>,
     occluders: CallbackSlot<Occluders>,
+    focused: Focused,
 }
 
 struct Layer {
@@ -103,6 +106,7 @@ struct Slot {
     id: NativeViewId,
     slot: web_sys::HtmlElement,
     wrapper: web_sys::HtmlElement,
+    content: web_sys::HtmlElement,
     /// Where it was last placed, its rank in paint order and the CSS colour under it; `None` while hidden.
     placed: Option<(Placement, usize, String)>,
 }
@@ -259,6 +263,10 @@ impl NativeViews {
         self.occluders.set(callback);
     }
 
+    pub(crate) fn set_focused(&self, callback: Box<dyn FnMut(NativeViewId)>) {
+        self.focused.set(callback);
+    }
+
     fn shows_views(&self) -> bool {
         self.layer
             .borrow()
@@ -392,7 +400,29 @@ impl WebWindowInner {
                 },
             )
         });
-        let listeners = pointer.collect();
+        // DOM focus moving into a view: `focusin` within this document; the window's `blur` when it moves into an
+        // iframe, whose document gets the events (the parent sees no `focusin`).
+        let focus_targets: [(&web_sys::EventTarget, &'static str); 2] = [
+            (document.as_ref(), "focusin"),
+            (self.browser_window.as_ref(), "blur"),
+        ];
+        let focus = focus_targets.map(|(target, event_name)| {
+            let window = Rc::downgrade(self);
+            let browser_window = self.browser_window.clone();
+            EventListenerHandle::add(target, event_name, move |_| {
+                // After this task: Firefox fires the window's `blur` before `activeElement` is the iframe.
+                let window = window.clone();
+                let report = Closure::once_into_js(move || {
+                    if let Some(window) = window.upgrade() {
+                        window.report_native_view_focus();
+                    }
+                });
+                browser_window
+                    .set_timeout_with_callback(report.unchecked_ref())
+                    .ok();
+            })
+        });
+        let listeners = pointer.chain(focus).collect();
         Some(Layer {
             root,
             slots_element,
@@ -442,12 +472,37 @@ impl WebWindowInner {
             id,
             slot,
             wrapper,
+            content,
             placed: None,
         })
     }
 
-    /// Flutter's `clearPlatformView` / `disposeView`: the slot leaves the document with the content in it.
-    /// The last view takes the layer with it: the canvas gets its own styles back and the document's listeners go.
+    /// DOM focus moved: if it is inside a view's slot now, GPUI focuses that view's handle.
+    fn report_native_view_focus(&self) {
+        let focused = self.native_views.layer.borrow().as_ref().and_then(|layer| {
+            layer
+                .slots
+                .iter()
+                .find(|slot| self.holds_focus(&slot.slot))
+                .map(|slot| slot.id)
+        });
+        if let Some(id) = focused {
+            self.native_views.focused.with(|callback| callback(id));
+        }
+    }
+
+    /// Whether DOM focus is inside `element`.
+    fn holds_focus(&self, element: &web_sys::Node) -> bool {
+        self.browser_window
+            .document()
+            .and_then(|document| document.active_element())
+            .is_some_and(|active| element.contains(Some(&active)))
+    }
+
+    /// Flutter's `clearPlatformView` / `disposeView`: the slot leaves the document with the content in it. Focus
+    /// inside it goes back to GPUI's input element (the browser would leave it on the body, where no key reaches
+    /// GPUI). The last view takes the layer with it: the canvas gets its own styles back and the document's
+    /// listeners go.
     fn detach_native_view(&self, id: NativeViewId) {
         let slot = {
             let mut layer = self.native_views.layer.borrow_mut();
@@ -459,6 +514,10 @@ impl WebWindowInner {
             };
             layer.slots.remove(index)
         };
+        // Focusing fires focus events GPUI may answer, so no borrow is held.
+        if self.holds_focus(&slot.slot) {
+            self.ime_mirror.focus();
+        }
         slot.slot.remove();
         let mut layer = self.native_views.layer.borrow_mut();
         let Some(current) = layer.as_mut() else {
@@ -692,6 +751,37 @@ impl WebWindowInner {
         event.stop_propagation();
         if let Some(target) = target {
             send_copy(event, target);
+        }
+    }
+
+    /// Gives the view's element DOM focus, or takes it back to GPUI's own input element.
+    /// Focusing fires focus events GPUI may answer, so the layer is not borrowed meanwhile.
+    pub(crate) fn focus_native_view(&self, id: Option<NativeViewId>) {
+        let Some((content, root)) = self.native_views.layer.borrow().as_ref().map(|layer| {
+            let content = id.and_then(|id| {
+                layer
+                    .slots
+                    .iter()
+                    .find(|slot| slot.id == id)
+                    .map(|slot| slot.content.clone())
+            });
+            (content, layer.root.clone())
+        }) else {
+            return;
+        };
+        match (id, content) {
+            // Focus already inside the element (an `<input>` in it) stays where the user put it.
+            (Some(_), Some(content)) if self.holds_focus(&content) => {}
+            // The `focusin` this fires reports the view GPUI has just focused, which changes nothing.
+            (Some(_), Some(content)) => {
+                content.focus().ok();
+            }
+            (Some(_), None) => {}
+            (None, _) => {
+                if self.holds_focus(&root) {
+                    self.ime_mirror.focus();
+                }
+            }
         }
     }
 }

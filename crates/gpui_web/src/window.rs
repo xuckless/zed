@@ -1115,6 +1115,10 @@ impl PlatformWindow for WebWindow {
         self.inner.attach_native_view(id, content)
     }
 
+    fn set_focused_native_view(&self, id: Option<gpui::NativeViewId>) {
+        self.inner.focus_native_view(id);
+    }
+
     fn on_hit_test_native_view(
         &self,
         callback: Box<dyn FnMut(Point<Pixels>) -> Option<gpui::NativeViewId>>,
@@ -1124,6 +1128,10 @@ impl PlatformWindow for WebWindow {
 
     fn on_native_view_occluders(&self, callback: Box<dyn FnMut() -> Vec<Bounds<Pixels>>>) {
         self.inner.native_views.set_occluders(callback);
+    }
+
+    fn on_native_view_focused(&self, callback: Box<dyn FnMut(gpui::NativeViewId)>) {
+        self.inner.native_views.set_focused(callback);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
