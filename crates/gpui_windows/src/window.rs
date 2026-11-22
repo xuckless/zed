@@ -1034,7 +1034,8 @@ impl PlatformWindow for WindowsWindow {
     }
 
     /// `view` is any COM object `IDCompositionVisual::SetContent` takes, usually a composition swap chain the app
-    /// presents to on its own device; it shows under GPUI's content through DirectComposition, never a child window.
+    /// presents to on its own device, or an `IDCompositionVisual` made on [`crate::composition_device`] (WebView2's
+    /// root visual target); it shows under GPUI's content through DirectComposition, never a child window.
     unsafe fn attach_native_view(
         &self,
         id: NativeViewId,

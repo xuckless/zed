@@ -26,7 +26,7 @@ use windows::{
         },
         Dxgi::{DXGI_PRESENT, IDXGISwapChain1},
     },
-    core::IUnknown,
+    core::{IUnknown, Interface as _},
 };
 
 use super::{
@@ -46,6 +46,8 @@ pub(super) struct NativeViews {
     /// Views whose last handle was dropped while the renderer was borrowed (it draws), taken out of the tree when the
     /// next frame starts. Shared with each `NativeViewAttachment`.
     detached: Rc<RefCell<Vec<NativeViewId>>>,
+    /// The app's `native_view_host::on_composition_device_changed` callbacks.
+    pub(super) composition_device_changed: Vec<Box<dyn FnMut()>>,
 }
 
 /// The part of the swap chain a native view shows through: cleared to transparent in paint order, as the Metal
@@ -133,9 +135,16 @@ impl NativeViewTree {
             let content_visual = comp_device.CreateVisual()?;
             clip_visual.SetClip(&clip)?;
             clip_visual.AddVisual(&content_visual, false, None)?;
-            content_visual
-                .SetContent(content)
-                .context("the native view's content is not something DirectComposition shows")?;
+            // A visual the app made on this device (`composition_device`, e.g. WebView2's root visual target) joins
+            // the tree under the content visual; anything else is the content visual's content.
+            match content.cast::<IDCompositionVisual>() {
+                Ok(visual) => content_visual
+                    .AddVisual(&visual, false, None)
+                    .context("the native view's visual is not on this window's DirectComposition device")?,
+                Err(_) => content_visual
+                    .SetContent(content)
+                    .context("the native view's content is not something DirectComposition shows")?,
+            }
             ViewVisuals {
                 clip_visual,
                 clip,
@@ -160,6 +169,7 @@ impl NativeViewTree {
                 self.views_visual.RemoveVisual(&visuals.clip_visual)?;
             }
             visuals.content_visual.SetContent(None)?;
+            visuals.content_visual.RemoveAllVisuals()?;
             comp_device.Commit()?;
         }
         Ok(())
@@ -242,11 +252,11 @@ impl NativeViewTree {
 
 impl DirectComposition {
     /// Shows every attached view's content again, on a new device after the old one was lost.
-    pub(super) fn reattach_native_views(&mut self, native_views: &NativeViews) -> Result<()> {
+    pub(super) fn reattach_native_views(&mut self, native_views: &NativeViews) {
         for (id, content) in &native_views.contents {
-            self.view_tree.attach(&self.comp_device, *id, content)?;
+            // A visual made on the lost device cannot join the new tree; the app must make it again.
+            self.view_tree.attach(&self.comp_device, *id, content).log_err();
         }
-        Ok(())
     }
 }
 

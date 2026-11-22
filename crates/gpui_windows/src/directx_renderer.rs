@@ -24,6 +24,7 @@ use crate::directx_renderer::native_view_tree::{NativeViewHole, NativeViewTree, 
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use crate::*;
 
+pub(crate) mod native_view_host;
 mod native_view_surface;
 mod native_view_tree;
 use gpui::*;
@@ -343,7 +344,7 @@ impl DirectXRenderer {
             let mut composition =
                 DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), self.hwnd)?;
             composition.set_swap_chain(&resources.swap_chain)?;
-            composition.reattach_native_views(&self.native_views)?;
+            composition.reattach_native_views(&self.native_views);
             Some(composition)
         };
 

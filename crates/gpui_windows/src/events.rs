@@ -1564,6 +1564,8 @@ impl WindowsWindowInner {
         {
             panic!("Device lost: {err}");
         }
+        // A visual the app made on the lost composition device can't join the new tree: the app makes it again.
+        crate::directx_renderer::native_view_host::composition_device_changed(self);
         // Make sure the first `draw_window` after recovery (whether it comes
         // from the forced WM_GPUI_FORCE_UPDATE_WINDOW or a stray WM_PAINT in
         // between) is treated as a forced render so it both clears

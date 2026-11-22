@@ -42,11 +42,12 @@ impl NativeViewId {
 ///
 /// macOS shows an `NSView`, iOS a `UIView`, Windows DirectComposition
 /// content (usually a composition swap chain), Wayland a `wl_surface` the
-/// app created on GPUI's own connection, and the web a DOM element under the
-/// canvas. [`NativeView::new`] fails on every other platform.
+/// app created on GPUI's own connection, Android a `SurfaceControl` or a
+/// `View`, and the web a DOM element under the canvas. [`NativeView::new`]
+/// fails on X11 and wherever the window can't show one.
 ///
 /// On a platform whose native views take no input of their own
-/// ([`crate::NativeViewInput::Window`]: iOS, Windows, Wayland), pointer input
+/// ([`crate::NativeViewInput::Window`]: iOS, Windows, Wayland, Android), pointer input
 /// over the view is hit-tested like any solid element's: listeners added to
 /// the element this handle becomes (`view.into_element().on_mouse_move(…)`)
 /// and its ancestors hear it, elements painted before the view hear nothing
@@ -114,8 +115,9 @@ impl NativeView {
     ///
     /// # Errors
     ///
-    /// Fails on platforms that cannot composite native views, which is every
-    /// platform but macOS for now.
+    /// Fails where the window cannot composite native views: on X11, on Wayland
+    /// without `wl_subcompositor` and `wp_viewporter` or with a window surface
+    /// that can't blend, on Windows with DirectComposition turned off.
     ///
     /// # Safety
     ///
@@ -123,7 +125,9 @@ impl NativeView {
     /// embeds, which is an `NSView` on macOS, and that view must not be in
     /// another view hierarchy. On iOS it is a `UIView`. On Windows it is a
     /// COM object (`IUnknown`) that `IDCompositionVisual::SetContent` takes,
-    /// usually a composition swap chain the app presents to on its own.
+    /// usually a composition swap chain the app presents to on its own, or an
+    /// `IDCompositionVisual` made on the window's own DirectComposition device
+    /// (`gpui_windows::composition_device`), such as WebView2's root visual target.
     /// On Wayland it is a `wl_proxy` of a `wl_surface`
     /// made on the window's own `wl_display`, with no role, no `wp_viewport`
     /// and no subsurfaces of its own; GPUI makes it a subsurface of the window
