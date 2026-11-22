@@ -11,12 +11,12 @@ use ctor::ctor;
 use dispatch2::DispatchQueue;
 use futures::channel::oneshot;
 use gpui::{
-    Action, ActivationPolicy, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem,
-    CursorStyle, ForegroundExecutor, GraphicalEnvironment, KeyContext, Keymap, Menu, MenuItem,
-    OsMenu, OwnedMenu, PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout,
-    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, PowerMode, Result, SystemMenuType,
-    Task, ThermalState, WindowAppearance, WindowKind, WindowParams, WindowingRequest,
-    popup::PopupNotSupportedError,
+    AccessibilityDisplaySettings, Action, ActivationPolicy, ActivityGuard, AnyWindowHandle,
+    BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor, GraphicalEnvironment,
+    KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    PlatformWindow, PowerMode, Result, SystemMenuType, Task, ThermalState, WindowAppearance,
+    WindowKind, WindowParams, WindowingRequest, popup::PopupNotSupportedError,
 };
 use gpui_apple::{
     keychain,
@@ -35,7 +35,8 @@ use objc2_app_kit::{
     NSAppearanceNameVibrantLight, NSApplication, NSApplicationActivationPolicy,
     NSApplicationOcclusionState, NSControlStateValueOn, NSCursor, NSDocumentController,
     NSEventModifierFlags, NSMenu, NSMenuItem, NSModalResponse, NSModalResponseOK, NSOpenPanel,
-    NSSavePanel, NSScroller, NSScrollerStyle, NSWorkspace, NSWorkspaceDidWakeNotification,
+    NSSavePanel, NSScroller, NSScrollerStyle, NSWorkspace,
+    NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification, NSWorkspaceDidWakeNotification,
     NSWorkspaceWillSleepNotification,
 };
 use objc2_foundation::{
@@ -180,6 +181,7 @@ pub(crate) struct MacPlatformState {
     on_keyboard_layout_change: Option<Box<dyn FnMut()>>,
     thermal_observer: Option<ProcessInfoObserver>,
     power_mode_observer: Option<ProcessInfoObserver>,
+    accessibility_display_observer: Option<ProcessInfoObserver>,
     on_displays_changed: Option<Box<dyn FnMut()>>,
     on_system_sleep: Option<Box<dyn FnMut()>>,
     on_system_wake: Option<Box<dyn FnMut()>>,
@@ -258,6 +260,7 @@ impl MacPlatform {
             on_keyboard_layout_change: None,
             thermal_observer: None,
             power_mode_observer: None,
+            accessibility_display_observer: None,
             on_displays_changed: None,
             on_system_sleep: None,
             on_system_wake: None,
@@ -1079,6 +1082,26 @@ impl Platform for MacPlatform {
         self.0.lock().power_mode_observer = Some(observer);
     }
 
+    fn accessibility_display_settings(&self) -> Option<AccessibilityDisplaySettings> {
+        Some(accessibility_display_settings())
+    }
+
+    fn on_accessibility_display_settings_change(
+        &self,
+        mut callback: Box<dyn FnMut(AccessibilityDisplaySettings)>,
+    ) {
+        // AppKit posts one notification on NSWorkspace's own center for any display option (System Settings >
+        // Accessibility > Display), so both settings are read again on each.
+        let observer = process_info::observe_notification(
+            NSWorkspace::sharedWorkspace().notificationCenter(),
+            // SAFETY: AppKit's notification name, an immutable static.
+            unsafe { NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification },
+            &self.foreground_executor(),
+            Box::new(move || callback(accessibility_display_settings())),
+        );
+        self.0.lock().accessibility_display_observer = Some(observer);
+    }
+
     fn on_system_wake(&self, callback: Box<dyn FnMut()>) {
         self.0.lock().on_system_wake = Some(callback);
         self.ensure_system_power_observers();
@@ -1393,6 +1416,15 @@ extern "C-unwind" fn did_finish_launching(this: &AnyObject, _: Sel, _: *mut AnyO
         if let Some(callback) = callback {
             callback();
         }
+    }
+}
+
+/// System Settings > Accessibility > Display: Reduce motion, Reduce transparency.
+fn accessibility_display_settings() -> AccessibilityDisplaySettings {
+    let workspace = NSWorkspace::sharedWorkspace();
+    AccessibilityDisplaySettings {
+        reduce_motion: workspace.accessibilityDisplayShouldReduceMotion(),
+        reduce_transparency: workspace.accessibilityDisplayShouldReduceTransparency(),
     }
 }
 

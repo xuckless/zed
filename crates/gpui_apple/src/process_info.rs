@@ -1,7 +1,10 @@
 use block2::RcBlock;
 use futures::{StreamExt, channel::mpsc};
 use gpui::{ForegroundExecutor, PowerMode, Task, ThermalState};
-use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2::{
+    rc::Retained,
+    runtime::{AnyObject, ProtocolObject},
+};
 use objc2_foundation::{
     NSNotification, NSNotificationCenter, NSNotificationName, NSObjectProtocol, NSProcessInfo,
     NSProcessInfoPowerStateDidChangeNotification, NSProcessInfoThermalState,
@@ -67,6 +70,17 @@ pub fn observe_power_mode(
     )
 }
 
+/// Runs `callback` on `executor` after each `name` notification `center` posts, from any sender: UIKit's and
+/// AppKit's accessibility settings notifications. Deferred and removed on drop, as the process info observers.
+pub fn observe_notification(
+    center: Retained<NSNotificationCenter>,
+    name: &NSNotificationName,
+    executor: &ForegroundExecutor,
+    callback: Box<dyn FnMut()>,
+) -> ProcessInfoObserver {
+    ProcessInfoObserver::with_center(center, name, None, executor, callback)
+}
+
 pub struct ProcessInfoObserver {
     center: Retained<NSNotificationCenter>,
     observer: Retained<ProtocolObject<dyn NSObjectProtocol>>,
@@ -82,14 +96,17 @@ impl ProcessInfoObserver {
         Self::with_center(
             NSNotificationCenter::defaultCenter(),
             name,
+            Some(&NSProcessInfo::processInfo()),
             executor,
             callback,
         )
     }
 
+    /// `object`: the sender to observe, `None` for any.
     fn with_center(
         center: Retained<NSNotificationCenter>,
         name: &NSNotificationName,
+        object: Option<&AnyObject>,
         executor: &ForegroundExecutor,
         mut callback: Box<dyn FnMut()>,
     ) -> Self {
@@ -102,12 +119,7 @@ impl ProcessInfoObserver {
             }
         });
         let observer = unsafe {
-            center.addObserverForName_object_queue_usingBlock(
-                Some(name),
-                Some(&NSProcessInfo::processInfo()),
-                None,
-                &block,
-            )
+            center.addObserverForName_object_queue_usingBlock(Some(name), object, None, &block)
         };
         let task = executor.spawn(async move {
             while receiver.next().await.is_some() {
@@ -163,6 +175,7 @@ mod tests {
         let observer = ProcessInfoObserver::with_center(
             center.clone(),
             name,
+            Some(&NSProcessInfo::processInfo()),
             &cx.foreground_executor,
             Box::new({
                 let calls = calls.clone();

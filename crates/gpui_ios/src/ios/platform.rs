@@ -17,10 +17,11 @@ use futures::{
     channel::{mpsc, oneshot},
 };
 use gpui::{
-    Action, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardItem, CursorStyle,
-    DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, PowerMode, Result, Task, ThermalState, WindowAppearance, WindowParams,
+    AccessibilityDisplaySettings, Action, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor,
+    ClipboardItem, CursorStyle, DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem,
+    PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper,
+    PlatformTextSystem, PlatformWindow, PowerMode, Result, Task, ThermalState, WindowAppearance,
+    WindowParams,
 };
 use gpui_apple::{
     AppleDispatcher, keychain, main_thread_marker,
@@ -31,9 +32,11 @@ use objc2_foundation::{
     NSBundle, NSDictionary, NSNotification, NSNotificationCenter, NSObjectProtocol, NSString, NSURL,
 };
 use objc2_ui_kit::{
-    UIApplication, UIPasteboard, UIScreenModeDidChangeNotification,
-    UITextInputCurrentInputModeDidChangeNotification, UITraitEnvironment, UIUserInterfaceStyle,
-    UIViewController,
+    UIAccessibilityIsReduceMotionEnabled, UIAccessibilityIsReduceTransparencyEnabled,
+    UIAccessibilityReduceMotionStatusDidChangeNotification,
+    UIAccessibilityReduceTransparencyStatusDidChangeNotification, UIApplication, UIPasteboard,
+    UIScreenModeDidChangeNotification, UITextInputCurrentInputModeDidChangeNotification,
+    UITraitEnvironment, UIUserInterfaceStyle, UIViewController,
 };
 #[allow(deprecated)]
 // Match UIScreen enumeration, including displays without a connected scene.
@@ -54,6 +57,8 @@ pub(crate) struct IosPlatformState {
     text_system: Arc<dyn PlatformTextSystem>,
     thermal_observer: RefCell<Option<ProcessInfoObserver>>,
     power_mode_observer: RefCell<Option<ProcessInfoObserver>>,
+    /// Observe the reduce-motion and reduce-transparency settings, one notification each.
+    accessibility_display_observers: RefCell<Vec<ProcessInfoObserver>>,
     display_observers: RefCell<Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>>,
     display_task: RefCell<Option<Task<()>>>,
     displays_changed_callback: CallbackSlot<Box<dyn FnMut()>>,
@@ -80,6 +85,7 @@ impl IosPlatform {
             text_system,
             thermal_observer: RefCell::new(None),
             power_mode_observer: RefCell::new(None),
+            accessibility_display_observers: RefCell::new(Vec::new()),
             display_observers: RefCell::new(Vec::new()),
             display_task: RefCell::new(None),
             displays_changed_callback: CallbackSlot::default(),
@@ -460,6 +466,39 @@ impl Platform for IosPlatform {
             .spawn(async move { Ok(keychain::delete_credentials(&url)?) })
     }
 
+    fn accessibility_display_settings(&self) -> Option<AccessibilityDisplaySettings> {
+        Some(accessibility_display_settings())
+    }
+
+    fn on_accessibility_display_settings_change(
+        &self,
+        callback: Box<dyn FnMut(AccessibilityDisplaySettings)>,
+    ) {
+        // React Native's RCTAccessibilityManager observes the same two notifications and reads the same two
+        // functions. Each observer defers to the foreground executor: UIKit may post inside another callback.
+        let callback = Rc::new(RefCell::new(callback));
+        // SAFETY: UIKit's notification names, immutable statics.
+        let names = unsafe {
+            [
+                UIAccessibilityReduceMotionStatusDidChangeNotification,
+                UIAccessibilityReduceTransparencyStatusDidChangeNotification,
+            ]
+        };
+        let observers = names
+            .into_iter()
+            .map(|name| {
+                let callback = callback.clone();
+                process_info::observe_notification(
+                    NSNotificationCenter::defaultCenter(),
+                    name,
+                    &self.0.foreground_executor,
+                    Box::new(move || (callback.borrow_mut())(accessibility_display_settings())),
+                )
+            })
+            .collect();
+        *self.0.accessibility_display_observers.borrow_mut() = observers;
+    }
+
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>) {
         // The user switching keyboard (another layout or language, from the globe key or a hardware keyboard's
         // shortcut) posts UIKit's input-mode notification. It can arrive inside a UIKit text callback, so GPUI runs
@@ -511,6 +550,17 @@ impl Platform for IosPlatform {
 
     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper> {
         Rc::new(DummyKeyboardMapper)
+    }
+}
+
+/// Settings > Accessibility > Motion > Reduce Motion, and Display & Text Size > Reduce Transparency.
+// Ported from facebook/react-native packages/react-native/React/CoreModules/RCTAccessibilityManager.mm @ v0.88.1
+// (c30b7f86850d47422637a64c70508e7411dbd8ea), its `_isReduceMotionEnabled` / `_isReduceTransparencyEnabled` reads.
+// Copyright (c) Meta Platforms, Inc. and affiliates. MIT, see LICENSE-REACT-NATIVE.
+fn accessibility_display_settings() -> AccessibilityDisplaySettings {
+    AccessibilityDisplaySettings {
+        reduce_motion: UIAccessibilityIsReduceMotionEnabled(),
+        reduce_transparency: UIAccessibilityIsReduceTransparencyEnabled(),
     }
 }
 
