@@ -287,7 +287,7 @@ impl WebWindowInner {
             }
 
             let button = dom_mouse_button_to_gpui(event.button());
-            let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+            let modifiers = modifiers_from_mouse_event(&event, is_mac_platform(this.os));
             let time = js_sys::Date::now();
 
             this.pressed_button.set(Some(button));
@@ -375,7 +375,7 @@ impl WebWindowInner {
             }
 
             let button = dom_mouse_button_to_gpui(event.button());
-            let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+            let modifiers = modifiers_from_mouse_event(&event, is_mac_platform(this.os));
 
             this.pressed_button.set(None);
             let click_count = this.click_state.borrow().current_count;
@@ -600,7 +600,7 @@ impl WebWindowInner {
                 return;
             }
 
-            let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+            let modifiers = modifiers_from_mouse_event(&event, is_mac_platform(this.os));
             let current_pressed = this.pressed_button.get();
 
             {
@@ -623,7 +623,7 @@ impl WebWindowInner {
             let event: web_sys::PointerEvent = event.unchecked_into();
 
             let position = pointer_position_in_element(&event);
-            let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
+            let modifiers = modifiers_from_mouse_event(&event, is_mac_platform(this.os));
             let current_pressed = this.pressed_button.get();
 
             {
@@ -654,7 +654,7 @@ impl WebWindowInner {
 
             let mouse_event: &web_sys::MouseEvent = event.as_ref();
             let position = mouse_position_in_element(mouse_event);
-            let modifiers = modifiers_from_wheel_event(mouse_event, this.is_mac);
+            let modifiers = modifiers_from_wheel_event(mouse_event, is_mac_platform(this.os));
 
             let delta_mode = event.delta_mode();
             let delta = if delta_mode == 1 {
@@ -713,7 +713,7 @@ impl WebWindowInner {
         self.listen_input("keydown", move |event: JsValue| {
             let event: web_sys::KeyboardEvent = event.unchecked_into();
 
-            let modifiers = modifiers_from_keyboard_event(&event, this.is_mac);
+            let modifiers = modifiers_from_keyboard_event(&event, is_mac_platform(this.os));
             let capslock = capslock_from_keyboard_event(&event);
 
             if this.update_modifiers(modifiers, capslock) {
@@ -776,7 +776,7 @@ impl WebWindowInner {
                 return;
             }
 
-            if keystroke_inserts_text(&modifiers, this.is_mac)
+            if keystroke_inserts_text(&modifiers, is_mac_platform(this.os))
                 && let Some(text) = key_char
             {
                 this.with_input_handler(|handler| {
@@ -797,7 +797,7 @@ impl WebWindowInner {
         self.listen_input("keyup", move |event: JsValue| {
             let event: web_sys::KeyboardEvent = event.unchecked_into();
 
-            let modifiers = modifiers_from_keyboard_event(&event, this.is_mac);
+            let modifiers = modifiers_from_keyboard_event(&event, is_mac_platform(this.os));
             let capslock = capslock_from_keyboard_event(&event);
 
             if this.update_modifiers(modifiers, capslock) {
@@ -1278,12 +1278,16 @@ fn capslock_from_keyboard_event(event: &web_sys::KeyboardEvent) -> Capslock {
     }
 }
 
-pub(crate) fn is_mac_platform(browser_window: &web_sys::Window) -> bool {
+// What the browser's OS decides, each from the one `os` a window reads (`platform_info`). To add a rule: a function
+// here.
+pub(crate) fn is_mac_platform(os: gpui::OperatingSystem) -> bool {
     // iOS hardware keyboards also use Option for text composition.
-    matches!(
-        platform_info(browser_window).os,
-        gpui::OperatingSystem::Mac | gpui::OperatingSystem::Ios
-    )
+    matches!(os, gpui::OperatingSystem::Mac | gpui::OperatingSystem::Ios)
+}
+
+/// Flutter's `operatingSystem == iOs || android` test (text_editing.rs).
+pub(crate) fn is_mobile(os: gpui::OperatingSystem) -> bool {
+    matches!(os, gpui::OperatingSystem::Ios | gpui::OperatingSystem::Android)
 }
 
 pub(crate) fn platform_info(browser_window: &web_sys::Window) -> gpui::PlatformInfo {

@@ -1,7 +1,5 @@
 use crate::display::WebDisplay;
-use crate::events::{
-    ClickState, EventListenerHandle, TouchIds, WebEventListeners, is_mac_platform,
-};
+use crate::events::{ClickState, EventListenerHandle, TouchIds, WebEventListeners};
 use crate::ime_mirror::ImeMirror;
 use crate::platform::WebWindowLifecycle;
 use crate::viewport::WebViewport;
@@ -58,9 +56,9 @@ pub(crate) struct WebWindowInner {
     pub(crate) ime_mirror: ImeMirror,
     pub(crate) viewport: RefCell<WebViewport>,
     pub(crate) has_device_pixel_support: bool,
-    pub(crate) is_mac: bool,
-    /// iOS measures the keyboard only while editing (`keyboard_inset`).
-    pub(crate) is_ios: bool,
+    /// The browser's OS, read once (`platform_info`): Mac keyboards, iOS's keyboard measuring and the IME mirror's
+    /// mobile attributes are all derived from it.
+    pub(crate) os: gpui::OperatingSystem,
     pub(crate) touch_input: bool,
     /// The insets `on_insets_changed` last reported.
     pub(crate) reported_insets: RefCell<WindowInsets>,
@@ -186,14 +184,14 @@ impl WebWindow {
             .flatten()
             .is_some_and(|query| query.matches());
         let os = crate::events::platform_info(&browser_window).os;
-        let mobile = matches!(
-            os,
-            gpui::OperatingSystem::Ios | gpui::OperatingSystem::Android
-        );
-        let is_ios = os == gpui::OperatingSystem::Ios;
-        let ime_mirror = ImeMirror::new(&document, &body, touch_input, mobile)?;
+        let ime_mirror = ImeMirror::new(&document, &body, touch_input, os)?;
         let mut viewport = WebViewport::new(&document)?;
-        viewport.update(&browser_window, &canvas, is_ios, false)?;
+        viewport.update(
+            &browser_window,
+            &canvas,
+            os == gpui::OperatingSystem::Ios,
+            false,
+        )?;
 
         let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new(browser_window.clone()));
 
@@ -218,16 +216,13 @@ impl WebWindow {
             capslock: Capslock::default(),
         };
 
-        let is_mac = is_mac_platform(&browser_window);
-
         let inner = Rc::new(WebWindowInner {
             browser_window,
             canvas,
             ime_mirror,
             viewport: RefCell::new(viewport),
             has_device_pixel_support,
-            is_mac,
-            is_ios,
+            os,
             touch_input,
             reported_insets: RefCell::new(WindowInsets::default()),
             state: RefCell::new(mutable_state),
@@ -422,7 +417,7 @@ impl WebWindowInner {
         match self.viewport.borrow_mut().update(
             &self.browser_window,
             &self.canvas,
-            self.is_ios,
+            self.os == gpui::OperatingSystem::Ios,
             is_editing_on_mobile,
         ) {
             Ok(changed) => changed,

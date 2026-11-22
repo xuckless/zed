@@ -178,9 +178,9 @@ pub(crate) struct ImeMirror {
     /// selection has moved; a rejected import means no import is coming,
     /// so the next sync must reassert the app's state instead of waiting.
     selection_import_rejected: Cell<bool>,
-    /// Whether the browser runs on iOS or Android, where Flutter sets
-    /// `enterkeyhint` (desktop keyboards have no action key).
-    mobile: bool,
+    /// The browser's OS: on iOS and Android Flutter sets `enterkeyhint`
+    /// (desktop keyboards have no action key).
+    os: gpui::OperatingSystem,
     /// The `inputmode` the configuration's keyboard type asks for, written
     /// whenever the virtual keyboard is enabled.
     input_mode: Cell<&'static str>,
@@ -191,7 +191,7 @@ impl ImeMirror {
         document: &web_sys::Document,
         body: &web_sys::HtmlElement,
         touch_input: bool,
-        mobile: bool,
+        os: gpui::OperatingSystem,
     ) -> anyhow::Result<Self> {
         let container: web_sys::HtmlElement = document
             .create_element("div")
@@ -212,6 +212,9 @@ impl ImeMirror {
         style.set_property("width", "1px").ok();
         style.set_property("height", "1px").ok();
         style.set_property("opacity", "0").ok();
+        // Placed on the caret, over the canvas: a click there must reach the
+        // canvas. Programmatic focus still works.
+        style.set_property("pointer-events", "none").ok();
         // Android Chrome zooms the visual viewport onto a focused text input
         // whose font is smaller than 16px; with page zoom disabled the user
         // can never zoom back out, so keep the hidden IME input at 16px.
@@ -242,7 +245,7 @@ impl ImeMirror {
             window_hint: Cell::new(0),
             sync_scheduled: Cell::new(false),
             selection_import_rejected: Cell::new(false),
-            mobile,
+            os,
             input_mode: Cell::new(text_editing::input_mode(Default::default())),
         };
         // Until an input handler asks otherwise, the element is an IME
@@ -265,7 +268,7 @@ impl ImeMirror {
         let replaced = kind != current && self.replace_element(kind);
         let element = self.element.borrow();
         let element = element.html();
-        for (name, value) in text_editing::attributes(configuration, self.mobile) {
+        for (name, value) in text_editing::attributes(configuration, crate::events::is_mobile(self.os)) {
             match value {
                 Some(value) => element.set_attribute(name, value).ok(),
                 None => element.remove_attribute(name).ok(),
