@@ -1,8 +1,7 @@
 // Ported from flutter/flutter packages/flutter/lib/src/gestures/lsq_solver.dart @ 3.50.1 (ae9b586f34a8443573f82ef57c3bf914a908cbf7).
 // Copyright 2014 The Flutter Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
 
-// Flutter's `precisionErrorTolerance` (foundation/constants.dart).
-const PRECISION_ERROR_TOLERANCE: f64 = 1e-10;
+use super::physics::precisionErrorTolerance;
 
 // TODO(abarth): Consider using vector_math.
 struct Vector<'a> {
@@ -139,7 +138,7 @@ impl LeastSquaresSolver<'_> {
             }
 
             let norm = q.get_row(j).norm();
-            if norm < PRECISION_ERROR_TOLERANCE {
+            if norm < precisionErrorTolerance {
                 // Vectors are linearly dependent or zero so no solution.
                 return None;
             }
@@ -199,7 +198,7 @@ impl LeastSquaresSolver<'_> {
             sum_squared_total += w[h] * w[h] * v * v;
         }
 
-        let confidence = if sum_squared_total <= PRECISION_ERROR_TOLERANCE {
+        let confidence = if sum_squared_total <= precisionErrorTolerance {
             1.0
         } else {
             1.0 - (sum_squared_error / sum_squared_total)

@@ -153,206 +153,31 @@ impl Default for GestureTuning {
     }
 }
 
-/// How free scrolling decelerates after a fling.
-///
-/// This models deceleration only. Boundary behavior — bouncing, edge glow,
-/// clamping — is the scroll container's policy: the container is the one that
-/// knows its extents.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ScrollPhysics {
-    /// Exponential velocity decay, the `UIScrollView` model:
-    /// `velocity(t) = v₀ · decay_per_msᵐˢ`.
-    Exponential {
-        /// Per-millisecond velocity decay factor. `UIScrollView`'s normal
-        /// deceleration rate is `0.998`.
-        decay_per_ms: f32,
-    },
-    /// The friction spline of Android's `OverScroller`: fling duration and
-    /// distance follow a logarithmic deceleration law, and progress along
-    /// the fling follows a cubic-Bezier ease-out curve. Transcribed from
-    /// AOSP's `SplineOverScroller` (Apache-2.0).
-    FrictionSpline {
-        /// The scroll friction coefficient;
-        /// `ViewConfiguration.getScrollFriction()` is `0.015` on Android.
-        friction: f32,
-        /// Pixels per physical inch of the display, in the coordinate space
-        /// the fling runs in. Android folds display density into its
-        /// deceleration coefficient, so the same finger speed flings
-        /// further in pixels on a denser screen.
-        pixels_per_inch: f32,
-    },
-}
+pub mod physics;
+mod scroll_physics;
+mod scroll_simulation;
+use physics::Simulation;
+pub use scroll_physics::{ScrollDecelerationRate, ScrollMetrics, ScrollPhysics, tolerance_for};
+pub use scroll_simulation::{BouncingScrollSimulation, ClampingScrollSimulation};
 
-impl ScrollPhysics {
-    /// iOS scroll feel: `UIScrollView`'s normal deceleration rate.
-    pub fn ios() -> Self {
-        Self::Exponential {
-            decay_per_ms: 0.998,
-        }
-    }
+/// The window's device pixel ratio isn't passed to the recognizer yet, so its
+/// flings use Flutter's `toleranceFor` at a ratio of 2.
+const FLING_DEVICE_PIXEL_RATIO: f64 = 2.0;
 
-    /// Android scroll feel: `OverScroller` with stock friction, at Android's
-    /// nominal density of 160 density-independent pixels per inch — the
-    /// right pairing when fling distances are in logical pixels. Platforms
-    /// that fling in physical pixels, or know the display's true density in
-    /// their logical space, should construct
-    /// [`ScrollPhysics::FrictionSpline`] directly.
-    pub fn android() -> Self {
-        Self::FrictionSpline {
-            friction: 0.015,
-            pixels_per_inch: 160.,
-        }
-    }
-
-    /// How long a fling released at `speed` pixels per second coasts before
-    /// it stops.
-    fn fling_duration(self, speed: f32) -> Duration {
-        match self {
-            Self::Exponential { decay_per_ms } => {
-                if speed <= MOMENTUM_STOP_VELOCITY {
-                    return Duration::ZERO;
-                }
-                let milliseconds = (MOMENTUM_STOP_VELOCITY / speed).ln() / decay_per_ms.ln();
-                Duration::from_secs_f32(milliseconds / 1000.)
-            }
-            Self::FrictionSpline {
-                friction,
-                pixels_per_inch,
-            } => {
-                if speed <= 0. {
-                    return Duration::ZERO;
-                }
-                let deceleration = friction_spline::deceleration(speed, friction, pixels_per_inch);
-                let seconds = (deceleration / (friction_spline::deceleration_rate() - 1.)).exp();
-                Duration::from_secs_f64(seconds)
-            }
-        }
-    }
-
-    /// Distance traveled `elapsed` into a fling released at `speed` pixels
-    /// per second, in pixels along the fling direction. Evaluated in closed
-    /// form so the trajectory is independent of tick timing.
-    fn fling_distance(self, speed: f32, elapsed: Duration) -> f32 {
-        let duration = self.fling_duration(speed);
-        if duration.is_zero() {
-            return 0.;
-        }
-        let elapsed = elapsed.min(duration);
-        match self {
-            Self::Exponential { decay_per_ms } => {
-                // ∫₀ᵗ v₀·kᵐˢ dms, with speed converted to pixels per
-                // millisecond.
-                let milliseconds = elapsed.as_secs_f32() * 1000.;
-                (speed / 1000.) * (decay_per_ms.powf(milliseconds) - 1.) / decay_per_ms.ln()
-            }
-            Self::FrictionSpline {
-                friction,
-                pixels_per_inch,
-            } => {
-                let deceleration = friction_spline::deceleration(speed, friction, pixels_per_inch);
-                let rate = friction_spline::deceleration_rate();
-                let total_distance = friction as f64
-                    * friction_spline::physical_coefficient(pixels_per_inch)
-                    * (rate / (rate - 1.) * deceleration).exp();
-                let progress = elapsed.as_secs_f64() / duration.as_secs_f64();
-                total_distance as f32 * friction_spline::distance_coefficient(progress as f32)
-            }
-        }
-    }
-}
-
-/// The fling model of Android's `OverScroller.SplineOverScroller`,
-/// transcribed from AOSP (Apache-2.0). `SPLINE_TIME`, which AOSP uses for
-/// programmatic scroll animations rather than flings, is intentionally not
-/// transcribed.
-mod friction_spline {
-    use std::sync::LazyLock;
-
-    const NB_SAMPLES: usize = 100;
-    const INFLEXION: f32 = 0.35;
-    const START_TENSION: f32 = 0.5;
-    const END_TENSION: f32 = 1.0;
-    const P1: f32 = START_TENSION * INFLEXION;
-    const P2: f32 = 1.0 - END_TENSION * (1.0 - INFLEXION);
-
-    /// Android's `DECELERATION_RATE`: `ln(0.78) / ln(0.9)`.
-    pub(super) fn deceleration_rate() -> f64 {
-        0.78f64.ln() / 0.9f64.ln()
-    }
-
-    /// `SPLINE_POSITION` from AOSP's static initializer: fractional fling
-    /// distance sampled at 100 evenly spaced fractions of the fling
-    /// duration, from a cubic Bezier with control points shaped by
-    /// `INFLEXION` and the start/end tensions.
-    static SPLINE_POSITION: LazyLock<[f32; NB_SAMPLES + 1]> = LazyLock::new(|| {
-        let mut spline_position = [0f32; NB_SAMPLES + 1];
-        let mut x_min = 0f32;
-        for (i, sample) in spline_position.iter_mut().take(NB_SAMPLES).enumerate() {
-            let alpha = i as f32 / NB_SAMPLES as f32;
-            let mut x_max = 1f32;
-            let (x, coefficient) = loop {
-                let x = x_min + (x_max - x_min) / 2.;
-                let coefficient = 3. * x * (1. - x);
-                let time = coefficient * ((1. - x) * P1 + x * P2) + x * x * x;
-                if (time - alpha).abs() < 1e-5 {
-                    break (x, coefficient);
-                }
-                if time > alpha {
-                    x_max = x;
-                } else {
-                    x_min = x;
-                }
-            };
-            *sample = coefficient * ((1. - x) * START_TENSION + x) + x * x * x;
-        }
-        spline_position[NB_SAMPLES] = 1.;
-        spline_position
-    });
-
-    /// `SensorManager.GRAVITY_EARTH · 39.37 in/m · ppi · 0.84`, AOSP's
-    /// `mPhysicalCoeff`: gravity expressed in pixels, times an empirical
-    /// "look and feel" tuning factor.
-    pub(super) fn physical_coefficient(pixels_per_inch: f32) -> f64 {
-        9.80665 * 39.37 * pixels_per_inch as f64 * 0.84
-    }
-
-    /// AOSP's `getSplineDeceleration`.
-    pub(super) fn deceleration(speed: f32, friction: f32, pixels_per_inch: f32) -> f64 {
-        (INFLEXION as f64 * speed as f64
-            / (friction as f64 * physical_coefficient(pixels_per_inch)))
-        .ln()
-    }
-
-    /// Fraction of the total fling distance covered at fraction `time` of
-    /// the fling duration: table lookup plus linear interpolation, as in
-    /// `SplineOverScroller.update`.
-    pub(super) fn distance_coefficient(time: f32) -> f32 {
-        if time >= 1. {
-            return 1.;
-        }
-        let index = ((NB_SAMPLES as f32 * time) as usize).min(NB_SAMPLES - 1);
-        let time_lower = index as f32 / NB_SAMPLES as f32;
-        let time_upper = (index + 1) as f32 / NB_SAMPLES as f32;
-        let distance_lower = SPLINE_POSITION[index];
-        let distance_upper = SPLINE_POSITION[index + 1];
-        let velocity_coefficient = (distance_upper - distance_lower) / (time_upper - time_lower);
-        distance_lower + (time - time_lower) * velocity_coefficient
-    }
-
-    #[cfg(test)]
-    pub(super) fn bezier_time_and_position(parameter: f32) -> (f32, f32) {
-        let coefficient = 3. * parameter * (1. - parameter);
-        let cubed = parameter * parameter * parameter;
-        (
-            coefficient * ((1. - parameter) * P1 + parameter * P2) + cubed,
-            coefficient * ((1. - parameter) * START_TENSION + parameter) + cubed,
-        )
-    }
-
-    #[cfg(test)]
-    pub(super) fn spline_position_samples() -> &'static [f32; NB_SAMPLES + 1] {
-        &SPLINE_POSITION
-    }
+/// The fling released at `speed` pixels per second, starting at 0: Flutter's
+/// `createBallisticSimulation` with no extents, since the recognizer knows
+/// none (the scroll container clamps). `None` when there is nothing to fling.
+fn fling_simulation(physics: ScrollPhysics, speed: f32) -> Option<Box<dyn Simulation>> {
+    physics.create_ballistic_simulation(
+        &ScrollMetrics {
+            min_scroll_extent: f64::NEG_INFINITY,
+            max_scroll_extent: f64::INFINITY,
+            pixels: 0.,
+            viewport_dimension: f64::INFINITY,
+            device_pixel_ratio: FLING_DEVICE_PIXEL_RATIO,
+        },
+        f64::from(speed),
+    )
 }
 
 /// The set of gesture kinds that participate in recognition.
@@ -524,12 +349,6 @@ impl PlatformGestures for NullPlatformGestures {}
 /// Flutter's `kMaxFlingVelocity`).
 const MAX_FLING_VELOCITY: f32 = 8000.;
 
-/// Momentum below this speed, in pixels per second, is imperceptible. The
-/// exponential model, which never mathematically stops, treats reaching this
-/// speed as the end of the fling. (The friction spline has a finite duration
-/// of its own.)
-const MOMENTUM_STOP_VELOCITY: f32 = 10.;
-
 /// The portable recognizer behind raw touch input: it watches the
 /// [`TouchEvent`] stream for one touch at a time and resolves it into either
 /// a tap or a pan, following the competition model described in the module
@@ -614,9 +433,9 @@ struct CompletedTap {
 }
 
 /// One fling in progress. The trajectory is a closed-form curve of elapsed
-/// time — each tick evaluates it and emits the increment — so the fling is
-/// exactly frame-rate independent: a stalled frame simply resumes further
-/// along the same curve.
+/// time — each tick evaluates it and emits the increment — so a stalled
+/// frame simply resumes further along the same curve. The fling ends on the
+/// first tick its simulation is done at, as Flutter's ballistic scroll does.
 struct Momentum {
     /// The device of the touch that flung.
     device: PointerDevice,
@@ -625,10 +444,9 @@ struct Momentum {
     position: Point<Pixels>,
     /// Unit vector of the release velocity.
     direction: Point<f32>,
-    /// Release speed in pixels per second.
-    speed: f32,
+    /// Distance along `direction` over time, from the release speed.
+    simulation: Box<dyn Simulation>,
     started_at: Instant,
-    duration: Duration,
     /// Distance already emitted along `direction`, in pixels.
     emitted_distance: f32,
 }
@@ -882,10 +700,10 @@ impl TouchGestureRecognizer {
                     if speed >= self.tuning.min_fling_velocity {
                         let direction = point(velocity.x / speed, velocity.y / speed);
                         let speed = speed.min(MAX_FLING_VELOCITY);
-                        let duration = self.tuning.scroll_physics.fling_duration(speed);
-                        if !duration.is_zero() {
-                            let total_distance =
-                                self.tuning.scroll_physics.fling_distance(speed, duration);
+                        if let Some(simulation) =
+                            fling_simulation(self.tuning.scroll_physics, speed)
+                        {
+                            let total_distance = simulation.x(f64::INFINITY) as f32;
                             // Prediction may have left the content ahead of
                             // the raw release position. Emitting that
                             // correction here would visibly snap the content
@@ -906,9 +724,8 @@ impl TouchGestureRecognizer {
                                 device: touch.device,
                                 position: touch.start_position,
                                 direction,
-                                speed,
+                                simulation,
                                 started_at: now,
-                                duration,
                                 emitted_distance,
                             });
                         }
@@ -1068,11 +885,8 @@ impl TouchGestureRecognizer {
 
     fn tick_momentum_at(&mut self, now: Instant) -> Option<RecognizedTouchGesture> {
         let momentum = self.momentum.as_mut()?;
-        let elapsed = now.duration_since(momentum.started_at);
-        let distance = self
-            .tuning
-            .scroll_physics
-            .fling_distance(momentum.speed, elapsed);
+        let elapsed = now.duration_since(momentum.started_at).as_secs_f64();
+        let distance = momentum.simulation.x(elapsed) as f32;
         // Prediction overshoot can start momentum ahead of its curve. Hold
         // that position until the curve catches up instead of stepping back.
         let step = (distance - momentum.emitted_distance).max(0.);
@@ -1082,7 +896,7 @@ impl TouchGestureRecognizer {
             px(momentum.direction.y * step),
         );
         let position = momentum.position;
-        if elapsed >= momentum.duration {
+        if momentum.simulation.is_done(elapsed) {
             self.momentum = None;
             Some(RecognizedTouchGesture::Scroll(scroll_event(
                 position,
@@ -1880,59 +1694,27 @@ mod tests {
     }
 
     #[test]
-    fn spline_position_table_matches_the_bezier_curve() {
-        let samples = friction_spline::spline_position_samples();
-        // AOSP's initializer solves sample 0 numerically like every other
-        // sample, so it lands within solver tolerance of zero, not at zero.
-        assert!(samples[0].abs() < 1e-4);
-        assert_eq!(samples[100], 1.);
-        for window in samples.windows(2) {
-            assert!(window[0] < window[1], "table must be strictly increasing");
-        }
-        // Each table entry must lie on the defining parametric Bezier: for
-        // sample i there must be a curve parameter whose time component is
-        // i/100 and whose position component is the stored value.
-        for (i, &stored_position) in samples.iter().enumerate().take(100) {
-            let alpha = i as f32 / 100.;
-            let (mut lower, mut upper) = (0f32, 1f32);
-            for _ in 0..50 {
-                let middle = (lower + upper) / 2.;
-                let (time, _) = friction_spline::bezier_time_and_position(middle);
-                if time > alpha {
-                    upper = middle;
-                } else {
-                    lower = middle;
-                }
-            }
-            let (time, position) = friction_spline::bezier_time_and_position((lower + upper) / 2.);
-            assert!(
-                (time - alpha).abs() < 1e-4,
-                "sample {i}: time {time} != {alpha}"
-            );
-            assert!(
-                (position - stored_position).abs() < 1e-3,
-                "sample {i}: position {position} != stored {stored_position}"
-            );
-        }
-    }
-
-    #[test]
     fn fling_curves_are_sane_for_both_physics() {
         for physics in [ScrollPhysics::ios(), ScrollPhysics::android()] {
-            let slow = physics.fling_duration(500.);
-            let fast = physics.fling_duration(4000.);
-            assert!(slow > Duration::ZERO, "{physics:?}");
-            assert!(fast > slow, "faster flings must coast longer: {physics:?}");
-
-            let halfway = physics.fling_distance(4000., fast / 2);
-            let total = physics.fling_distance(4000., fast);
-            assert!(halfway > 0. && halfway < total, "{physics:?}");
+            let (Some(slow), Some(fast)) = (
+                fling_simulation(physics, 500.),
+                fling_simulation(physics, 4000.),
+            ) else {
+                panic!("{physics:?}: both releases fling");
+            };
+            let stop_time = |simulation: &dyn Simulation| {
+                (1..)
+                    .map(|frame| frame as f64 / 60.)
+                    .find(|&t| simulation.is_done(t))
+            };
+            let (slow_stop, fast_stop) = (stop_time(&*slow), stop_time(&*fast));
+            assert!(slow_stop > Some(0.), "{physics:?}");
             assert!(
-                physics.fling_distance(4000., fast * 2) == total,
-                "distance must not grow past the fling duration: {physics:?}"
+                fast_stop > slow_stop,
+                "faster flings must coast longer: {physics:?}"
             );
             assert!(
-                physics.fling_distance(4000., fast) > physics.fling_distance(500., slow),
+                fast.x(f64::INFINITY) > slow.x(f64::INFINITY),
                 "faster flings must travel further: {physics:?}"
             );
         }
