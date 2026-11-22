@@ -2427,6 +2427,14 @@ impl Window {
                     .flatten()
             })
         });
+        platform_window.on_native_view_occluders({
+            let mut cx = cx.to_async();
+            Box::new(move || {
+                handle
+                    .update(&mut cx, |_, window, _| window.native_view_occluders())
+                    .unwrap_or_default()
+            })
+        });
         platform_window.on_key_down_before_native_view({
             let mut cx = cx.to_async();
             Box::new(move |event| {

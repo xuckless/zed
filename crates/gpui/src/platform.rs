@@ -1435,6 +1435,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         _callback: Box<dyn FnMut(Point<Pixels>) -> Option<crate::NativeViewId>>,
     ) {
     }
+    /// Registers the callback that gives the regions over shown native views
+    /// where the window's own content takes mouse input: elements with a
+    /// hitbox painted after a view. A platform whose views take input
+    /// themselves (the web) keeps these regions for the window. Asked after a
+    /// frame is drawn, outside any window update.
+    fn on_native_view_occluders(&self, _callback: Box<dyn FnMut() -> Vec<Bounds<Pixels>>>) {}
     /// Registers the callback invoked when the user moves keyboard input to
     /// a native view through the platform, such as by clicking in it.
     fn on_native_view_focused(&self, _callback: Box<dyn FnMut(crate::NativeViewId)>) {}

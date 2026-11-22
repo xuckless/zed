@@ -368,6 +368,33 @@ impl Window {
             .map(|view| view.id)
     }
 
+    /// Where the window's own content takes mouse input over the shown native
+    /// views: each hitbox inserted after a view's, clipped to that view. Every
+    /// other point of a view is the view's (`hit_test_native_view`), so a
+    /// platform whose views hit-test themselves (the web) keeps these regions
+    /// for the window.
+    pub(super) fn native_view_occluders(&self) -> Vec<Bounds<Pixels>> {
+        let hitboxes = &self.rendered_frame.hitboxes;
+        let clipped = |hitbox: &Hitbox| hitbox.bounds.intersect(&hitbox.content_mask.bounds);
+        self.rendered_frame
+            .scene
+            .native_views
+            .iter()
+            .filter_map(|native_view| {
+                hitboxes
+                    .iter()
+                    .position(|hitbox| hitbox.id == native_view.hitbox_id)
+            })
+            .flat_map(|index| {
+                let view = clipped(&hitboxes[index]);
+                hitboxes[index + 1..]
+                    .iter()
+                    .map(move |hitbox| clipped(hitbox).intersect(&view))
+                    .filter(|occluder| !occluder.is_empty())
+            })
+            .collect()
+    }
+
     /// The native view that a mouse event at this position reaches, if no
     /// GPUI hitbox is above it there.
     pub(super) fn hit_test_native_view(&self, position: Point<Pixels>) -> Option<NativeViewId> {
@@ -473,7 +500,7 @@ mod tests {
     use crate::{
         Context, Entity, FocusHandle, InputHandler, KeyBinding, Keystroke, Modifiers, MouseButton,
         MouseDownEvent, MouseMoveEvent, Render, ScaledPixels, ScrollEvent, TestAppContext,
-        UTF16Selection, VisualTestContext, WindowHandle, canvas, point, prelude::*, px, rgb,
+        UTF16Selection, VisualTestContext, WindowHandle, canvas, point, prelude::*, px, rgb, size,
     };
     use std::ops::Range;
 
@@ -676,6 +703,19 @@ mod tests {
         assert_eq!(platform_window.hit_test_native_view(uncovered), Some(id));
         assert_eq!(platform_window.hit_test_native_view(covered), None);
         assert_eq!(platform_window.hit_test_native_view(outside), None);
+    }
+
+    /// The cover, painted after the view and taking input, is the window's over
+    /// the view; nothing else is (the view is at (0, 10), the cover at (0, 0),
+    /// both from the fixture).
+    #[gpui::test]
+    fn native_view_occluders_are_the_hitboxes_painted_over_it(cx: &mut TestAppContext) {
+        let window = open_window(cx);
+        let platform_window = cx.test_window(window.into());
+        cx.run_until_parked();
+
+        let cover_over_view = Bounds::new(point(px(0.), px(10.)), size(px(50.), px(40.)));
+        assert_eq!(platform_window.native_view_occluders(), [cover_over_view]);
     }
 
     #[gpui::test]

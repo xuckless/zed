@@ -36,6 +36,7 @@ pub(crate) struct TestWindowState {
     focused_native_view: Option<NativeViewId>,
     native_view_input: NativeViewInput,
     hit_test_native_view_callback: Option<Box<dyn FnMut(Point<Pixels>) -> Option<NativeViewId>>>,
+    native_view_occluders_callback: Option<Box<dyn FnMut() -> Vec<Bounds<Pixels>>>>,
     native_view_focused_callback: Option<Box<dyn FnMut(NativeViewId)>>,
     key_down_before_native_view_callback: Option<Box<dyn FnMut(KeyDownEvent) -> bool>>,
     input_callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
@@ -137,6 +138,7 @@ impl TestWindow {
             focused_native_view: None,
             native_view_input: NativeViewInput::View,
             hit_test_native_view_callback: None,
+            native_view_occluders_callback: None,
             native_view_focused_callback: None,
             key_down_before_native_view_callback: None,
             request_frame_callback: None,
@@ -306,6 +308,17 @@ impl TestWindow {
         let id = callback(position);
         self.0.lock().hit_test_native_view_callback = Some(callback);
         id
+    }
+
+    /// Asks the window where its own content takes mouse input over the shown
+    /// native views.
+    pub fn native_view_occluders(&self) -> Vec<Bounds<Pixels>> {
+        let Some(mut callback) = self.0.lock().native_view_occluders_callback.take() else {
+            return Vec::new();
+        };
+        let occluders = callback();
+        self.0.lock().native_view_occluders_callback = Some(callback);
+        occluders
     }
 
     /// Acts as if the user pressed a key while a native view had keyboard input,
@@ -695,6 +708,10 @@ impl PlatformWindow for TestWindow {
         callback: Box<dyn FnMut(Point<Pixels>) -> Option<NativeViewId>>,
     ) {
         self.0.lock().hit_test_native_view_callback = Some(callback);
+    }
+
+    fn on_native_view_occluders(&self, callback: Box<dyn FnMut() -> Vec<Bounds<Pixels>>>) {
+        self.0.lock().native_view_occluders_callback = Some(callback);
     }
 
     fn on_native_view_focused(&self, callback: Box<dyn FnMut(NativeViewId)>) {
