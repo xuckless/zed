@@ -715,6 +715,11 @@ fn checked_offset(position: usize, offset: isize, document_length: usize) -> Opt
 }
 
 #[cfg(test)]
+#[allow(dead_code, reason = "run by the main-thread integration-test harness, tests/text_input.rs")]
+#[path = "text_input_flutter_oracle.rs"]
+pub(super) mod flutter_oracle;
+
+#[cfg(test)]
 pub(super) mod tests {
     use super::*;
 

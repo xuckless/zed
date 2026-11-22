@@ -29,6 +29,7 @@ runtime_shaders = ["gpui_apple/runtime_shaders"]
 
 
 [target.'cfg(target_os = "ios")'.dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
 gpui_platform.workspace = true
 objc2-ui-kit = { workspace = true, features = ["UIConversationContext"] }
 slotmap.workspace = true

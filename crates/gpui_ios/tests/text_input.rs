@@ -20,14 +20,15 @@ mod window {
         HANDLER_QUERIES.with(Cell::get)
     }
 
-    pub(crate) struct IosWindowState;
+    /// Upstream's protocol tests never upgrade to one. Flutter's oracle rows each make one around their fake app.
+    pub(crate) struct IosWindowState(pub(crate) RefCell<PlatformInputHandler>);
 
     impl IosWindowState {
         pub(crate) fn with_input_handler<R>(
             &self,
-            _callback: impl FnOnce(&mut PlatformInputHandler) -> R,
+            callback: impl FnOnce(&mut PlatformInputHandler) -> R,
         ) -> Option<R> {
-            None
+            Some(callback(&mut self.0.borrow_mut()))
         }
     }
 
@@ -55,5 +56,18 @@ fn main() {
             window::handler_queries,
         );
         println!("UIKit text input native protocol smoke test passed");
+
+        // Flutter's FlutterTextInputPluginTest.mm cases; an argument runs only the rows whose name contains it.
+        let filter = std::env::args().nth(1).unwrap_or_default();
+        let attach = |view: &text_input::TextInputView, handler| -> Box<dyn std::any::Any> {
+            let state = std::rc::Rc::new(window::IosWindowState(std::cell::RefCell::new(handler)));
+            view.set_window(std::rc::Rc::downgrade(&state));
+            Box::new(state)
+        };
+        if !text_input::flutter_oracle::run(main_thread, &filter, &attach) {
+            eprintln!("Flutter text input oracle: rows failed");
+            std::process::exit(1);
+        }
+        println!("Flutter text input oracle passed");
     }
 }

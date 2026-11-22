@@ -2157,6 +2157,17 @@ impl PlatformInputHandler {
         }
     }
 
+    /// The handler [`crate::Window::handle_input`] registers for a focused `focus_handle`, for a
+    /// backend's tests that drive its text input without painting a window.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_focused_field(
+        cx: AsyncWindowContext,
+        handler: Box<dyn InputHandler>,
+        focus_handle: &crate::FocusHandle,
+    ) -> Self {
+        Self::new(cx, handler).with_focus(focus_handle.id)
+    }
+
     pub(crate) fn with_focus(mut self, focus_id: crate::FocusId) -> Self {
         self.focus_id = Some(focus_id);
         self
