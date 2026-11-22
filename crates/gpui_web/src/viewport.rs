@@ -7,6 +7,8 @@
 use gpui::{Bounds, Edges, Pixels, WindowInsets, point, px, size};
 use wasm_bindgen::JsCast;
 
+use crate::keyboard_inset::{VisualViewport, keyboard_inset};
+
 pub(crate) struct WebViewport {
     safe_area_probes: [web_sys::HtmlElement; 4],
     pub(crate) visible_bounds: Bounds<Pixels>,
@@ -40,10 +42,13 @@ impl WebViewport {
         }
     }
 
+    /// `ios` and `is_editing_on_mobile` are [`keyboard_inset`]'s.
     pub(crate) fn update(
         &mut self,
         window: &web_sys::Window,
         canvas: &web_sys::HtmlCanvasElement,
+        ios: bool,
+        is_editing_on_mobile: bool,
     ) -> anyhow::Result<bool> {
         let canvas_bounds = canvas.get_bounding_client_rect();
         let document = window
@@ -54,7 +59,8 @@ impl WebViewport {
             .ok_or_else(|| anyhow::anyhow!("Missing root"))?;
         let layout_width = root.client_width() as f64;
         let layout_height = root.client_height() as f64;
-        let (left, top, width, height) = match window.visual_viewport() {
+        let visual_viewport = window.visual_viewport();
+        let (left, top, width, height) = match &visual_viewport {
             Some(viewport) => (
                 viewport.offset_left(),
                 viewport.offset_top(),
@@ -85,8 +91,22 @@ impl WebViewport {
             bottom: px((canvas_bounds.bottom() - layout_height + bottom).max(0.) as f32),
             left: px((left - canvas_bounds.left()).max(0.) as f32),
         };
+        let keyboard = keyboard_inset(
+            canvas_bounds.bottom(),
+            visual_viewport.map(|viewport| VisualViewport {
+                offset_top: viewport.offset_top(),
+                height: viewport.height(),
+                scale: viewport.scale(),
+            }),
+            ios,
+            is_editing_on_mobile,
+        );
         let insets = WindowInsets {
             safe_area,
+            ime: Edges {
+                bottom: px(keyboard as f32),
+                ..Edges::default()
+            },
             ..WindowInsets::default()
         };
         let changed = self.visible_bounds != visible_bounds || self.insets != insets;

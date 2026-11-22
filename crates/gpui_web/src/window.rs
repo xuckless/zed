@@ -28,6 +28,7 @@ pub(crate) struct WebWindowCallbacks {
     pub(crate) hover_status_change: Option<Box<dyn FnMut(bool)>>,
     pub(crate) resize: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     pub(crate) visual_viewport_changed: Option<Box<dyn FnMut()>>,
+    pub(crate) insets_changed: Option<Box<dyn FnMut(WindowInsets)>>,
     pub(crate) moved: Option<Box<dyn FnMut()>>,
     pub(crate) should_close: Option<Box<dyn FnMut() -> bool>>,
     pub(crate) close: Option<Box<dyn FnOnce()>>,
@@ -58,7 +59,11 @@ pub(crate) struct WebWindowInner {
     pub(crate) viewport: RefCell<WebViewport>,
     pub(crate) has_device_pixel_support: bool,
     pub(crate) is_mac: bool,
+    /// iOS measures the keyboard only while editing (`keyboard_inset`).
+    pub(crate) is_ios: bool,
     pub(crate) touch_input: bool,
+    /// The insets `on_insets_changed` last reported.
+    pub(crate) reported_insets: RefCell<WindowInsets>,
     pub(crate) state: RefCell<WebWindowMutableState>,
     pub(crate) callbacks: RefCell<WebWindowCallbacks>,
     pub(crate) click_state: RefCell<ClickState>,
@@ -180,13 +185,15 @@ impl WebWindow {
             .ok()
             .flatten()
             .is_some_and(|query| query.matches());
+        let os = crate::events::platform_info(&browser_window).os;
         let mobile = matches!(
-            crate::events::platform_info(&browser_window).os,
+            os,
             gpui::OperatingSystem::Ios | gpui::OperatingSystem::Android
         );
+        let is_ios = os == gpui::OperatingSystem::Ios;
         let ime_mirror = ImeMirror::new(&document, &body, touch_input, mobile)?;
         let mut viewport = WebViewport::new(&document)?;
-        viewport.update(&browser_window, &canvas)?;
+        viewport.update(&browser_window, &canvas, is_ios, false)?;
 
         let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new(browser_window.clone()));
 
@@ -220,7 +227,9 @@ impl WebWindow {
             viewport: RefCell::new(viewport),
             has_device_pixel_support,
             is_mac,
+            is_ios,
             touch_input,
+            reported_insets: RefCell::new(WindowInsets::default()),
             state: RefCell::new(mutable_state),
             callbacks: RefCell::new(WebWindowCallbacks::default()),
             click_state: RefCell::new(ClickState::default()),
@@ -408,11 +417,14 @@ impl WebWindow {
 
 impl WebWindowInner {
     fn sample_viewport(&self) -> bool {
-        match self
-            .viewport
-            .borrow_mut()
-            .update(&self.browser_window, &self.canvas)
-        {
+        // Flutter's `isEditingOnMobile`: touch input with the keyboard enabled.
+        let is_editing_on_mobile = self.touch_input && self.ime_mirror.virtual_keyboard_enabled();
+        match self.viewport.borrow_mut().update(
+            &self.browser_window,
+            &self.canvas,
+            self.is_ios,
+            is_editing_on_mobile,
+        ) {
             Ok(changed) => changed,
             Err(error) => {
                 log::warn!("Failed to update browser viewport: {error:#}");
@@ -422,6 +434,19 @@ impl WebWindowInner {
     }
 
     pub(crate) fn notify_viewport_changed(&self) {
+        // `on_insets_changed` observers update the window, so the insets are
+        // sampled and reported here, between frames, never from
+        // `prepare_frame` (which may sample a change first: hence the record
+        // of what was last reported).
+        self.sample_viewport();
+        let insets = self.viewport.borrow().insets.clone();
+        if *self.reported_insets.borrow() != insets {
+            *self.reported_insets.borrow_mut() = insets.clone();
+            self.with_callback(
+                |callbacks| &mut callbacks.insets_changed,
+                |callback| callback(insets),
+            );
+        }
         self.with_callback(
             |callbacks| &mut callbacks.visual_viewport_changed,
             |callback| callback(),
@@ -658,7 +683,7 @@ fn current_appearance(browser_window: &web_sys::Window) -> WindowAppearance {
 
 /// The Page Visibility API: `hidden` when the tab is in the background or the
 /// browser window is minimized. A missing document reads as visible.
-fn document_visibility(browser_window: &web_sys::Window) -> WindowVisibility {
+pub(crate) fn document_visibility(browser_window: &web_sys::Window) -> WindowVisibility {
     let is_visible = browser_window
         .document()
         .and_then(|document| js_sys::Reflect::get(&document, &"visibilityState".into()).ok())
@@ -888,6 +913,10 @@ impl PlatformWindow for WebWindow {
 
     fn insets(&self) -> WindowInsets {
         self.inner.viewport.borrow().insets.clone()
+    }
+
+    fn on_insets_changed(&self, callback: Box<dyn FnMut(WindowInsets)>) {
+        self.inner.callbacks.borrow_mut().insets_changed = Some(callback);
     }
 
     fn text_input_state_changed(&self, change: TextInputStateChange) {

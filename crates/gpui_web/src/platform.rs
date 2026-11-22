@@ -4,17 +4,18 @@ use crate::display::WebDisplay;
 use crate::events::EventListenerHandle;
 use crate::http_client::FetchHttpClient;
 use crate::keyboard::WebKeyboardLayout;
+use crate::page_lifecycle::{Document, PageEvent, PageState};
 use crate::text_system::WebTextSystem;
 use crate::window::WebWindow;
 use anyhow::Result;
 use futures::channel::oneshot;
 use gpui::{
-    Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardEntry, ClipboardItem,
-    ClipboardReadError, ClipboardString, CursorStyle, DummyKeyboardMapper, ForegroundExecutor,
-    GestureTuning, Image, ImageFormat, Keymap, Menu, MenuItem, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformGestures, PlatformKeyboardLayout, PlatformKeyboardMapper,
-    PlatformTextSystem, PlatformWindow, ScrollPhysics, Task, ThermalState, WindowAppearance,
-    WindowKind, WindowParams, popup::PopupNotSupportedError,
+    Action, ActivityGuard, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardEntry,
+    ClipboardItem, ClipboardReadError, ClipboardString, CursorStyle, DummyKeyboardMapper,
+    ForegroundExecutor, GestureTuning, Image, ImageFormat, Keymap, Menu, MenuItem,
+    PathPromptOptions, Platform, PlatformDisplay, PlatformGestures, PlatformKeyboardLayout,
+    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, ScrollPhysics, Task, ThermalState,
+    WindowAppearance, WindowKind, WindowParams, popup::PopupNotSupportedError,
 };
 use gpui_wgpu::{PreparedWebGraphics, WebBackendPreference, WgpuContext, wgpu};
 use std::{
@@ -46,6 +47,8 @@ pub struct WebPlatform {
     last_cursor_css: Rc<Cell<&'static str>>,
     gestures: Rc<WebGestures>,
     _cursor_restore_listeners: Vec<EventListenerHandle>,
+    lifecycle: Rc<WebLifecycle>,
+    _lifecycle_listeners: Vec<EventListenerHandle>,
 }
 
 /// Gesture feel for the browser, chosen so touch scrolling matches the host
@@ -192,6 +195,11 @@ impl WebPlatform {
         let gestures = Rc::new(WebGestures::from_user_agent(
             &browser_window.navigator().user_agent().unwrap_or_default(),
         ));
+        let lifecycle = Rc::new(WebLifecycle {
+            state: Cell::new(PageState::current(page_document(&browser_window))),
+            callback: RefCell::new(None),
+        });
+        let lifecycle_listeners = lifecycle_listeners(&browser_window, &lifecycle);
 
         Self {
             browser_window,
@@ -210,6 +218,8 @@ impl WebPlatform {
             last_cursor_css,
             gestures,
             _cursor_restore_listeners: cursor_restore_listeners,
+            lifecycle,
+            _lifecycle_listeners: lifecycle_listeners,
         }
     }
 
@@ -517,6 +527,12 @@ impl Platform for WebPlatform {
         self.callbacks.borrow_mut().reopen = Some(callback);
     }
 
+    /// The page's lifecycle (`page_lifecycle.rs`): focus, visibility, the
+    /// back/forward cache and unloading.
+    fn on_app_lifecycle(&self, callback: Box<dyn FnMut(AppLifecyclePhase)>) {
+        *self.lifecycle.callback.borrow_mut() = Some(callback);
+    }
+
     // Browsers expose no system sleep or wake signal; the nearest thing is the
     // Page Visibility API, which drives `WindowVisibility` instead.
     fn on_system_sleep(&self, _callback: Box<dyn FnMut()>) {}
@@ -818,6 +834,87 @@ fn cursor_restore_listeners(
     add_listener(document_target, "visibilitychange");
 
     handles
+}
+
+/// The page's lifecycle and the `on_app_lifecycle` observer it reports to.
+///
+/// Phases are delivered synchronously from the DOM event: `pagehide` is the
+/// last chance a closing page gets. Focus moving between the page's own
+/// elements (the IME mirror's focus cycling) changes no state, so it never
+/// calls the observer from inside a GPUI dispatch.
+struct WebLifecycle {
+    state: Cell<PageState>,
+    callback: RefCell<Option<Box<dyn FnMut(AppLifecyclePhase)>>>,
+}
+
+impl WebLifecycle {
+    fn handle(&self, event: PageEvent, browser_window: &web_sys::Window) {
+        let document = page_document(browser_window);
+        let (state, phases) = self.state.get().on(event, document);
+        self.state.set(state);
+        // Taken for the call, so an observer that re-enters the platform
+        // finds the slot empty instead of a borrowed `RefCell`.
+        let Some(mut callback) = self.callback.borrow_mut().take() else {
+            return;
+        };
+        for phase in phases {
+            callback(phase);
+        }
+        self.callback.borrow_mut().get_or_insert(callback);
+    }
+}
+
+fn page_document(browser_window: &web_sys::Window) -> Document {
+    Document {
+        hidden: !crate::window::document_visibility(browser_window).is_visible(),
+        has_focus: browser_window
+            .document()
+            .and_then(|document| document.has_focus().ok())
+            .unwrap_or(true),
+    }
+}
+
+/// Page Lifecycle's event listeners: `focus`, `blur`, `pageshow` and
+/// `pagehide` fire on the window, the others on the document. To listen to
+/// another event: a row here and a `PageEvent`.
+fn lifecycle_listeners(
+    browser_window: &web_sys::Window,
+    lifecycle: &Rc<WebLifecycle>,
+) -> Vec<EventListenerHandle> {
+    let Some(document) = browser_window.document() else {
+        return Vec::new();
+    };
+    let window_target: &web_sys::EventTarget = browser_window.as_ref();
+    let document_target: &web_sys::EventTarget = document.as_ref();
+    let rows: [(
+        &web_sys::EventTarget,
+        &'static str,
+        fn(&JsValue) -> PageEvent,
+    ); 7] = [
+        (window_target, "focus", |_| PageEvent::Focus),
+        (window_target, "blur", |_| PageEvent::Blur),
+        (window_target, "pageshow", |_| PageEvent::PageShow),
+        (window_target, "pagehide", |event| PageEvent::PageHide {
+            persisted: js_sys::Reflect::get(event, &"persisted".into())
+                .ok()
+                .and_then(|persisted| persisted.as_bool())
+                .unwrap_or(false),
+        }),
+        (document_target, "visibilitychange", |_| {
+            PageEvent::VisibilityChange
+        }),
+        (document_target, "freeze", |_| PageEvent::Freeze),
+        (document_target, "resume", |_| PageEvent::Resume),
+    ];
+    rows.into_iter()
+        .map(|(target, event_name, page_event)| {
+            let lifecycle = Rc::clone(lifecycle);
+            let browser_window = browser_window.clone();
+            EventListenerHandle::add(target, event_name, move |event: JsValue| {
+                lifecycle.handle(page_event(&event), &browser_window);
+            })
+        })
+        .collect()
 }
 
 fn show_graphics_unavailable_message(browser_window: &web_sys::Window, error: &anyhow::Error) {

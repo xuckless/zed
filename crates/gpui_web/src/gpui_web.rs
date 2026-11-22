@@ -24,7 +24,11 @@ mod ime_mirror;
 #[cfg(target_family = "wasm")]
 mod keyboard;
 #[cfg(target_family = "wasm")]
+mod keyboard_inset;
+#[cfg(target_family = "wasm")]
 mod logging;
+#[cfg(target_family = "wasm")]
+mod page_lifecycle;
 #[cfg(target_family = "wasm")]
 mod platform;
 #[cfg(any(target_family = "wasm", test))]
