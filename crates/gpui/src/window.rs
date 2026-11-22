@@ -80,6 +80,7 @@ pub use a11y::A11ySubtreeBuilder;
 use native_view::NativeViewState;
 pub use native_view::{NativeView, NativeViewId};
 mod native_view_input;
+pub mod native_view_placement;
 use native_view_input::Occlusion;
 pub use native_view_input::NativeViewInput;
 
