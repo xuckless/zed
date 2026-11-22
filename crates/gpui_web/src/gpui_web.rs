@@ -30,6 +30,8 @@ mod platform;
 #[cfg(any(target_family = "wasm", test))]
 mod run_replacements;
 #[cfg(target_family = "wasm")]
+mod text_editing;
+#[cfg(target_family = "wasm")]
 mod text_system;
 #[cfg(target_family = "wasm")]
 mod viewport;

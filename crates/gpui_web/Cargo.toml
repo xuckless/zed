@@ -61,6 +61,7 @@ web-sys = { workspace = true, features = [
     "FocusOptions",
     "HtmlCanvasElement",
     "HtmlElement",
+    "HtmlInputElement",
     "HtmlTextAreaElement",
     "IdleDeadline",
     "IdleRequestOptions",

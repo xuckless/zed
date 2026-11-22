@@ -180,7 +180,11 @@ impl WebWindow {
             .ok()
             .flatten()
             .is_some_and(|query| query.matches());
-        let ime_mirror = ImeMirror::new(&document, &body, touch_input)?;
+        let mobile = matches!(
+            crate::events::platform_info(&browser_window).os,
+            gpui::OperatingSystem::Ios | gpui::OperatingSystem::Android
+        );
+        let ime_mirror = ImeMirror::new(&document, &body, touch_input, mobile)?;
         let mut viewport = WebViewport::new(&document)?;
         viewport.update(&browser_window, &canvas)?;
 
@@ -784,7 +788,12 @@ impl PlatformWindow for WebWindow {
     }
 
     fn set_text_input_configuration(&mut self, configuration: TextInputConfiguration) {
-        self.inner.ime_mirror.apply_configuration(&configuration);
+        if self.inner.ime_mirror.apply_configuration(&configuration) {
+            // A new element: the old one took its composition with it, and
+            // the window must be written into the new one.
+            self.inner.is_composing.set(false);
+            ImeMirror::schedule_sync(&self.inner);
+        }
     }
 
     fn show_soft_keyboard(&self) {
@@ -1081,7 +1090,21 @@ impl PlatformWindow for WebWindow {
         self.inner.state.borrow().renderer.gpu_specs()
     }
 
-    fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
+    /// Puts the IME mirror on the caret, so a desktop IME's candidate window
+    /// opens there (Flutter's `placeElement`). Not mid-composition (Flutter's
+    /// `updateElementPlacement`: moving a composing element disturbs the IME),
+    /// and not on touch, where the mirror stays at the top: a focused field
+    /// near the keyboard makes iOS pan the page to it, and mobile keyboards
+    /// show their candidates in the keyboard, not at the caret.
+    fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+        if self.inner.touch_input || self.inner.is_composing.get() {
+            return;
+        }
+        let canvas = self.inner.canvas.get_bounding_client_rect();
+        self.inner
+            .ime_mirror
+            .place(bounds, (canvas.left(), canvas.top()));
+    }
 
     fn request_decorations(&self, _decorations: WindowDecorations) {}
 

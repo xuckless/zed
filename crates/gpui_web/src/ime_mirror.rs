@@ -1,4 +1,5 @@
-//! The hidden `<textarea>` that connects browser IMEs to GPUI.
+//! The hidden `<textarea>` (an `<input type=password>` for secure fields)
+//! that connects browser IMEs to GPUI.
 //!
 //! IMEs (software keyboards, composition engines) decide what backspace,
 //! autocorrect, and suggestions mean by inspecting the focused editable
@@ -17,9 +18,10 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use gpui::{Autocapitalize, TextInputAction, TextInputConfiguration};
+use gpui::{Bounds, Pixels, TextInputConfiguration};
 use wasm_bindgen::JsCast;
 
+use crate::text_editing::{self, ElementKind};
 use crate::window::WebWindowInner;
 
 /// UTF-16 code units of document text mirrored on each side of the
@@ -47,14 +49,109 @@ const CONTEXT_CHARS: usize = 512;
 /// element write and therefore an IME restart.
 const MIN_EDGE_CHARS: usize = 64;
 
-/// The hidden `<textarea>` IMEs edit, plus the bookkeeping that relates it
-/// to the document.
+/// The element IMEs edit: a `<textarea>`, or an `<input type=password>`
+/// while the focused field is secure ([`text_editing::element_kind`]). The
+/// two share their value and selection API, but web-sys gives them no
+/// common type.
+enum MirrorElement {
+    TextArea(web_sys::HtmlTextAreaElement),
+    Password(web_sys::HtmlInputElement),
+}
+
+impl MirrorElement {
+    fn create(document: &web_sys::Document, kind: ElementKind) -> anyhow::Result<Self> {
+        let tag = match kind {
+            ElementKind::TextArea => "textarea",
+            ElementKind::Password => "input",
+        };
+        let element = document
+            .create_element(tag)
+            .map_err(|e| anyhow::anyhow!("Failed to create {tag} element: {e:?}"))?;
+        let not_kind = |e| anyhow::anyhow!("Created element is not a {tag}: {e:?}");
+        Ok(match kind {
+            ElementKind::TextArea => Self::TextArea(element.dyn_into().map_err(not_kind)?),
+            ElementKind::Password => {
+                let input: web_sys::HtmlInputElement = element.dyn_into().map_err(not_kind)?;
+                input.set_type("password");
+                Self::Password(input)
+            }
+        })
+    }
+
+    fn kind(&self) -> ElementKind {
+        match self {
+            Self::TextArea(_) => ElementKind::TextArea,
+            Self::Password(_) => ElementKind::Password,
+        }
+    }
+
+    fn html(&self) -> &web_sys::HtmlElement {
+        match self {
+            Self::TextArea(element) => element,
+            Self::Password(element) => element,
+        }
+    }
+
+    fn value(&self) -> String {
+        match self {
+            Self::TextArea(element) => element.value(),
+            Self::Password(element) => element.value(),
+        }
+    }
+
+    fn set_value(&self, value: &str) {
+        match self {
+            Self::TextArea(element) => element.set_value(value),
+            Self::Password(element) => element.set_value(value),
+        }
+    }
+
+    fn selection_start(&self) -> Option<u32> {
+        match self {
+            Self::TextArea(element) => element.selection_start(),
+            Self::Password(element) => element.selection_start(),
+        }
+        .ok()
+        .flatten()
+    }
+
+    fn selection_end(&self) -> Option<u32> {
+        match self {
+            Self::TextArea(element) => element.selection_end(),
+            Self::Password(element) => element.selection_end(),
+        }
+        .ok()
+        .flatten()
+    }
+
+    fn set_selection_range(&self, start: u32, end: u32) {
+        match self {
+            Self::TextArea(element) => element.set_selection_range(start, end),
+            Self::Password(element) => element.set_selection_range(start, end),
+        }
+        .ok();
+    }
+
+    fn set_read_only(&self, read_only: bool) {
+        match self {
+            Self::TextArea(element) => element.set_read_only(read_only),
+            Self::Password(element) => element.set_read_only(read_only),
+        }
+    }
+}
+
+/// The hidden element IMEs edit, plus the bookkeeping that relates it to
+/// the document.
 ///
 /// The element and every value/selection write on it are private to this
 /// module; other code interacts through read accessors, focus and
 /// virtual-keyboard control, and [`ImeMirror::schedule_sync`].
 pub(crate) struct ImeMirror {
-    element: web_sys::HtmlTextAreaElement,
+    /// Holds the element and outlives its swaps: the IME listeners sit here
+    /// (every event they hear bubbles), so a swap needn't move them.
+    container: web_sys::HtmlElement,
+    /// Replaced only by `apply_configuration`, when the element kind changes.
+    element: RefCell<MirrorElement>,
     /// The mirror text most recently synced to (or observed in) the hidden
     /// element. `input` events diff the element's new value against this to
     /// recover what edit the IME performed.
@@ -81,6 +178,12 @@ pub(crate) struct ImeMirror {
     /// selection has moved; a rejected import means no import is coming,
     /// so the next sync must reassert the app's state instead of waiting.
     selection_import_rejected: Cell<bool>,
+    /// Whether the browser runs on iOS or Android, where Flutter sets
+    /// `enterkeyhint` (desktop keyboards have no action key).
+    mobile: bool,
+    /// The `inputmode` the configuration's keyboard type asks for, written
+    /// whenever the virtual keyboard is enabled.
+    input_mode: Cell<&'static str>,
 }
 
 impl ImeMirror {
@@ -88,16 +191,21 @@ impl ImeMirror {
         document: &web_sys::Document,
         body: &web_sys::HtmlElement,
         touch_input: bool,
+        mobile: bool,
     ) -> anyhow::Result<Self> {
+        let container: web_sys::HtmlElement = document
+            .create_element("div")
+            .map_err(|e| anyhow::anyhow!("Failed to create div element: {e:?}"))?
+            .dyn_into()
+            .map_err(|e| anyhow::anyhow!("Created element is not a div: {e:?}"))?;
+        // No box of its own: the element inside is positioned against the
+        // viewport, the container only routes its events.
+        container.style().set_property("display", "contents").ok();
         // A textarea rather than an input: single-line inputs silently strip
         // newlines from assigned values, which would make the mirror text
         // disagree with what was written into it.
-        let element: web_sys::HtmlTextAreaElement = document
-            .create_element("textarea")
-            .map_err(|e| anyhow::anyhow!("Failed to create textarea element: {e:?}"))?
-            .dyn_into()
-            .map_err(|e| anyhow::anyhow!("Created element is not a textarea: {e:?}"))?;
-        let style = element.style();
+        let element = MirrorElement::create(document, ElementKind::TextArea)?;
+        let style = element.html().style();
         style.set_property("position", "fixed").ok();
         style.set_property("top", "0").ok();
         style.set_property("left", "0").ok();
@@ -108,9 +216,12 @@ impl ImeMirror {
         // whose font is smaller than 16px; with page zoom disabled the user
         // can never zoom back out, so keep the hidden IME input at 16px.
         style.set_property("font-size", "16px").ok();
-        body.append_child(&element)
+        container
+            .append_child(element.html())
+            .map_err(|e| anyhow::anyhow!("Failed to append input to its container: {e:?}"))?;
+        body.append_child(&container)
             .map_err(|e| anyhow::anyhow!("Failed to append input to body: {e:?}"))?;
-        Self::focus_element(&element);
+        Self::focus_element(element.html());
         // The element must stay focused to receive hardware-key and IME
         // events, but on touch-first devices a focused *editable* element
         // invites the browser to summon the virtual keyboard on the next
@@ -118,17 +229,21 @@ impl ImeMirror {
         // until an editable tap, without disabling hardware IME composition.
         if touch_input {
             element
+                .html()
                 .set_attribute("inputmode", "none")
                 .map_err(|error| anyhow::anyhow!("Failed to configure input mode: {error:?}"))?;
         }
 
         let this = Self {
-            element,
+            container,
+            element: RefCell::new(element),
             text: RefCell::new(String::new()),
             selection: Cell::new((0, 0)),
             window_hint: Cell::new(0),
             sync_scheduled: Cell::new(false),
             selection_import_rejected: Cell::new(false),
+            mobile,
+            input_mode: Cell::new(text_editing::input_mode(Default::default())),
         };
         // Until an input handler asks otherwise, the element is an IME
         // conduit, not a form field: browser-side text assistance would
@@ -137,56 +252,111 @@ impl ImeMirror {
         Ok(this)
     }
 
-    /// Maps a [`TextInputConfiguration`] onto the element's text-assistance
-    /// attributes. Callers must only invoke this on actual configuration
+    /// Maps a [`TextInputConfiguration`] onto the element (Flutter's rules:
+    /// [`text_editing::element_kind`], [`text_editing::attributes`]) and its
+    /// keyboard layout. Callers must only invoke this on actual configuration
     /// changes (GPUI diffs before forwarding): mutating the focused element
-    /// can restart the IME's input connection.
-    pub(crate) fn apply_configuration(&self, configuration: &TextInputConfiguration) {
-        let element: &web_sys::Element = self.element.as_ref();
-        self.element.set_spellcheck(configuration.suggestions);
-        let on_off = |enabled: bool| if enabled { "on" } else { "off" };
-        element
-            .set_attribute("autocomplete", on_off(configuration.suggestions))
-            .ok();
-        element
-            .set_attribute("autocorrect", on_off(configuration.autocorrect))
-            .ok();
-        element
-            .set_attribute(
-                "autocapitalize",
-                match configuration.autocapitalize {
-                    Autocapitalize::None => "off",
-                    Autocapitalize::Words => "words",
-                    Autocapitalize::Sentences => "sentences",
-                    Autocapitalize::Characters => "characters",
-                },
-            )
-            .ok();
-        let enter_key_hint = match configuration.input_action {
-            TextInputAction::Unspecified => None,
-            TextInputAction::Enter => Some("enter"),
-            TextInputAction::Done => Some("done"),
-            TextInputAction::Go => Some("go"),
-            TextInputAction::Next => Some("next"),
-            TextInputAction::Previous => Some("previous"),
-            TextInputAction::Search => Some("search"),
-            TextInputAction::Send => Some("send"),
+    /// can restart the IME's input connection. Returns whether the element
+    /// was replaced: the new one is empty until the next sync, and holds no
+    /// composition.
+    pub(crate) fn apply_configuration(&self, configuration: &TextInputConfiguration) -> bool {
+        let kind = text_editing::element_kind(configuration);
+        let current = self.element.borrow().kind();
+        let replaced = kind != current && self.replace_element(kind);
+        let element = self.element.borrow();
+        let element = element.html();
+        for (name, value) in text_editing::attributes(configuration, self.mobile) {
+            match value {
+                Some(value) => element.set_attribute(name, value).ok(),
+                None => element.remove_attribute(name).ok(),
+            };
+        }
+        self.input_mode
+            .set(text_editing::input_mode(configuration.keyboard_type));
+        // Touch input owns `inputmode` ("none" while it suppresses the
+        // keyboard); an enabled keyboard takes the new layout now.
+        if element.has_attribute("inputmode") && self.virtual_keyboard_enabled() {
+            self.set_virtual_keyboard_enabled(true);
+        }
+        replaced
+    }
+
+    /// Swaps in a `kind` element in the old one's place, as Flutter's
+    /// `TextInput.updateConfig` gets a fresh element when `obscureText` or
+    /// `isMultiline` changes. It takes over the old one's placement,
+    /// keyboard state, read-only state and focus; the mirror's bookkeeping
+    /// restarts empty, so the next sync writes the window afresh.
+    fn replace_element(&self, kind: ElementKind) -> bool {
+        let old = self.element.borrow().html().clone();
+        let Some(document) = old.owner_document() else {
+            return false;
         };
-        match enter_key_hint {
-            Some(hint) => element.set_attribute("enterkeyhint", hint).ok(),
-            None => element.remove_attribute("enterkeyhint").ok(),
+        let new = match MirrorElement::create(&document, kind) {
+            Ok(new) => new,
+            Err(error) => {
+                log::warn!("IME mirror keeps its element: {error}");
+                return false;
+            }
         };
+        // Copied attributes; the configuration's own are applied after.
+        for name in ["style", "inputmode", "readonly"] {
+            if let Some(value) = old.get_attribute(name) {
+                new.html().set_attribute(name, &value).ok();
+            }
+        }
+        let focused = self.is_focused();
+        if let Err(error) = old.replace_with_with_node_1(new.html()) {
+            log::warn!("IME mirror keeps its element: {error:?}");
+            return false;
+        }
+        *self.element.borrow_mut() = new;
+        self.text.borrow_mut().clear();
+        self.selection.set((0, 0));
+        self.window_hint.set(0);
+        self.selection_import_rejected.set(false);
+        if focused {
+            self.focus();
+        }
+        true
+    }
+
+    /// Moves the element onto `caret` (window coordinates; the canvas starts
+    /// at `canvas_origin` in the page), as Flutter's `placeElement` puts its
+    /// element over the field, so a desktop IME's candidate window and the
+    /// browser's composition popups open at the caret instead of the page's
+    /// corner. The caller never places it mid-composition (see
+    /// `WebWindow::update_ime_position`).
+    pub(crate) fn place(&self, caret: Bounds<Pixels>, canvas_origin: (f64, f64)) {
+        let style = self.element.borrow().html().style();
+        let left = format!(
+            "{}px",
+            canvas_origin.0 + f64::from(f32::from(caret.origin.x))
+        );
+        let top = format!(
+            "{}px",
+            canvas_origin.1 + f64::from(f32::from(caret.origin.y))
+        );
+        style.set_property("left", &left).ok();
+        style.set_property("top", &top).ok();
+    }
+
+    /// Whether Enter reaches the element as an `insertLineBreak` beforeinput.
+    pub(crate) fn inserts_line_breaks(&self) -> bool {
+        match self.element.borrow().kind() {
+            ElementKind::TextArea => true,
+            ElementKind::Password => false,
+        }
     }
 
     pub(crate) fn event_target(&self) -> &web_sys::EventTarget {
-        self.element.as_ref()
+        self.container.as_ref()
     }
 
     pub(crate) fn focus(&self) {
-        Self::focus_element(&self.element);
+        Self::focus_element(self.element.borrow().html());
     }
 
-    fn focus_element(element: &web_sys::HtmlTextAreaElement) {
+    fn focus_element(element: &web_sys::HtmlElement) {
         // The hidden mirror is not a scroll target: revealing its caret can
         // pan Android Chrome's visual viewport when the keyboard opens.
         let options = web_sys::FocusOptions::new();
@@ -197,7 +367,8 @@ impl ImeMirror {
     }
 
     pub(crate) fn is_focused(&self) -> bool {
-        let element: &web_sys::Element = self.element.as_ref();
+        let element = self.element.borrow();
+        let element: &web_sys::Element = element.html().as_ref();
         web_sys::window()
             .and_then(|window| window.document())
             .and_then(|document| document.active_element())
@@ -205,41 +376,49 @@ impl ImeMirror {
     }
 
     pub(crate) fn blur(&self) {
-        self.element.blur().ok();
+        self.element.borrow().html().blur().ok();
     }
 
     pub(crate) fn virtual_keyboard_enabled(&self) -> bool {
-        self.element.get_attribute("inputmode").as_deref() != Some("none")
+        self.element
+            .borrow()
+            .html()
+            .get_attribute("inputmode")
+            .as_deref()
+            != Some("none")
     }
 
     pub(crate) fn set_read_only(&self, read_only: bool) {
-        self.element.set_read_only(read_only);
+        self.element.borrow().set_read_only(read_only);
     }
 
     pub(crate) fn set_virtual_keyboard_enabled(&self, enabled: bool) {
-        if let Err(error) = self
-            .element
-            .set_attribute("inputmode", if enabled { "text" } else { "none" })
-        {
+        if let Err(error) = self.element.borrow().html().set_attribute(
+            "inputmode",
+            if enabled {
+                self.input_mode.get()
+            } else {
+                "none"
+            },
+        ) {
             log::warn!("Failed to configure input mode: {error:?}");
         }
     }
 
     pub(crate) fn remove(&self) {
-        let element: &web_sys::Element = self.element.as_ref();
-        element.remove();
+        self.container.remove();
     }
 
     pub(crate) fn value(&self) -> String {
-        self.element.value()
+        self.element.borrow().value()
     }
 
     pub(crate) fn selection_start(&self) -> Option<u32> {
-        self.element.selection_start().ok().flatten()
+        self.element.borrow().selection_start()
     }
 
     pub(crate) fn element_selection_end(&self) -> Option<u32> {
-        self.element.selection_end().ok().flatten()
+        self.element.borrow().selection_end()
     }
 
     pub(crate) fn stored_text(&self) -> String {
@@ -256,13 +435,12 @@ impl ImeMirror {
     /// the element is already what the IME expects, and echoing a write
     /// back would restart the IME mid-gesture.
     pub(crate) fn adopt_element_state(&self) {
-        *self.text.borrow_mut() = self.element.value();
+        *self.text.borrow_mut() = self.element.borrow().value();
         let selection_start = self.selection_start().unwrap_or(0);
         let selection_end = self
             .element
+            .borrow()
             .selection_end()
-            .ok()
-            .flatten()
             .unwrap_or(selection_start);
         self.selection.set((selection_start, selection_end));
     }
@@ -343,7 +521,7 @@ impl ImeMirror {
             // growing its selection. The import reconciles the two sides and
             // schedules a fresh sync when it cannot adopt the move.
             if !mirror.selection_import_rejected.replace(false)
-                && *mirror.text.borrow() == mirror.element.value()
+                && *mirror.text.borrow() == mirror.element.borrow().value()
             {
                 let live_start = mirror.selection_start().unwrap_or(0);
                 let live_end = mirror.element_selection_end().unwrap_or(live_start);
@@ -356,7 +534,7 @@ impl ImeMirror {
                 .flatten();
             let Some(selection) = selection else {
                 if !mirror.text.borrow().is_empty() {
-                    mirror.element.set_value("");
+                    mirror.element.borrow().set_value("");
                     mirror.text.borrow_mut().clear();
                 }
                 mirror.selection.set((0, 0));
@@ -412,28 +590,28 @@ impl ImeMirror {
                 .unwrap_or_default();
             let window_start = adjusted.unwrap_or(window_range).start;
 
-            if *mirror.text.borrow() != text || mirror.element.value() != text {
-                mirror.element.set_value(&text);
+            if *mirror.text.borrow() != text || mirror.element.borrow().value() != text {
+                mirror.element.borrow().set_value(&text);
                 *mirror.text.borrow_mut() = text;
             }
 
             mirror.window_hint.set(window_start);
             let selection_start = selection.range.start.saturating_sub(window_start) as u32;
             let selection_end = selection.range.end.saturating_sub(window_start) as u32;
-            if mirror.element.selection_start().ok().flatten() != Some(selection_start)
-                || mirror.element.selection_end().ok().flatten() != Some(selection_end)
+            if mirror.element.borrow().selection_start() != Some(selection_start)
+                || mirror.element.borrow().selection_end() != Some(selection_end)
             {
                 mirror
                     .element
-                    .set_selection_range(selection_start, selection_end)
-                    .ok();
+                    .borrow()
+                    .set_selection_range(selection_start, selection_end);
             }
             // Read the selection back rather than trusting the computed
             // values: the browser clamps out-of-bounds positions, and a
             // stored selection the element doesn't actually have would
             // corrupt the next diff.
-            let actual_start = mirror.element.selection_start().ok().flatten();
-            let actual_end = mirror.element.selection_end().ok().flatten();
+            let actual_start = mirror.element.borrow().selection_start();
+            let actual_end = mirror.element.borrow().selection_end();
             mirror.selection.set((
                 actual_start.unwrap_or(selection_start),
                 actual_end.unwrap_or(selection_end),
@@ -458,7 +636,7 @@ fn move_selection_within_window(
     let mirror = &window.ime_mirror;
     let stored_text = mirror.text.borrow().clone();
     let stored_length = stored_text.encode_utf16().count();
-    if stored_length == 0 || mirror.element.value() != stored_text {
+    if stored_length == 0 || mirror.element.borrow().value() != stored_text {
         return false;
     }
     let window_start = mirror.window_hint.get();
@@ -516,10 +694,10 @@ fn move_selection_within_window(
 
     mirror
         .element
-        .set_selection_range(selection_start as u32, selection_end as u32)
-        .ok();
-    let actual_start = mirror.element.selection_start().ok().flatten();
-    let actual_end = mirror.element.selection_end().ok().flatten();
+        .borrow()
+        .set_selection_range(selection_start as u32, selection_end as u32);
+    let actual_start = mirror.element.borrow().selection_start();
+    let actual_end = mirror.element.borrow().selection_end();
     if actual_start != Some(selection_start as u32) || actual_end != Some(selection_end as u32) {
         return false;
     }
@@ -550,8 +728,8 @@ fn is_consistent(
         return false;
     }
     // The element's real selection must match what we believe it is.
-    if mirror.element.selection_start().ok().flatten() != Some(element_selection_start as u32)
-        || mirror.element.selection_end().ok().flatten() != Some(element_selection_end as u32)
+    if mirror.element.borrow().selection_start() != Some(element_selection_start as u32)
+        || mirror.element.borrow().selection_end() != Some(element_selection_end as u32)
     {
         return false;
     }
@@ -610,7 +788,7 @@ fn is_consistent(
     if document_text != stored_text {
         return false;
     }
-    if mirror.element.value() != stored_text {
+    if mirror.element.borrow().value() != stored_text {
         return false;
     }
     // The element selection corresponds to the app selection end too?
