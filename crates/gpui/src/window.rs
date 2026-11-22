@@ -858,6 +858,9 @@ pub struct Hitbox {
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
+    /// The dispatch node of the element that inserted the hitbox, which tells
+    /// a [`HitboxBehavior::BlockMouseExceptAncestors`] hitbox its ancestors.
+    pub(crate) dispatch_node: Option<DispatchNodeId>,
 }
 
 impl Hitbox {
@@ -4669,11 +4672,6 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
-        self.next_frame.hitboxes.extend(
-            self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
-                .iter()
-                .cloned(),
-        );
         self.next_frame.tooltip_requests.extend(
             self.rendered_frame.tooltip_requests
                 [range.start.tooltips_index..range.end.tooltips_index]
@@ -4693,6 +4691,17 @@ impl Window {
             range.start.dispatch_tree_index..range.end.dispatch_tree_index,
             &mut self.rendered_frame.dispatch_tree,
             self.focus,
+        );
+        // After the dispatch subtree, whose new node ids the hitboxes take.
+        self.next_frame.hitboxes.extend(
+            self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
+                .iter()
+                .map(|hitbox| Hitbox {
+                    dispatch_node: hitbox
+                        .dispatch_node
+                        .map(|node| reused_subtree.refresh_node_id(node)),
+                    ..hitbox.clone()
+                }),
         );
 
         if reused_subtree.contains_focus() {
@@ -6045,6 +6054,7 @@ impl Window {
             bounds,
             content_mask,
             behavior,
+            dispatch_node: self.next_frame.dispatch_tree.active_node_id(),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
