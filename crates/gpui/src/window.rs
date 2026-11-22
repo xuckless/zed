@@ -3948,6 +3948,18 @@ impl Window {
         if self.platform_window.prepare_frame() {
             self.refresh();
         }
+        // A field that focus left (blur, another element) ends its IME composition before this
+        // draw drops its input handler, so its marked text becomes plain text and no stale composing
+        // range reaches the next input session; the platform then ends its IME's side. A tap's
+        // focus change is drawn inside the touch dispatch, so this is the last point where the
+        // left field's handler is reachable.
+        let mut input_handler = self.platform_window.take_input_handler();
+        if let Some(handler) = &mut input_handler
+            && handler.focus_id().is_some_and(|id| self.focus != Some(id))
+            && handler.end_composition_during_update(self, cx)
+        {
+            self.platform_window.end_composition();
+        }
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -3958,7 +3970,7 @@ impl Window {
         // Place it back into a None slot (left by a previous .take()) so that
         // cached paint_range indices in reuse_paint find the handler at the
         // expected position.
-        if let Some(input_handler) = self.platform_window.take_input_handler() {
+        if let Some(input_handler) = input_handler {
             if let Some(slot) = self
                 .rendered_frame
                 .input_handlers

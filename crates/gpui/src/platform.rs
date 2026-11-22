@@ -1319,6 +1319,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// element on web). Called only when the configuration changes, because
     /// reconfiguring a live input session can restart the IME connection.
     fn set_text_input_configuration(&mut self, _configuration: TextInputConfiguration) {}
+    /// GPUI ended the composition of a field that focus left: its marked text is plain text now.
+    /// End the native IME's composition too, without committing it, or its next keystroke
+    /// re-inserts that text. Called during a draw, with no input handler set, so IME callbacks
+    /// it triggers synchronously reach no field. No-op by default, for platforms whose IME
+    /// session already restarts when the focused field changes or blurs (iOS, Android).
+    fn end_composition(&self) {}
     fn prompt(
         &self,
         level: PromptLevel,
@@ -2255,6 +2261,19 @@ impl PlatformInputHandler {
     /// cannot borrow the app.
     pub(crate) fn unmark_text_during_update(&mut self, window: &mut Window, cx: &mut App) {
         self.handler.unmark_text(window, cx);
+    }
+
+    /// Ends the composition, if the field has one, from inside an update. Returns whether it had one.
+    pub(crate) fn end_composition_during_update(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let marked = self.handler.marked_text_range(window, cx).is_some();
+        if marked {
+            self.handler.unmark_text(window, cx);
+        }
+        marked
     }
 
     pub fn dispatch_input(&mut self, input: &str, window: &mut Window, cx: &mut App) {

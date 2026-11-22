@@ -1770,6 +1770,20 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().input_handler.take()
     }
 
+    fn end_composition(&self) {
+        // GPUI already unmarked the field; without this the input method still holds its
+        // composition and inserts it again at the caret with the next keystroke. The lock is
+        // released first: the input context may call back into the view, which locks it.
+        let native_view = self.0.lock().native_view.as_ptr();
+        // SAFETY: `native_view` is this window's live GPUI view, which outlives `self`.
+        unsafe {
+            let input_context: *mut AnyObject = msg_send![native_view, inputContext];
+            if !input_context.is_null() {
+                let _: () = msg_send![input_context, discardMarkedText];
+            }
+        }
+    }
+
     fn prompt(
         &self,
         level: PromptLevel,

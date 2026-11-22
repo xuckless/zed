@@ -49,6 +49,7 @@ pub(crate) struct TestWindowState {
     insets_callback: Option<Box<dyn FnMut(WindowInsets)>>,
     virtual_keyboard_requests: usize,
     virtual_keyboard_dismissals: usize,
+    composition_ends: usize,
     moved_callback: Option<Box<dyn FnMut()>>,
     display_changed_callback: Option<Box<dyn FnMut()>>,
     appearance_change_callback: Option<Box<dyn FnMut()>>,
@@ -125,6 +126,7 @@ impl TestWindow {
             insets_callback: None,
             virtual_keyboard_requests: 0,
             virtual_keyboard_dismissals: 0,
+            composition_ends: 0,
             moved_callback: None,
             display_changed_callback: None,
             appearance_change_callback: None,
@@ -234,6 +236,11 @@ impl TestWindow {
 
     pub fn virtual_keyboard_dismissals(&self) -> usize {
         self.0.lock().virtual_keyboard_dismissals
+    }
+
+    /// How many times GPUI ended a composition on the platform ([`PlatformWindow::end_composition`]).
+    pub fn composition_ends(&self) -> usize {
+        self.0.lock().composition_ends
     }
 
     /// Every [`TextInputConfiguration`] forwarded to this window, in order.
@@ -465,6 +472,10 @@ impl PlatformWindow for TestWindow {
 
     fn text_input_state_changed(&self, change: TextInputStateChange) {
         self.0.lock().text_input_state_changes.push(change);
+    }
+
+    fn end_composition(&self) {
+        self.0.lock().composition_ends += 1;
     }
 
     fn prompt(

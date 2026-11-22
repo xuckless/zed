@@ -864,6 +864,18 @@ impl PlatformWindow for WebWindow {
         }
     }
 
+    fn end_composition(&self) {
+        // `sync` skips the mirror while the browser composes, so without this its composition
+        // would carry on into the next field. Browsers commit a composition when its element
+        // blurs: the commit's `compositionend` finds no input handler during this draw, or the
+        // next field's without marked text, so it inserts nothing.
+        if !self.inner.is_composing.replace(false) || !self.inner.ime_mirror.is_focused() {
+            return;
+        }
+        self.inner.focus_ime_mirror();
+        ImeMirror::schedule_sync(&self.inner);
+    }
+
     fn prompt(
         &self,
         _level: PromptLevel,
