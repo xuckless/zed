@@ -75,8 +75,45 @@ pub fn touch_phase(touch: &UITouch) -> TouchPhase {
     }
 }
 
-pub fn touch_id(touch: &UITouch) -> TouchId {
-    TouchId(touch as *const UITouch as usize as u64)
+// Ported from flutter/flutter engine/src/flutter/lib/ui/window/pointer_data_packet_converter.cc
+// (`UpdatePointerIdentifier`: each down takes `++pointer_`, kept until the device's up or cancel erases its state)
+// and engine/src/flutter/shell/platform/darwin/ios/framework/Source/FlutterViewController.mm (`dispatchTouches:`,
+// `pointer_data.device = reinterpret_cast<int64_t>(touch)`) @ 3.50.1 (ae9b586f34a8443573f82ef57c3bf914a908cbf7).
+// Copyright 2014 The Flutter Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
+/// GPUI's ids for the touches UIKit has down, keyed by `UITouch` address as Flutter keys its device. UIKit reuses a
+/// finished touch's object, and so its address, for a later touch, so an address names a touch only while it is
+/// live: each began touch takes the next id (from 0, wrapping) and gives it up when it ends or is cancelled.
+#[derive(Debug, Default)]
+pub struct TouchIds {
+    next: u64,
+    live: Vec<(usize, TouchId)>,
+}
+
+impl TouchIds {
+    /// The touches (id, phase) one UIKit sample makes. A move or end of an address with no live touch is dropped; a
+    /// begin of one still live cancels that stale touch, then starts its own.
+    pub fn track(&mut self, touch: usize, phase: TouchPhase) -> Vec<(TouchId, TouchPhase)> {
+        let index = self.live.iter().position(|(live, _)| *live == touch);
+        match (index, phase) {
+            (None, TouchPhase::Started) => vec![(self.start(touch), phase)],
+            (None, TouchPhase::Moved | TouchPhase::Ended | TouchPhase::Cancelled) => Vec::new(),
+            (Some(index), TouchPhase::Started) => {
+                let (_, stale) = self.live.remove(index);
+                vec![(stale, TouchPhase::Cancelled), (self.start(touch), phase)]
+            }
+            (Some(index), TouchPhase::Moved) => vec![(self.live[index].1, phase)],
+            (Some(index), TouchPhase::Ended | TouchPhase::Cancelled) => {
+                vec![(self.live.remove(index).1, phase)]
+            }
+        }
+    }
+
+    fn start(&mut self, touch: usize) -> TouchId {
+        let id = TouchId(self.next);
+        self.next = self.next.wrapping_add(1);
+        self.live.push((touch, id));
+        id
+    }
 }
 
 /// Converts one step of a trackpad or mouse-wheel scroll gesture.
@@ -139,5 +176,51 @@ pub fn touch_device(touch: &UITouch) -> PointerDevice {
         // objc2 makes `UITouchType` an open newtype, so a match needs this arm; a
         // type UIKit adds later reads as a finger.
         _ => PointerDevice::Touch,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn touch_ids() {
+        use TouchPhase::*;
+        // (name, UITouch address, phase, touches out as (id, phase)): addresses are reused, live ids never are.
+        let rows: [(&str, usize, TouchPhase, &[(u64, TouchPhase)]); 9] = [
+            ("first finger down", 0x10, Started, &[(0, Started)]),
+            ("second finger down", 0x20, Started, &[(1, Started)]),
+            ("first finger moves", 0x10, Moved, &[(0, Moved)]),
+            ("first finger lifts", 0x10, Ended, &[(0, Ended)]),
+            (
+                "its address reused by the next tap",
+                0x10,
+                Started,
+                &[(2, Started)],
+            ),
+            (
+                "second finger cancelled",
+                0x20,
+                Cancelled,
+                &[(1, Cancelled)],
+            ),
+            (
+                "a begin of a live address cancels its stale touch",
+                0x10,
+                Started,
+                &[(2, Cancelled), (3, Started)],
+            ),
+            ("rejected: a move with no live begin", 0x30, Moved, &[]),
+            ("rejected: an end with no live begin", 0x30, Ended, &[]),
+        ];
+        let mut ids = TouchIds::default();
+        for (name, touch, phase, expected) in rows {
+            let got: Vec<_> = ids
+                .track(touch, phase)
+                .into_iter()
+                .map(|(id, phase)| (id.0, phase))
+                .collect();
+            assert_eq!(got, expected, "{name}");
+        }
     }
 }

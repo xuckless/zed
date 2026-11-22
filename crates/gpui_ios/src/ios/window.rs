@@ -292,6 +292,8 @@ pub(crate) struct IosWindowState {
     appearance_changed_callback: CallbackSlot<Box<dyn FnMut()>>,
     insets_changed_callback: CallbackSlot<Box<dyn FnMut(WindowInsets)>>,
     keyboard_dismiss_touch: Cell<Option<KeyboardDismissTouch>>,
+    /// GPUI's ids for the touches UIKit has down (events.rs).
+    touch_ids: RefCell<TouchIds>,
     /// Where the back gesture an element claimed started, while it runs.
     back_gesture_start: Cell<Option<Point<Pixels>>>,
     keyboard_height: Cell<f32>,
@@ -453,6 +455,7 @@ impl IosWindow {
             appearance_changed_callback: CallbackSlot::default(),
             insets_changed_callback: CallbackSlot::default(),
             keyboard_dismiss_touch: Cell::new(None),
+            touch_ids: RefCell::default(),
             back_gesture_start: Cell::new(None),
             keyboard_height: Cell::new(0.),
             mouse_position: Cell::new(Point::default()),
@@ -538,26 +541,26 @@ impl IosWindowState {
     pub fn handle_touch(&self, touch: &UITouch, _event: Option<&UIEvent>) {
         // Each touch carries UIKit's own time stamp. UIKit's historical coalesced
         // samples are not replayed: one sample per touch callback, as Flutter's embedder.
-        let id = touch_id(touch);
-        self.handle_touch_sample(touch, id);
-    }
-
-    fn handle_touch_sample(&self, touch: &UITouch, id: TouchId) {
+        let touches = self
+            .touch_ids
+            .borrow_mut()
+            .track(touch as *const UITouch as usize, touch_phase(touch));
         let position = touch_location_in_view(touch, &self.view);
         self.mouse_position.set(position);
-
-        let event = TouchEvent {
-            id,
-            phase: touch_phase(touch),
-            position,
-            predicted_position: None,
-            force: touch_force(touch),
-            device: touch_device(touch),
-            time_stamp: process_info::uptime_instant(touch.timestamp()),
-        };
-        self.handle_keyboard_dismiss_touch(&event);
-        self.input_callback
-            .with(|callback| callback(PlatformInput::Touch(event)));
+        for (id, phase) in touches {
+            let event = TouchEvent {
+                id,
+                phase,
+                position,
+                predicted_position: None,
+                force: touch_force(touch),
+                device: touch_device(touch),
+                time_stamp: process_info::uptime_instant(touch.timestamp()),
+            };
+            self.handle_keyboard_dismiss_touch(&event);
+            self.input_callback
+                .with(|callback| callback(PlatformInput::Touch(event)));
+        }
     }
 
     /// Delivers one step of a trackpad or mouse-wheel scroll gesture.
