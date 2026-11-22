@@ -60,6 +60,7 @@ use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
 use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3, zwp_text_input_v3,
 };
+use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1;
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1};
 use wayland_protocols::xdg::decoration::zv1::client::{
@@ -256,6 +257,9 @@ pub struct Globals {
     pub viewporter: Option<wp_viewporter::WpViewporter>,
     /// Makes native views subsurfaces of their windows.
     pub subcompositor: Option<wl_subcompositor::WlSubcompositor>,
+    /// Fills the colour under a window's native views, where offered (else a 1×1 shm buffer).
+    pub single_pixel_buffer_manager:
+        Option<wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1>,
     pub fractional_scale_manager:
         Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
@@ -310,6 +314,7 @@ impl Globals {
                 .context("Wayland compositor does not provide xdg_wm_base")?,
             viewporter: globals.bind(&qh, 1..=1, ()).ok(),
             subcompositor: globals.bind(&qh, 1..=1, ()).ok(),
+            single_pixel_buffer_manager: globals.bind(&qh, 1..=1, ()).ok(),
             fractional_scale_manager: globals.bind(&qh, 1..=1, ()).ok(),
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
             layer_shell: globals.bind(&qh, 1..=5, ()).ok(),
@@ -1702,6 +1707,9 @@ delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewport::WpViewport);
 delegate_noop!(WaylandClientStatePtr: ignore wl_subcompositor::WlSubcompositor);
 delegate_noop!(WaylandClientStatePtr: ignore wl_subsurface::WlSubsurface);
+delegate_noop!(
+    WaylandClientStatePtr: ignore wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1
+);
 
 impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
     fn event(

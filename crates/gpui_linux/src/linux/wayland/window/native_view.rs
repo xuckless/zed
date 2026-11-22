@@ -12,21 +12,23 @@ use std::{
     any::Any,
     cell::RefCell,
     ffi::c_void,
+    os::fd::{AsFd, FromRawFd, OwnedFd},
     ptr::NonNull,
     rc::{Rc, Weak},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use gpui::{
-    Bounds, NativeView, NativeViewId, PaintNativeView, ScaledPixels, Scene, Size,
-    native_view_placement::{hole_inset, round_outwards, visible},
+    Bounds, NativeView, NativeViewId, PaintNativeView, Rgba, ScaledPixels, Scene, Size,
+    WindowBackgroundAppearance,
+    native_view_placement::{background, hole_inset, round_outwards, visible},
     point, size,
 };
 use wayland_client::{
     Proxy, QueueHandle,
-    protocol::{wl_buffer, wl_region, wl_subcompositor, wl_subsurface, wl_surface},
+    protocol::{wl_buffer, wl_region, wl_shm, wl_subcompositor, wl_subsurface, wl_surface},
 };
-use wayland_protocols::wp::viewporter::client::wp_viewport;
+use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
 use super::WaylandWindowState;
 use crate::linux::{Globals, WaylandClientStatePtr};
@@ -41,6 +43,8 @@ pub(crate) struct NativeViews {
     /// What the window's last commit shows. A frame whose draw fails places this again, so the
     /// retry that commits the window's old buffer shows the views where that buffer's holes are.
     committed: Frame,
+    /// Made the first time a frame shows a background colour under its views.
+    underlay: Option<Underlay>,
 }
 
 /// What one frame shows of the window's native views.
@@ -48,16 +52,34 @@ pub(crate) struct NativeViews {
 struct Frame {
     /// The views shown, back to front (paint order), each where it shows.
     views: Vec<(NativeViewId, Shown)>,
+    /// The colour under the views and the window region it fills (the views' bounds), in an opaque
+    /// window whose views ask for one (`native_view_placement::background`).
+    underlay: Option<(Bounds<i32>, Rgba)>,
 }
 
 impl Frame {
-    fn new(scene: &Scene, scale: f32) -> Self {
+    fn new(scene: &Scene, scale: f32, appearance: WindowBackgroundAppearance) -> Self {
         let views: Vec<_> = scene
             .native_views
             .iter()
             .filter_map(|painted| shown(painted, scale).map(|shown| (painted.id, shown)))
             .collect();
-        Self { views }
+        // appearance → underlay. A see-through window shows what is behind it, as on Windows.
+        let colour = match appearance {
+            WindowBackgroundAppearance::Opaque => background(&scene.native_views),
+            WindowBackgroundAppearance::Transparent
+            | WindowBackgroundAppearance::Blurred
+            | WindowBackgroundAppearance::MicaBackdrop
+            | WindowBackgroundAppearance::MicaAltBackdrop => None,
+        };
+        let covered = views
+            .iter()
+            .map(|(_, shown)| shown.bounds)
+            .reduce(|covered, bounds| covered.union(&bounds));
+        Self {
+            views,
+            underlay: covered.zip(colour),
+        }
     }
 }
 
@@ -109,7 +131,7 @@ pub(crate) fn place_views(state: &mut WaylandWindowState, scene: &Scene) -> bool
     if let Some(renderer) = &mut state.renderer {
         renderer.set_native_view_hole_inset(hole_inset(state.scale.fract() != 0.));
     }
-    let frame = Frame::new(scene, state.scale);
+    let frame = Frame::new(scene, state.scale, state.background_appearance);
     place(state, frame)
 }
 
@@ -151,7 +173,8 @@ fn place(state: &mut WaylandWindowState, frame: Frame) -> bool {
         ..
     } = state;
     native_views.views.retain(|view| view.strong_count() > 0);
-    let Some(subcompositor) = &globals.subcompositor else {
+    let (Some(subcompositor), Some(viewporter)) = (&globals.subcompositor, &globals.viewporter)
+    else {
         return false;
     };
     if frame == native_views.placed {
@@ -161,6 +184,7 @@ fn place(state: &mut WaylandWindowState, frame: Frame) -> bool {
         surface,
         globals,
         subcompositor,
+        viewporter,
         qh: &globals.qh,
     };
     let views: Vec<_> = native_views
@@ -177,11 +201,20 @@ fn place(state: &mut WaylandWindowState, frame: Frame) -> bool {
             .map(|(_, shown)| *shown);
         view.configure(shown_at, &parent);
     }
+    let had_underlay = native_views.underlay.is_some();
+    if native_views.underlay.is_none() && frame.underlay.is_some() {
+        native_views.underlay = Some(Underlay::new(&parent));
+    }
     let stacking = |frame: &Frame| frame.views.iter().map(|(id, _)| *id).collect::<Vec<_>>();
     // A new subsurface starts on top of the window, and the views' order must follow their paint
     // order, so the whole stack is set again whenever it changes. Each `place_below(window)` puts
     // the subsurface right under the window, so the last one placed is the frontmost.
-    if stacking(&frame) != stacking(&native_views.placed) {
+    if stacking(&frame) != stacking(&native_views.placed)
+        || had_underlay != native_views.underlay.is_some()
+    {
+        if let Some(underlay) = &native_views.underlay {
+            underlay.subsurface.place_below(parent.surface);
+        }
         for (id, _) in &frame.views {
             for view in &views {
                 let view = view.borrow();
@@ -192,6 +225,9 @@ fn place(state: &mut WaylandWindowState, frame: Frame) -> bool {
                 }
             }
         }
+    }
+    if let Some(underlay) = &mut native_views.underlay {
+        underlay.show(frame.underlay, &parent);
     }
     native_views.placed = frame;
     true
@@ -629,11 +665,116 @@ impl Buffers {
     }
 }
 
+/// GPUI's own subsurface at the bottom of the window's stack, under the views, filled with the
+/// colour the views ask for (`NativeView::set_background`), so a hole shows that colour, not the
+/// desktop, wherever a view has not drawn: before its first buffer, when it shows again, while it
+/// catches up with a resize. Windows' background visual and macOS's window colour do the same.
+struct Underlay {
+    surface: wl_surface::WlSurface,
+    subsurface: wl_subsurface::WlSubsurface,
+    viewport: wp_viewport::WpViewport,
+    /// The 1×1 buffer on the surface and its colour.
+    buffer: Option<(Rgba, wl_buffer::WlBuffer)>,
+}
+
+impl Underlay {
+    fn new(parent: &Parent<'_>) -> Self {
+        let surface = parent.globals.compositor.create_surface(parent.qh, ());
+        let subsurface =
+            parent
+                .subcompositor
+                .get_subsurface(&surface, parent.surface, parent.qh, ());
+        // Synchronized for good: it only changes with the window's frames.
+        subsurface.set_sync();
+        set_empty_input_region(&surface, parent);
+        let viewport = parent.viewporter.get_viewport(&surface, parent.qh, ());
+        Self {
+            surface,
+            subsurface,
+            viewport,
+            buffer: None,
+        }
+    }
+
+    fn show(&mut self, shown: Option<(Bounds<i32>, Rgba)>, parent: &Parent<'_>) {
+        let Some((bounds, colour)) = shown else {
+            self.surface.attach(None, 0, 0);
+            self.surface.commit();
+            return;
+        };
+        if self.buffer.as_ref().map(|(shown, _)| *shown) != Some(colour) {
+            // The old buffer's storage never changes, so destroying it while attached is allowed.
+            let old = std::mem::replace(
+                &mut self.buffer,
+                colour_buffer(colour, parent).map(|buffer| (colour, buffer)),
+            );
+            if let Some((_, old)) = old {
+                old.destroy();
+            }
+        }
+        let Some((_, buffer)) = &self.buffer else {
+            return;
+        };
+        self.surface.attach(Some(buffer), 0, 0);
+        self.subsurface
+            .set_position(bounds.origin.x, bounds.origin.y);
+        self.viewport
+            .set_destination(bounds.size.width.max(1), bounds.size.height.max(1));
+        self.surface.damage(0, 0, i32::MAX, i32::MAX);
+        self.surface.commit();
+    }
+}
+
+impl Drop for Underlay {
+    fn drop(&mut self) {
+        self.subsurface.destroy();
+        self.viewport.destroy();
+        if let Some((_, buffer)) = self.buffer.take() {
+            buffer.destroy();
+        }
+        self.surface.destroy();
+    }
+}
+
+/// A 1×1 buffer of `colour`: a single-pixel buffer where the compositor offers them, else shm.
+fn colour_buffer(colour: Rgba, parent: &Parent<'_>) -> Option<wl_buffer::WlBuffer> {
+    if let Some(manager) = &parent.globals.single_pixel_buffer_manager {
+        let channel = |value: f32| (f64::from(value.clamp(0., 1.)) * f64::from(u32::MAX)) as u32;
+        return Some(manager.create_u32_rgba_buffer(
+            channel(colour.r),
+            channel(colour.g),
+            channel(colour.b),
+            u32::MAX,
+            parent.qh,
+            (),
+        ));
+    }
+    let byte = |value: f32| (value.clamp(0., 1.) * 255.).round() as u32;
+    let pixel = (byte(colour.r) << 16 | byte(colour.g) << 8 | byte(colour.b)).to_ne_bytes();
+    // SAFETY: memfd_create with a valid C string; a negative result is checked.
+    let raw =
+        unsafe { libc::memfd_create(c"gpui-native-view-underlay".as_ptr(), libc::MFD_CLOEXEC) };
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: raw is a fresh fd this function owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: writes the 4 bytes of `pixel` to the fd.
+    if unsafe { libc::write(raw, pixel.as_ptr().cast(), pixel.len()) } != pixel.len() as isize {
+        return None;
+    }
+    let pool = parent.globals.shm.create_pool(fd.as_fd(), 4, parent.qh, ());
+    let buffer = pool.create_buffer(0, 1, 1, 4, wl_shm::Format::Xrgb8888, parent.qh, ());
+    pool.destroy();
+    Some(buffer)
+}
+
 /// The window surface a view's subsurface belongs to, and the globals that make one.
 struct Parent<'a> {
     surface: &'a wl_surface::WlSurface,
     globals: &'a Globals,
     subcompositor: &'a wl_subcompositor::WlSubcompositor,
+    viewporter: &'a wp_viewporter::WpViewporter,
     qh: &'a QueueHandle<WaylandClientStatePtr>,
 }
 
@@ -859,6 +1000,72 @@ mod tests {
         ];
         for (name, bounds, clip, scale, expected) in rows {
             assert_eq!(shown(&painted(bounds, clip), scale), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn frames_stack_views_in_paint_order_over_an_underlay() {
+        let red = gpui::hsla(0., 1., 0.5, 1.);
+        let clear = gpui::Hsla::transparent_black();
+        let screen = physical(0., 0., 1000., 1000.);
+        let view = |id: u64, x: f32, background| PaintNativeView {
+            id: NativeViewId::for_test(id),
+            background,
+            ..painted(physical(x, 0., 10., 10.), screen)
+        };
+        let scene = |views: Vec<PaintNativeView>| {
+            let mut scene = Scene::default();
+            for view in views {
+                scene.insert_primitive(view);
+            }
+            scene.finish();
+            scene
+        };
+        let at = |x: i32| whole(rect(x, 0, 10, 10));
+        let opaque = WindowBackgroundAppearance::Opaque;
+        // (row name, scene views in paint order, appearance, frame)
+        let rows = [
+            ("no views", vec![], opaque, Frame::default()),
+            (
+                "back to front, no colour asked, no underlay",
+                vec![view(2, 0., clear), view(1, 20., clear)],
+                opaque,
+                Frame {
+                    views: vec![
+                        (NativeViewId::for_test(2), at(0)),
+                        (NativeViewId::for_test(1), at(20)),
+                    ],
+                    underlay: None,
+                },
+            ),
+            (
+                "an opaque window's underlay covers every view",
+                vec![view(1, 0., red), view(2, 20., clear)],
+                opaque,
+                Frame {
+                    views: vec![
+                        (NativeViewId::for_test(1), at(0)),
+                        (NativeViewId::for_test(2), at(20)),
+                    ],
+                    underlay: Some((rect(0, 0, 30, 10), Rgba::from(red))),
+                },
+            ),
+            (
+                "a see-through window shows what is behind it",
+                vec![view(1, 0., red)],
+                WindowBackgroundAppearance::Transparent,
+                Frame {
+                    views: vec![(NativeViewId::for_test(1), at(0))],
+                    underlay: None,
+                },
+            ),
+        ];
+        for (name, views, appearance, expected) in rows {
+            assert_eq!(
+                Frame::new(&scene(views), 1., appearance),
+                expected,
+                "{name}"
+            );
         }
     }
 
