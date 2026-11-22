@@ -1,6 +1,7 @@
 use crate::{
     BoolExt, MacDisplay, MetalFrames, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
-    TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
+    TISGetInputSourceProperty, WindowFrameSource,
+    events::{MOUSE_CANCELLED, platform_input_from_native},
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     ns_string, renderer,
 };
@@ -75,6 +76,7 @@ use std::{
 
 mod native_views;
 mod touch;
+mod touch_recognizer;
 
 const WINDOW_STATE_IVAR: &CStr = c"windowState";
 
@@ -104,6 +106,7 @@ pub enum UserTabbingPreference {
 #[ctor(unsafe)]
 unsafe fn build_classes() {
     unsafe {
+        touch_recognizer::register_touch_recognizer_class();
         WINDOW_CLASS = build_window_class(c"GPUIWindow", class!(NSWindow));
         PANEL_CLASS = build_window_class(c"GPUIPanel", class!(NSPanel));
         VIEW_CLASS = {
@@ -161,6 +164,12 @@ unsafe fn build_classes() {
             );
             decl.add_method(
                 sel!(mouseExited:),
+                handle_view_event as extern "C" fn(_, Sel, *mut AnyObject),
+            );
+            // macOS 26 cancels a press it took over (a direct touch's mouse copy among them); a mouse up then, so
+            // GPUI keeps no button down.
+            decl.add_method(
+                sel!(mouseCancelled:),
                 handle_view_event as extern "C" fn(_, Sel, *mut AnyObject),
             );
             decl.add_method(
@@ -670,6 +679,9 @@ struct MacWindowState {
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
+    /// The direct touches GPUITouchRecognizer holds (touch.rs), and those waiting for `event_callback`.
+    touch_ids: touch::TouchIds<touch_recognizer::TouchIdentity>,
+    touch_queue: touch::TouchQueue,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
     visibility_callback: Option<Box<dyn FnMut(WindowVisibility)>>,
     // `None` until a callback is registered, so notifications during
@@ -1181,6 +1193,8 @@ impl MacWindow {
                 renderer,
                 request_frame_callback: None,
                 event_callback: None,
+                touch_ids: touch::TouchIds::default(),
+                touch_queue: touch::TouchQueue::default(),
                 activate_callback: None,
                 visibility_callback: None,
                 last_visibility: None,
@@ -1275,6 +1289,7 @@ impl MacWindow {
             native_view,
             setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawPolicy::DuringViewResize
             ];
+            touch_recognizer::add_touch_recognizer(native_view);
 
             let native_view: *mut AnyObject = msg_send![native_view, autorelease];
             let _: () = msg_send![content_view, addSubview: native_view];
@@ -3069,13 +3084,20 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, native_event: *mut Any
     let mut lock = window_state.as_ref().lock();
     let window_height = lock.content_size().height;
     let native_event_type: NSEventType = unsafe { msg_send![native_event, type] };
+    // AppKit's mouse, scroll and magnify copies of the touches GPUITouchRecognizer holds: GPUI makes its own.
+    // SAFETY: `subtype` is read only for mouse events, which carry one.
+    if touch::is_touch_copy(native_event_type, lock.touch_ids.is_touching(), || unsafe {
+        msg_send![native_event, subtype]
+    }) {
+        return;
+    }
     match native_event_type {
         NSEventType::LeftMouseDown => {
             // AppKit owns `native_event` for the callback; retain it so the drag session can still
             // be started later, once the pointer leaves the window.
             lock.last_left_mouse_down_event = unsafe { Retained::retain(native_event) };
         }
-        NSEventType::LeftMouseUp => {
+        NSEventType::LeftMouseUp | MOUSE_CANCELLED => {
             lock.last_left_mouse_down_event = None;
         }
         _ => {}

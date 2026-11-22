@@ -27,6 +27,10 @@ use objc2_app_kit::{
 };
 use std::{borrow::Cow, ffi::c_void};
 
+/// `NSEventTypeMouseCancelled` (NSEvent.h, macOS 26), newer than objc2-app-kit's `NSEventType`: a press AppKit
+/// took over ends as a mouse up, so GPUI keeps no button down.
+pub(crate) const MOUSE_CANCELLED: NSEventType = NSEventType(40);
+
 pub(crate) const ESCAPE_KEY: u16 = 0x1b;
 
 const BACKSPACE_KEY: u32 = 0x7f;
@@ -177,7 +181,10 @@ pub(crate) unsafe fn platform_input_from_native(
                     })
                 })
             }
-            NSEventType::LeftMouseUp | NSEventType::RightMouseUp | NSEventType::OtherMouseUp => {
+            NSEventType::LeftMouseUp
+            | NSEventType::RightMouseUp
+            | NSEventType::OtherMouseUp
+            | MOUSE_CANCELLED => {
                 let button = match native_event.buttonNumber() {
                     0 => MouseButton::Left,
                     1 => MouseButton::Right,
