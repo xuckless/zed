@@ -1370,3 +1370,29 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     color.a *= input.opacity * saturate(0.5 - distance);
     return color;
 }
+
+/*
+**
+**              Native views
+**
+*/
+
+struct NativeViewHole {
+    Bounds bounds;
+    Bounds content_mask;
+};
+
+StructuredBuffer<NativeViewHole> native_view_holes: register(t1);
+
+float4 native_view_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID): SV_Position {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    NativeViewHole hole = native_view_holes[batch_start_index + instance_id];
+    ClippedVertex vertex = clip_to_mask(unit_vertex, hole.bounds, hole.content_mask);
+    return to_device_position_impl(vertex.position);
+}
+
+// The pipeline does not blend, so this erases what was drawn beneath the view, as the Metal renderer's
+// native_view_fragment does.
+float4 native_view_fragment(float4 position: SV_Position): SV_Target {
+    return float4(0.0, 0.0, 0.0, 0.0);
+}

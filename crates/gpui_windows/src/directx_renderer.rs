@@ -20,8 +20,11 @@ use windows::{
     core::{HSTRING, Interface},
 };
 
+use crate::directx_renderer::native_view_tree::NativeViewHole;
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use crate::*;
+
+mod native_view_tree;
 use gpui::*;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
@@ -90,6 +93,7 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    native_view_holes: PipelineState<NativeViewHole>,
 }
 
 struct DirectXGlobalElements {
@@ -438,8 +442,7 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
-                // Native views are only composited on macOS.
-                PrimitiveBatch::NativeViews(_) => Ok(()),
+                PrimitiveBatch::NativeViews(range) => self.draw_native_view_holes(range),
             }
             .with_context(|| {
                 format!(
@@ -697,7 +700,7 @@ impl DirectXRenderer {
             )?;
         }
 
-        Ok(())
+        self.upload_native_view_holes(scene)
     }
 
     fn draw_shadows(&mut self, start: usize, len: usize) -> Result<()> {
@@ -1014,6 +1017,7 @@ impl DirectXRenderPipelines {
             create_blend_state(device)?,
         )?;
         let opaque_quad_pipeline = OpaqueQuadPipeline::new(device)?;
+        let native_view_holes = native_view_tree::hole_pipeline(device)?;
 
         Ok(Self {
             shadow_pipeline,
@@ -1026,6 +1030,7 @@ impl DirectXRenderPipelines {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            native_view_holes,
         })
     }
 }
@@ -1741,6 +1746,7 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
+        NativeView,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1813,6 +1819,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => match target {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::NativeView => match target {
+                    ShaderTarget::Vertex => NATIVE_VIEW_VERTEX_BYTES,
+                    ShaderTarget::Fragment => NATIVE_VIEW_FRAGMENT_BYTES,
                 },
             };
             Self { inner: bytes }
@@ -1894,6 +1904,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                ShaderModule::NativeView => "native_view",
             }
         }
     }
