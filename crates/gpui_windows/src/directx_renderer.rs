@@ -24,6 +24,7 @@ use crate::directx_renderer::native_view_tree::{NativeViewHole, NativeViewTree, 
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use crate::*;
 
+mod native_view_surface;
 mod native_view_tree;
 use gpui::*;
 

@@ -31,6 +31,48 @@ impl Placement {
     }
 }
 
+/// What GPUI's own visual shows, as a plain value (`directx_renderer`'s `Presenting` holds the surface).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Showing {
+    /// GPUI's swap chain, as upstream.
+    SwapChain,
+    /// The composition surface GPUI's frames are copied into while a view shows.
+    Surface,
+    /// Still the surface, the frame after the last view went; the swap chain already holds that frame.
+    LeavingSurface,
+}
+
+/// How a frame reaches DirectComposition. A swap chain's `Present` and a `Commit` are not atomic (DComp has no API to
+/// tie them), so a frame that moves a view could show its new hole a composition frame before or after the view's new
+/// placement. A composition surface changes only on `Commit`, so GPUI's frame, its holes and the views' placement
+/// change together, at one GPU copy of GPUI's frame per GPUI frame (never per frame of a view's own content).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PresentStep {
+    /// `Present` on GPUI's swap chain, as upstream: no copy, no `Commit`.
+    Present,
+    /// Copy into the surface (made first, or again at a new size) and commit it with the views' placement.
+    CopyToSurface,
+    /// The last view went: this hole-less frame is copied into the surface and committed with the views' removal,
+    /// and presented to the swap chain too, so the swap chain holds it when it shows again.
+    CopyToSurfaceAndPresent,
+    /// Present, then show the swap chain again (`SetContent` and a `Commit`): it already holds the previous
+    /// hole-less frame, so whichever of the two frames DWM composes first is current, never a stale one.
+    PresentAndShowSwapChain,
+}
+
+/// `showing × whether the frame shows a view → (step, showing next)`. A window pays for the surface only while it
+/// shows a native view, and leaves it over two frames, so no stale swap chain frame ever flashes.
+pub(crate) fn present_step(showing: Showing, shows_views: bool) -> (PresentStep, Showing) {
+    match (showing, shows_views) {
+        (Showing::SwapChain, false) => (PresentStep::Present, Showing::SwapChain),
+        (Showing::SwapChain | Showing::Surface | Showing::LeavingSurface, true) => {
+            (PresentStep::CopyToSurface, Showing::Surface)
+        }
+        (Showing::Surface, false) => (PresentStep::CopyToSurfaceAndPresent, Showing::LeavingSurface),
+        (Showing::LeavingSurface, false) => (PresentStep::PresentAndShowSwapChain, Showing::SwapChain),
+    }
+}
+
 /// What one frame shows of the window's native views.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Frame {
@@ -102,6 +144,24 @@ mod tests {
                 background: Hsla::transparent_black(),
             };
             assert_eq!(Placement::new(&view), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn present_steps() {
+        use PresentStep::*;
+        use Showing::*;
+        // (row name, showing, the frame shows a view, step, showing next). One row per (showing, views) pair.
+        let rows = [
+            ("no view: the swap chain, as upstream", SwapChain, false, Present, SwapChain),
+            ("the first view: the surface", SwapChain, true, CopyToSurface, Surface),
+            ("views go on showing", Surface, true, CopyToSurface, Surface),
+            ("the last view goes: the surface once more, the swap chain primed", Surface, false, CopyToSurfaceAndPresent, LeavingSurface),
+            ("the frame after: the swap chain again", LeavingSurface, false, PresentAndShowSwapChain, SwapChain),
+            ("a view shows again while leaving: the surface stays", LeavingSurface, true, CopyToSurface, Surface),
+        ];
+        for (name, showing, shows_views, step, next) in rows {
+            assert_eq!(present_step(showing, shows_views), (step, next), "{name}");
         }
     }
 

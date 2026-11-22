@@ -35,7 +35,8 @@ use super::{
     create_swap_chain_for_composition, shader_resources::ShaderModule,
 };
 use crate::WindowsWindowInner;
-use crate::native_views::{Frame, Placement};
+use super::native_view_surface::Presenting;
+use crate::native_views::{Frame, Placement, PresentStep};
 
 /// What the renderer keeps of its native views across devices.
 #[derive(Default)]
@@ -81,6 +82,8 @@ pub(super) struct NativeViewTree {
     views: Vec<(NativeViewId, ViewVisuals)>,
     /// What the tree shows now; a frame that shows the same changes nothing and commits nothing.
     shown: Frame,
+    /// What GPUI's own visual shows: its swap chain, or while views show, the surface its frames are copied into.
+    pub(super) presenting: Presenting,
 }
 
 /// One view's subtree, after Chromium's `VisualSubtree`: the clip sits on an untransformed parent, and the content
@@ -116,6 +119,8 @@ impl NativeViewTree {
                 background: None,
                 views: Vec::new(),
                 shown: Frame::default(),
+                // `DirectComposition::set_swap_chain` shows the swap chain on a new device.
+                presenting: Presenting::SwapChain,
             })
         }
     }
@@ -313,16 +318,34 @@ impl DirectXRenderer {
         Ok(Frame::new(&scene.native_views, appearance))
     }
 
-    /// After a frame renders: presents it, then changes the visual tree and commits once, after Chromium's
-    /// DCLayerTree, which presents its swap chains, then builds and commits the tree. A frame that moves no view
-    /// commits nothing, and the views' own presents never need GPUI: DWM picks up a swap chain's present by itself.
+    /// After a frame renders: shows it (`Presenting::show`), then changes the visual tree and commits once, after
+    /// Chromium's DCLayerTree, which presents its swap chains, then builds and commits the tree. Through the surface,
+    /// the frame, its holes and the views' new placement change in that one commit. A swap chain frame that moves no
+    /// view commits nothing, and the views' own presents never need GPUI: DWM picks up a swap chain's present by
+    /// itself.
     pub(super) fn present_native_views(&mut self, frame: Frame) -> Result<()> {
-        self.present()?;
         let Some(composition) = &mut self.direct_composition else {
-            return Ok(());
+            return self.present();
         };
         let devices = self.devices.as_ref().context("devices missing")?;
-        if composition.view_tree.place_views(frame, devices)? {
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let step = composition.view_tree.presenting.show(
+            !frame.views.is_empty(),
+            &composition.comp_device,
+            &composition.comp_visual,
+            resources,
+            &devices.device_context,
+            [self.width, self.height],
+        )?;
+        let placed = composition.view_tree.place_views(frame, devices)?;
+        // step → whether it changes what DirectComposition shows. Only a plain present doesn't.
+        let commits = match step {
+            PresentStep::Present => placed,
+            PresentStep::CopyToSurface
+            | PresentStep::CopyToSurfaceAndPresent
+            | PresentStep::PresentAndShowSwapChain => true,
+        };
+        if commits {
             // SAFETY: plain call on a live device.
             unsafe { composition.comp_device.Commit() }?;
         }
