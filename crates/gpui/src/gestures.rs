@@ -6,7 +6,18 @@
 //! [`ScrollEvent`](crate::ScrollEvent)s, including post-release
 //! momentum. Long presses and touch drags can be claimed by element listeners.
 
-use std::collections::VecDeque;
+mod lsq_solver;
+#[cfg(test)]
+mod lsq_solver_test;
+mod velocity_tracker;
+#[cfg(test)]
+mod velocity_tracker_data;
+#[cfg(test)]
+mod velocity_tracker_test;
+
+use velocity_tracker::VelocityTracker;
+pub use velocity_tracker::VelocityTrackerKind;
+
 use std::mem;
 use std::time::Duration;
 
@@ -123,6 +134,9 @@ pub struct GestureTuning {
     /// Minimum release velocity, in pixels per second, required to start
     /// scroll momentum.
     pub min_fling_velocity: f32,
+    /// How a touch's release velocity is estimated: one of Flutter's
+    /// per-platform velocity trackers.
+    pub velocity_tracker: VelocityTrackerKind,
 }
 
 impl Default for GestureTuning {
@@ -134,6 +148,7 @@ impl Default for GestureTuning {
             long_press_duration: Duration::from_millis(500),
             scroll_physics: ScrollPhysics::ios(),
             min_fling_velocity: 50.,
+            velocity_tracker: VelocityTrackerKind::IOSScrollViewFling,
         }
     }
 }
@@ -515,18 +530,6 @@ const MAX_FLING_VELOCITY: f32 = 8000.;
 /// of its own.)
 const MOMENTUM_STOP_VELOCITY: f32 = 10.;
 
-/// How far back the release-velocity estimate looks. Samples older than this
-/// reflect an earlier part of the gesture, not the speed at release.
-const VELOCITY_WINDOW: Duration = Duration::from_millis(100);
-
-/// A pause between samples longer than this means the finger stopped:
-/// anything before the pause describes an earlier motion, not the release
-/// (Flutter's `kAssumePointerMoveStoppedMilliseconds`). Touch hardware
-/// reports movement every 8–16ms while the finger is in motion.
-const VELOCITY_ASSUME_STOPPED_GAP: Duration = Duration::from_millis(40);
-
-const VELOCITY_MAX_SAMPLES: usize = 20;
-
 /// The portable recognizer behind raw touch input: it watches the
 /// [`TouchEvent`] stream for one touch at a time and resolves it into either
 /// a tap or a pan, following the competition model described in the module
@@ -680,8 +683,9 @@ impl TouchGestureRecognizer {
                     false
                 };
                 if matches!(self.state, TouchGestureState::Idle) {
-                    let mut velocity_tracker = VelocityTracker::default();
-                    velocity_tracker.push(now, event.position);
+                    let mut velocity_tracker =
+                        VelocityTracker::with_kind(self.tuning.velocity_tracker);
+                    velocity_tracker.add_position(now, event.position);
                     let touch = ActiveTouch {
                         id: event.id,
                         device: event.device,
@@ -722,7 +726,7 @@ impl TouchGestureRecognizer {
                     long_press_offered,
                     touch_drag_offered,
                 } if touch.id == event.id => {
-                    touch.velocity_tracker.push(now, event.position);
+                    touch.velocity_tracker.add_position(now, event.position);
                     touch.last_position = event.position;
                     let accumulated = event.position - touch.start_position;
                     if accumulated.magnitude() > f64::from(self.tuning.touch_slop) {
@@ -774,7 +778,7 @@ impl TouchGestureRecognizer {
                     if raw_delta != Point::default() {
                         touch.last_movement = raw_delta;
                     }
-                    touch.velocity_tracker.push(now, event.position);
+                    touch.velocity_tracker.add_position(now, event.position);
                     touch.last_position = event.position;
                     let mut target = event.predicted_position.unwrap_or(event.position);
                     let mut delta = target - touch.emitted_position;
@@ -864,21 +868,10 @@ impl TouchGestureRecognizer {
                     // The release deliberately contributes no velocity
                     // sample: it usually repeats the last movement's position
                     // with a later timestamp, which would dilute the
-                    // estimate. But a release long after the last movement
-                    // means the finger had already stopped, so nothing
-                    // flings.
-                    let finger_stopped =
-                        touch
-                            .velocity_tracker
-                            .latest_sample_time()
-                            .is_none_or(|latest| {
-                                now.duration_since(latest) > VELOCITY_ASSUME_STOPPED_GAP
-                            });
-                    let mut velocity = if finger_stopped {
-                        Point::default()
-                    } else {
-                        touch.velocity_tracker.velocity()
-                    };
+                    // estimate. A release long after the last movement
+                    // means the finger had already stopped: the tracker
+                    // reports zero, so nothing flings.
+                    let mut velocity = touch.velocity_tracker.get_velocity(now);
                     match axis {
                         Axis::Vertical => velocity.x = 0.,
                         Axis::Horizontal => velocity.y = 0.,
@@ -1118,107 +1111,6 @@ fn scroll_event(
         touch_phase,
         source: ScrollSource::Touch,
     }
-}
-
-/// Estimates the velocity a touch had at its newest sample.
-#[derive(Default)]
-struct VelocityTracker {
-    samples: VecDeque<(Instant, Point<Pixels>)>,
-}
-
-impl VelocityTracker {
-    fn push(&mut self, time: Instant, position: Point<Pixels>) {
-        self.samples.push_back((time, position));
-        while self.samples.len() > VELOCITY_MAX_SAMPLES {
-            self.samples.pop_front();
-        }
-    }
-
-    fn latest_sample_time(&self) -> Option<Instant> {
-        self.samples.back().map(|(time, _)| *time)
-    }
-
-    /// The velocity at the newest sample, in pixels per second.
-    ///
-    /// Fits a second-degree polynomial by least squares over the trailing
-    /// [`VELOCITY_WINDOW`] and takes its derivative at the newest sample,
-    /// like Flutter's `VelocityTracker` and Android's `lsq2` strategy. An
-    /// endpoint difference over the same window would report the window's
-    /// *average* speed, which for a flick — still accelerating at lift-off —
-    /// is roughly half the speed the finger actually had at release.
-    fn velocity(&self) -> Point<f32> {
-        let Some((newest_time, _)) = self.samples.back() else {
-            return Point::default();
-        };
-        let mut times_seconds: SmallVec<[f64; VELOCITY_MAX_SAMPLES]> = SmallVec::new();
-        let mut horizontal: SmallVec<[f64; VELOCITY_MAX_SAMPLES]> = SmallVec::new();
-        let mut vertical: SmallVec<[f64; VELOCITY_MAX_SAMPLES]> = SmallVec::new();
-        let mut previous_time = *newest_time;
-        for (time, position) in self.samples.iter().rev() {
-            let age = newest_time.duration_since(*time);
-            if age > VELOCITY_WINDOW
-                || previous_time.duration_since(*time) > VELOCITY_ASSUME_STOPPED_GAP
-            {
-                break;
-            }
-            previous_time = *time;
-            times_seconds.push(-age.as_secs_f64());
-            horizontal.push(f64::from(f32::from(position.x)));
-            vertical.push(f64::from(f32::from(position.y)));
-        }
-
-        let endpoint_estimate = |values: &[f64]| -> f32 {
-            let elapsed = -times_seconds.last().copied().unwrap_or(0.);
-            if elapsed <= f64::EPSILON {
-                return 0.;
-            }
-            ((values.first().copied().unwrap_or(0.) - values.last().copied().unwrap_or(0.))
-                / elapsed) as f32
-        };
-        if times_seconds.len() < 3 {
-            return point(endpoint_estimate(&horizontal), endpoint_estimate(&vertical));
-        }
-        point(
-            quadratic_velocity_at_newest(&times_seconds, &horizontal).map_or_else(
-                || endpoint_estimate(&horizontal),
-                |velocity| velocity as f32,
-            ),
-            quadratic_velocity_at_newest(&times_seconds, &vertical)
-                .map_or_else(|| endpoint_estimate(&vertical), |velocity| velocity as f32),
-        )
-    }
-}
-
-/// Least-squares fit of `value = a0 + a1·t + a2·t²` returning `a1`: the
-/// fitted curve's velocity at `t = 0`, which callers place at the newest
-/// sample. `None` when the samples are too degenerate to fit (all
-/// simultaneous, for example).
-fn quadratic_velocity_at_newest(times: &[f64], values: &[f64]) -> Option<f64> {
-    let count = times.len() as f64;
-    let (mut sum_t1, mut sum_t2, mut sum_t3, mut sum_t4) = (0., 0., 0., 0.);
-    let (mut sum_v, mut sum_vt, mut sum_vt2) = (0., 0., 0.);
-    for (&time, &value) in times.iter().zip(values) {
-        let time_squared = time * time;
-        sum_t1 += time;
-        sum_t2 += time_squared;
-        sum_t3 += time_squared * time;
-        sum_t4 += time_squared * time_squared;
-        sum_v += value;
-        sum_vt += value * time;
-        sum_vt2 += value * time_squared;
-    }
-    // Cramer's rule on the 3×3 normal equations, solved for the linear
-    // coefficient only.
-    let determinant = count * (sum_t2 * sum_t4 - sum_t3 * sum_t3)
-        - sum_t1 * (sum_t1 * sum_t4 - sum_t3 * sum_t2)
-        + sum_t2 * (sum_t1 * sum_t3 - sum_t2 * sum_t2);
-    if determinant.abs() < 1e-12 {
-        return None;
-    }
-    let linear_determinant = count * (sum_vt * sum_t4 - sum_t3 * sum_vt2)
-        - sum_v * (sum_t1 * sum_t4 - sum_t3 * sum_t2)
-        + sum_t2 * (sum_t1 * sum_vt2 - sum_vt * sum_t2);
-    Some(linear_determinant / determinant)
 }
 
 #[cfg(test)]
@@ -2106,16 +1998,16 @@ mod tests {
         // A uniformly accelerating flick: position grows quadratically, so
         // the speed at the newest sample (2·k·t) is twice the window
         // average (k·t). The estimator must report the former.
-        let mut velocity_tracker = VelocityTracker::default();
+        let mut velocity_tracker = VelocityTracker::with_kind(VelocityTrackerKind::LeastSquares);
         let start = Instant::now();
         for step in 0..=6 {
             let t = step as f32 * 0.016;
-            velocity_tracker.push(
+            velocity_tracker.add_position(
                 start + Duration::from_millis(step * 16),
                 point(px(0.), px(1000. * t * t)),
             );
         }
-        let velocity = velocity_tracker.velocity();
+        let velocity = velocity_tracker.get_velocity(start + Duration::from_millis(96));
         let release_speed = 2. * 1000. * 0.096;
         assert!(
             (velocity.y - release_speed).abs() < 1.,
@@ -2130,13 +2022,13 @@ mod tests {
         // Fast motion, then a hold longer than the stopped-finger gap, then
         // a slow nudge: only the motion after the pause describes the
         // release.
-        let mut velocity_tracker = VelocityTracker::default();
+        let mut velocity_tracker = VelocityTracker::with_kind(VelocityTrackerKind::LeastSquares);
         let start = Instant::now();
-        velocity_tracker.push(start, point(px(0.), px(0.)));
-        velocity_tracker.push(start + Duration::from_millis(16), point(px(0.), px(50.)));
-        velocity_tracker.push(start + Duration::from_millis(80), point(px(0.), px(52.)));
-        velocity_tracker.push(start + Duration::from_millis(96), point(px(0.), px(54.)));
-        let velocity = velocity_tracker.velocity();
+        velocity_tracker.add_position(start, point(px(0.), px(0.)));
+        velocity_tracker.add_position(start + Duration::from_millis(16), point(px(0.), px(50.)));
+        velocity_tracker.add_position(start + Duration::from_millis(80), point(px(0.), px(52.)));
+        velocity_tracker.add_position(start + Duration::from_millis(96), point(px(0.), px(54.)));
+        let velocity = velocity_tracker.get_velocity(start + Duration::from_millis(96));
         assert!(
             velocity.y < 200.,
             "pre-pause motion leaked into the estimate: {} px/s",
