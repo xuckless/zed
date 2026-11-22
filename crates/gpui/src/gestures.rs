@@ -613,6 +613,12 @@ impl TouchGestureRecognizer {
         }
     }
 
+    /// Runs with `tuning` from the next event on; touches in progress keep
+    /// their state and are judged by the new values.
+    pub(crate) fn set_tuning(&mut self, tuning: GestureTuning) {
+        self.tuning = tuning;
+    }
+
     /// Each gesture is paired with the device it reports: the touch's own,
     /// except the closing step of a fling this touch catches, which keeps the
     /// device of the touch that flung, like the momentum steps before it.

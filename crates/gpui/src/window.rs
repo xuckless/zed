@@ -3959,8 +3959,10 @@ impl Window {
         self.long_press_capture == Some(entity.entity_id())
     }
 
-    /// The tuning this window's touch recognition runs with.
-    pub(crate) fn gesture_tuning(&self) -> crate::GestureTuning {
+    /// The tuning this window's touch recognition runs with: the app's when it
+    /// opened ([`App::gesture_tuning`]), or the last
+    /// [`Window::set_gesture_tuning`].
+    pub fn gesture_tuning(&self) -> crate::GestureTuning {
         self.touch_gestures.tuning()
     }
 
@@ -3979,11 +3981,16 @@ impl Window {
         self.platform_window.perform_haptic(haptic);
     }
 
-    /// Restarts touch recognition with the tuning a test passes, in place of
-    /// the platform's.
-    #[cfg(test)]
-    pub(crate) fn set_gesture_tuning(&mut self, tuning: crate::GestureTuning) {
-        self.touch_gestures = TouchGestureRecognizer::new(tuning);
+    /// Changes this open window's gesture tuning (slops, timeouts, scroll
+    /// physics) from its next touch event on, for a platform setting that
+    /// changes while the window is open, such as Android's touch slop after a
+    /// density change. Touches in progress continue under the new values.
+    /// [`App::set_gesture_tuning`] covers windows opened later. The platform
+    /// window gets it too (`PlatformWindow::set_gesture_tuning`: gpui_web's
+    /// keyboard tap shadow follows the new slop).
+    pub fn set_gesture_tuning(&mut self, tuning: crate::GestureTuning) {
+        self.touch_gestures.set_tuning(tuning);
+        self.platform_window.set_gesture_tuning(tuning);
     }
 
     /// The current state of the keyboard's modifiers
@@ -10727,6 +10734,52 @@ mod tests {
                 move |_, _| PointerSourceRecorder { seen }
             });
             dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 10.);
+            dispatch_touch(window, cx, TouchId(1), TouchPhase::Moved, 10. + travel);
+            dispatch_touch(window, cx, TouchId(1), TouchPhase::Ended, 10. + travel);
+            let mut seen: Vec<_> = seen
+                .borrow()
+                .iter()
+                .filter(|(kind, _)| *kind != "render")
+                .map(|(kind, source)| (*kind, source.is_some()))
+                .collect();
+            seen.dedup();
+            assert_eq!(seen, expected, "{name}");
+        }
+    }
+
+    #[gpui::test]
+    fn open_window_takes_a_new_gesture_tuning(cx: &mut TestAppContext) {
+        let tap = [("down", true), ("up", true)];
+        let pan = [("scroll", true)];
+        // (name, touch slop set on the open window after the touch starts, finger travel,
+        // events seen). Each row opens its own window with the default tuning.
+        let rows: [(&str, Option<f32>, f32, &[(&str, bool)]); 3] = [
+            ("not retuned: kTouchSlop's 18 px, 12 px taps", None, 12., &tap),
+            (
+                "retuned to 8 px mid-touch (Android after a density change): 12 px pans",
+                Some(8.),
+                12.,
+                &pan,
+            ),
+            ("retuned to 8 px mid-touch: 6 px taps", Some(8.), 6., &tap),
+        ];
+        for (name, touch_slop, travel, expected) in rows {
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let window = cx.add_window({
+                let seen = seen.clone();
+                move |_, _| PointerSourceRecorder { seen }
+            });
+            dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 10.);
+            if let Some(touch_slop) = touch_slop {
+                window
+                    .update(cx, |_, window, _| {
+                        window.set_gesture_tuning(GestureTuning {
+                            touch_slop: px(touch_slop),
+                            ..GestureTuning::default()
+                        })
+                    })
+                    .unwrap();
+            }
             dispatch_touch(window, cx, TouchId(1), TouchPhase::Moved, 10. + travel);
             dispatch_touch(window, cx, TouchId(1), TouchPhase::Ended, 10. + travel);
             let mut seen: Vec<_> = seen

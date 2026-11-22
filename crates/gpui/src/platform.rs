@@ -1530,6 +1530,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// The default plays nothing, as on desktops, where Flutter plays none.
     fn perform_haptic(&self, _haptic: crate::Haptic) {}
 
+    /// The window's gesture tuning changed
+    /// ([`Window::set_gesture_tuning`](crate::Window::set_gesture_tuning)).
+    /// The default ignores it: only a backend that reads the tuning itself
+    /// (gpui_web's keyboard tap shadow, from `WindowParams::gesture_tuning`)
+    /// follows it.
+    fn set_gesture_tuning(&self, _tuning: crate::GestureTuning) {}
+
     /// Initialize the accessibility adapter with callbacks.
     fn a11y_init(&self, _callbacks: A11yCallbacks) {}
 

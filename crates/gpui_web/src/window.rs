@@ -85,9 +85,10 @@ pub(crate) struct WebWindowInner {
     /// flickers the keyboard and drags the caret around.
     pub(crate) touch_tap_candidate: Cell<Option<(i32, Point<Pixels>)>>,
     /// The gesture recognizer's touch slop for this window
-    /// (`WindowParams::gesture_tuning`), so the shadow above clears exactly
-    /// when gpui's recognizer stops treating the touch as a tap.
-    pub(crate) touch_slop: Pixels,
+    /// (`WindowParams::gesture_tuning`, then `PlatformWindow::set_gesture_tuning`),
+    /// so the shadow above clears exactly when gpui's recognizer stops treating
+    /// the touch as a tap.
+    pub(crate) touch_slop: Cell<Pixels>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
     raf_id: Cell<Option<i32>>,
@@ -227,7 +228,7 @@ impl WebWindow {
             suppress_focus_status_events: Cell::new(false),
             gesture_start_visual_viewport_height: Cell::new(0.0),
             touch_tap_candidate: Cell::new(None),
-            touch_slop: params.gesture_tuning.touch_slop,
+            touch_slop: Cell::new(params.gesture_tuning.touch_slop),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
             raf_id: Cell::new(None),
@@ -858,6 +859,10 @@ impl PlatformWindow for WebWindow {
         if js_sys::Reflect::has(&navigator, &JsValue::from_str("vibrate")).unwrap_or(false) {
             navigator.vibrate_with_duration(duration_ms);
         }
+    }
+
+    fn set_gesture_tuning(&self, tuning: gpui::GestureTuning) {
+        self.inner.touch_slop.set(tuning.touch_slop);
     }
 
     fn visual_viewport_bounds(&self) -> Bounds<Pixels> {

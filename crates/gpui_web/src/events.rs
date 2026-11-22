@@ -580,7 +580,7 @@ impl WebWindowInner {
                 // pointerup handler.
                 if let Some((pointer_id, start_position)) = this.touch_tap_candidate.get()
                     && pointer_id == event.pointer_id()
-                    && (position - start_position).magnitude() > f64::from(this.touch_slop)
+                    && (position - start_position).magnitude() > f64::from(this.touch_slop.get())
                 {
                     this.touch_tap_candidate.set(None);
                 }
