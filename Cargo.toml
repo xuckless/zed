@@ -722,6 +722,7 @@ objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
     "UICommand",
     "UICornerConfiguration",
     "UICornerRadius",
+    "UIDevice",
     "UIEvent",
     "UIFeedbackGenerator",
     "UIImpactFeedbackGenerator",

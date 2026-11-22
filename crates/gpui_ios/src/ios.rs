@@ -4,7 +4,9 @@ mod application;
 mod display;
 mod events;
 mod keyboard;
+mod keyboard_inset;
 mod platform;
+mod spring_animation;
 mod text_input;
 mod window;
 

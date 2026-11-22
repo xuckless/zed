@@ -11,6 +11,10 @@
 
 use super::events::*;
 use super::keyboard::{KeyResponder, Press, PressPhase, Primary};
+use super::keyboard_inset::{
+    InsetSample, KeyboardInsetAction, KeyboardInsetManager, KeyboardNotification, KeyboardSpring,
+    NotificationName, Rect, ViewGeometry,
+};
 use super::text_input::TextInputView;
 use super::{CallbackSlot, IosDisplay, platform::IosPlatformState};
 use gpui::{
@@ -34,12 +38,16 @@ use objc2::{
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
-    NSArray, NSNotification, NSNotificationCenter, NSObjectProtocol, NSSet, NSValue,
+    NSArray, NSNotification, NSNotificationCenter, NSNumber, NSObjectProtocol, NSSet, NSString,
+    NSValue,
 };
-use objc2_quartz_core::CAMetalLayer;
+use objc2_quartz_core::{CACurrentMediaTime, CAMetalLayer, CASpringAnimation};
 use objc2_ui_kit::{
-    NSValueUIGeometryExtensions, UIKeyboardFrameEndUserInfoKey,
-    UIKeyboardWillChangeFrameNotification, UIKeyboardWillHideNotification, UIStatusBarStyle,
+    NSValueUIGeometryExtensions, UIKeyboardAnimationDurationUserInfoKey,
+    UIKeyboardFrameBeginUserInfoKey, UIKeyboardFrameEndUserInfoKey, UIKeyboardIsLocalUserInfoKey,
+    UIKeyboardWillChangeFrameNotification, UIKeyboardWillHideNotification,
+    UIKeyboardWillShowNotification, UIStatusBarStyle, UIUserInterfaceIdiom,
+    UIUserInterfaceSizeClass,
 };
 use objc2_ui_kit::{
     UICornerConfiguration, UICornerRadius, UIEvent, UIGestureRecognizer,
@@ -352,7 +360,13 @@ pub(crate) struct IosWindowState {
     touch_ids: RefCell<TouchIds>,
     /// Where the back gesture an element claimed started, while it runs.
     back_gesture_start: Cell<Option<Point<Pixels>>>,
+    /// The keyboard's bottom inset GPUI was last told, in points: the keyboard animation's current value.
     keyboard_height: Cell<f32>,
+    /// The inset's target and animation (keyboard_inset.rs).
+    keyboard_inset: RefCell<KeyboardInsetManager>,
+    /// Flutter's `keyboardAnimationView`: a hidden view whose `y` UIKit animates with the keyboard's duration and
+    /// curve; its spring (or, without one, its presentation layer) gives each frame's inset.
+    keyboard_animation_view: Retained<UIView>,
     /// Current mouse position (from touch)
     mouse_position: Cell<Point<Pixels>>,
     /// Current modifiers
@@ -488,6 +502,10 @@ impl IosWindow {
         text_input_view.setUserInteractionEnabled(true);
         view.addSubview(&text_input_view);
 
+        let keyboard_animation_view = UIView::new(main_thread);
+        keyboard_animation_view.setHidden(true);
+        view.addSubview(&keyboard_animation_view);
+
         let state = IosWindowState {
             platform: Rc::downgrade(platform),
             keyboard_observers: RefCell::default(),
@@ -518,6 +536,8 @@ impl IosWindow {
             touch_ids: RefCell::default(),
             back_gesture_start: Cell::new(None),
             keyboard_height: Cell::new(0.),
+            keyboard_inset: RefCell::default(),
+            keyboard_animation_view,
             mouse_position: Cell::new(Point::default()),
             modifiers: Cell::new(Modifiers::default()),
             key_responder: RefCell::default(),
@@ -552,50 +572,182 @@ impl IosWindowState {
     }
 
     fn register_keyboard_observers(self: &Rc<Self>) {
-        unsafe {
-            let notification_center = NSNotificationCenter::defaultCenter();
-
+        let notification_center = NSNotificationCenter::defaultCenter();
+        // SAFETY: UIKit's notification names, immutable statics.
+        let notifications = unsafe {
+            [
+                (UIKeyboardWillShowNotification, NotificationName::WillShow),
+                (
+                    UIKeyboardWillChangeFrameNotification,
+                    NotificationName::WillChangeFrame,
+                ),
+                (UIKeyboardWillHideNotification, NotificationName::WillHide),
+            ]
+        };
+        let observers = notifications.map(|(notification, name)| {
             let window = Rc::downgrade(self);
-            let frame_change_block =
-                block2::RcBlock::new(move |notification: NonNull<NSNotification>| {
-                    let Some(user_info) = notification.as_ref().userInfo() else {
-                        return;
-                    };
-                    let Some(frame_value) = user_info.objectForKey(UIKeyboardFrameEndUserInfoKey)
-                    else {
-                        return;
-                    };
-                    let Some(frame_value) = frame_value.downcast_ref::<NSValue>() else {
-                        return;
-                    };
-                    let frame = frame_value.CGRectValue();
-                    if let Some(window) = window.upgrade() {
-                        window.set_keyboard_height(frame.size.height as f32);
-                    }
-                });
-
-            let window = Rc::downgrade(self);
-            let hide_block = block2::RcBlock::new(move |_notification: NonNull<NSNotification>| {
+            let block = block2::RcBlock::new(move |notification: NonNull<NSNotification>| {
                 if let Some(window) = window.upgrade() {
-                    window.set_keyboard_height(0.);
+                    // SAFETY: NSNotificationCenter passes a live notification.
+                    window.handle_keyboard_notification(name, unsafe { notification.as_ref() });
                 }
             });
+            // SAFETY: the block holds only a weak window; the observer is removed on drop.
+            unsafe {
+                notification_center.addObserverForName_object_queue_usingBlock(
+                    Some(notification),
+                    None,
+                    None,
+                    &block,
+                )
+            }
+        });
+        self.keyboard_observers.borrow_mut().extend(observers);
+    }
 
-            let frame_observer = notification_center.addObserverForName_object_queue_usingBlock(
-                Some(UIKeyboardWillChangeFrameNotification),
-                None,
-                None,
-                &frame_change_block,
+    // Ported from flutter/flutter engine/src/flutter/shell/platform/darwin/ios/framework/Source/
+    // KeyboardInsetManager.swift (`handleKeyboardNotification(_:)`, `startKeyBoardAnimation(_:)`,
+    // `handleKeyboardAnimationCallback(withTargetTime:)`) and FlutterViewController.mm (`keyboardWillShowNotification:`,
+    // `keyboardWillChangeFrame:`, `keyboardWillBeHidden:`, `isPadInSlideOverOrStageManagerMode`,
+    // `convertViewRectToScreen:`) @ 3.50.1 (ae9b586f34a8443573f82ef57c3bf914a908cbf7). Copyright 2014 The Flutter
+    // Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
+    /// Turns a keyboard notification into the inset's target and starts the animation toward it.
+    fn handle_keyboard_notification(&self, name: NotificationName, notification: &NSNotification) {
+        let user_info = notification.userInfo();
+        let value = |key: &NSString| user_info.as_ref().and_then(|info| info.objectForKey(key));
+        let rect = |key: &NSString| {
+            value(key)
+                .and_then(|value| value.downcast::<NSValue>().ok())
+                // SAFETY: UIKit stores the keyboard's frames as CGRect values.
+                .map_or(Rect::default(), |value| {
+                    rect(unsafe { value.CGRectValue() })
+                })
+        };
+        let number =
+            |key: &NSString| value(key).and_then(|value| value.downcast::<NSNumber>().ok());
+        // SAFETY: UIKit's user-info keys, immutable statics.
+        let notification = unsafe {
+            KeyboardNotification {
+                name,
+                begin: rect(UIKeyboardFrameBeginUserInfoKey),
+                end: rect(UIKeyboardFrameEndUserInfoKey),
+                duration: number(UIKeyboardAnimationDurationUserInfoKey)
+                    .map_or(0., |duration| duration.doubleValue()),
+                is_local: number(UIKeyboardIsLocalUserInfoKey).map(|local| local.boolValue()),
+            }
+        };
+        let action = self
+            .keyboard_inset
+            .borrow_mut()
+            .handle_keyboard_notification(&notification, &self.keyboard_geometry());
+        match action {
+            KeyboardInsetAction::Ignore
+            | KeyboardInsetAction::Unchanged
+            | KeyboardInsetAction::Compound => {}
+            KeyboardInsetAction::HideImmediately => {
+                self.keyboard_animation_view.layer().removeAllAnimations();
+                self.set_keyboard_height(0.);
+            }
+            KeyboardInsetAction::Start {
+                duration,
+                generation,
+            } => self.start_keyboard_animation(duration, generation),
+        }
+    }
+
+    /// Where the view sits on its screen, for the keyboard's frame (which is in the screen's coordinate space).
+    fn keyboard_geometry(&self) -> ViewGeometry {
+        let screen = self.window.screen();
+        let coordinate_space = screen.coordinateSpace();
+        // SAFETY: UICoordinateSpace's `convertRect:toCoordinateSpace:`, which UIView implements.
+        let view_in_screen: CGRect = unsafe {
+            msg_send![&*self.view, convertRect: self.view.bounds(), toCoordinateSpace: &*coordinate_space]
+        };
+        let traits = self.view.traitCollection();
+        // SAFETY: plain trait-collection getters on the main thread.
+        let pad_in_slide_over_or_stage_manager = unsafe {
+            traits.userInterfaceIdiom() == UIUserInterfaceIdiom::Pad
+                && traits.horizontalSizeClass() == UIUserInterfaceSizeClass::Compact
+                && traits.verticalSizeClass() == UIUserInterfaceSizeClass::Regular
+        };
+        ViewGeometry {
+            screen: rect(screen.bounds()),
+            view_in_screen: rect(view_in_screen),
+            pad_in_slide_over_or_stage_manager,
+        }
+    }
+
+    /// Flutter's `startKeyBoardAnimation(_:)`: UIKit animates the hidden view's `y` from the current inset to the
+    /// target with the keyboard's duration (and, inside the notification, its curve); its `CASpringAnimation`, if
+    /// it is one, becomes the spring `step_keyboard_animation` samples each frame. The completion of the animation
+    /// still running sets the target.
+    fn start_keyboard_animation(&self, duration: f64, generation: u64) {
+        let view = &self.keyboard_animation_view;
+        view.layer().removeAllAnimations();
+        let frame_at = |inset: f64| CGRect::new(CGPoint::new(0., inset), CGSize::ZERO);
+        let original_view_inset_bottom = self.keyboard_height.get() as f64;
+        view.setFrame(frame_at(original_view_inset_bottom));
+        // Core Animation's clock, the one the display link's target times are on.
+        let start_time = CACurrentMediaTime();
+        let target = self.keyboard_inset.borrow().target_view_inset_bottom;
+        let animations = block2::RcBlock::new({
+            let view = view.clone();
+            move || {
+                view.setFrame(frame_at(target));
+                view.layoutIfNeeded();
+            }
+        });
+        let window = self.view.ivars().0.borrow().clone();
+        let completion = block2::RcBlock::new(move |_finished: objc2::runtime::Bool| {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            if window.keyboard_inset.borrow_mut().finish(generation) {
+                let target = window.keyboard_inset.borrow().target_view_inset_bottom;
+                window.set_keyboard_height(target as f32);
+            }
+        });
+        UIView::animateWithDuration_animations_completion(
+            duration,
+            &animations,
+            Some(&completion),
+            view.mtm(),
+        );
+        // The animation UIKit added for the new frame inside the notification: the keyboard's own curve.
+        // SAFETY: reading the layer's animation for a key on the main thread.
+        let animation = unsafe { view.layer().animationForKey(&NSString::from_str("position")) };
+        let keyboard_spring = animation
+            .and_then(|animation| animation.downcast::<CASpringAnimation>().ok())
+            .map(|spring| KeyboardSpring {
+                stiffness: spring.stiffness(),
+                damping: spring.damping(),
+                mass: spring.mass(),
+                initial_velocity: spring.initialVelocity(),
+            });
+        self.keyboard_inset
+            .borrow_mut()
+            .set_up_keyboard_spring_animation_if_needed(
+                keyboard_spring,
+                original_view_inset_bottom,
+                start_time,
             );
-            let hide_observer = notification_center.addObserverForName_object_queue_usingBlock(
-                Some(UIKeyboardWillHideNotification),
-                None,
-                None,
-                &hide_block,
-            );
-            self.keyboard_observers
-                .borrow_mut()
-                .extend([frame_observer, hide_observer]);
+    }
+
+    /// Flutter's `handleKeyboardAnimationCallback(withTargetTime:)`: while the animation runs, the inset is the
+    /// keyboard's spring at the frame's vsync target time, or without a spring the hidden view's presented `y`.
+    fn step_keyboard_animation(&self, target_time: f64) {
+        let sample = self.keyboard_inset.borrow().sample(target_time);
+        match sample {
+            InsetSample::Idle => {}
+            InsetSample::Spring(inset) => self.set_keyboard_height(inset as f32),
+            InsetSample::PresentationLayer => {
+                // SAFETY: reading the presentation copy of a layer on the main thread.
+                if let Some(presented) =
+                    unsafe { self.keyboard_animation_view.layer().presentationLayer() }
+                {
+                    self.set_keyboard_height(presented.frame().origin.y as f32);
+                }
+            }
         }
     }
 
@@ -804,7 +956,9 @@ impl IosWindowState {
         }
     }
 
-    pub(super) fn request_frame(&self) {
+    /// One display-link frame; `target_time` is its vsync target (`CADisplayLink.targetTimestamp`).
+    pub(super) fn request_frame(&self, target_time: f64) {
+        self.step_keyboard_animation(target_time);
         self.request_frame_callback.with(|callback| {
             let force_render = self.force_next_frame.replace(false);
             callback(RequestFrameOptions {
@@ -965,6 +1119,16 @@ impl IosWindowState {
         self.resize_callback
             .with(|callback| callback(new_size, new_scale));
     }
+}
+
+/// A `CGRect` as keyboard_inset.rs's.
+fn rect(rect: CGRect) -> Rect {
+    Rect::new(
+        rect.origin.x,
+        rect.origin.y,
+        rect.size.width,
+        rect.size.height,
+    )
 }
 
 /// A `UIPress`'s phase as keyboard.rs's.
