@@ -74,6 +74,7 @@ use std::{
 };
 
 mod native_views;
+mod touch;
 
 const WINDOW_STATE_IVAR: &CStr = c"windowState";
 
