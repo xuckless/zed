@@ -300,10 +300,20 @@ impl TextSystem {
     /// Layouts already in progress may complete against the previous font set.
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.platform_text_system.add_fonts(fonts)?;
+        self.invalidate_fonts();
+        Ok(())
+    }
+
+    /// Drops cached font resolution and invalidates line layouts, as
+    /// [`Self::add_fonts`] does, without adding fonts: for a platform text
+    /// system whose font matching changed on its own (on Android, the
+    /// per-language fallback order follows the system locales).
+    ///
+    /// Layouts already in progress may complete against the previous fonts.
+    pub fn invalidate_fonts(&self) {
         self.font_ids_by_font.write().clear();
         self.missing_glyph_reporter.reset();
         self.font_generation.fetch_add(1, Ordering::Release);
-        Ok(())
     }
 
     /// Takes the receiver for missing-glyph reports.
@@ -1316,6 +1326,34 @@ mod font_resolution_tests {
 
         text_system.fallback_font_stack.clear();
         assert_eq!(text_system.resolve_font(&requested), FontId(42));
+    }
+
+    #[test]
+    fn font_changes_drop_cached_fonts_and_bump_the_generation() {
+        // One row per way the font set changes; add a row per new one.
+        let rows: [(&str, fn(&TextSystem)); 2] = [
+            ("add_fonts", |text_system| {
+                text_system.add_fonts(Vec::new()).expect("no fonts to add");
+            }),
+            ("invalidate_fonts", TextSystem::invalidate_fonts),
+        ];
+        for (name, change) in rows {
+            let text_system = TextSystem::new(Arc::new(NoopTextSystem::new()));
+            text_system
+                .font_ids_by_font
+                .write()
+                .insert(font("Arial"), CachedFont::Direct(FontId(42)));
+            let generation = text_system.font_generation.load(Ordering::Acquire);
+
+            change(&text_system);
+
+            assert!(text_system.font_ids_by_font.read().is_empty(), "{name}");
+            assert_eq!(
+                text_system.font_generation.load(Ordering::Acquire),
+                generation + 1,
+                "{name}"
+            );
+        }
     }
 }
 
