@@ -10,6 +10,8 @@
 //! whose view hosts a CAMetalLayer.
 
 use super::events::*;
+
+mod native_views;
 use super::keyboard::{KeyResponder, Press, PressPhase, Primary};
 use super::keyboard_inset::{
     InsetSample, KeyboardInsetAction, KeyboardInsetManager, KeyboardNotification, KeyboardSpring,
@@ -376,6 +378,8 @@ pub(crate) struct IosWindowState {
     /// Fires the held key's repeats while `key_responder` has a key that repeats.
     key_repeat_timer: RefCell<Option<Retained<objc2_foundation::NSTimer>>>,
     renderer: Mutex<MetalRenderer>,
+    /// The app's views shown beneath GPUI's (native_views.rs).
+    native_views: RefCell<native_views::NativeViews>,
 }
 
 impl IosWindow {
@@ -545,6 +549,7 @@ impl IosWindow {
             key_responder: RefCell::default(),
             key_repeat_timer: RefCell::default(),
             renderer: Mutex::new(renderer),
+            native_views: RefCell::default(),
         };
 
         Ok(Self {
@@ -1355,7 +1360,21 @@ impl PlatformWindow for IosWindow {
     }
 
     fn draw(&self, scene: &Scene) {
-        self.renderer.lock().draw(scene);
+        native_views::draw(self, scene);
+    }
+
+    unsafe fn attach_native_view(
+        &self,
+        id: gpui::NativeViewId,
+        view: NonNull<c_void>,
+    ) -> Option<Box<dyn std::any::Any>> {
+        // SAFETY: The caller upholds `attach`'s requirements for `view`, and
+        // GPUI's windows run on the main thread.
+        unsafe { native_views::attach(&self.state, id, view) }
+    }
+
+    fn native_view_input(&self) -> gpui::NativeViewInput {
+        gpui::NativeViewInput::Window
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
