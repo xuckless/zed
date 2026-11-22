@@ -170,6 +170,7 @@ impl InputEvent for TouchEvent {
         PlatformInput::Touch(self)
     }
 }
+impl MouseEvent for TouchEvent {}
 
 /// A mouse down event from the platform
 #[derive(Clone, Debug, Default)]

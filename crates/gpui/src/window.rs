@@ -28,7 +28,7 @@ use crate::{
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
-use crate::interactive::{PointerDevice, PointerSource, TouchEvent};
+use crate::interactive::{PointerDevice, PointerSource, TouchEvent, TouchId, TouchPhase};
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 use derive_more::{Deref, DerefMut};
@@ -1305,6 +1305,8 @@ pub struct Window {
     touch_prediction_enabled: bool,
     /// `Some` only while a pointer event is being dispatched.
     pointer_source: Option<PointerSource>,
+    /// Where each touch in progress goes, decided when it started.
+    touch_routes: FxHashMap<TouchId, TouchRoute>,
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
@@ -1641,6 +1643,20 @@ fn default_bounds(
         (false, false) => display_bounds.origin,
     };
     window_bounds_ctor(Bounds::new(final_origin, base_size))
+}
+
+/// Where one touch's events go. Decided while its [`TouchPhase::Started`] is
+/// dispatched: the first listener to decide wins, and bubble order visits the
+/// frontmost element first, so the deepest handler under the touch decides.
+#[derive(Clone, Debug, PartialEq)]
+enum TouchRoute {
+    /// Its started event is being dispatched and nobody has decided yet.
+    Deciding,
+    /// The gesture recognizer, which turns it into mouse and scroll events.
+    Gestures,
+    /// The element that claimed it: every later phase goes to its touch
+    /// listeners wherever it is drawn now, and no events are synthesized.
+    Claimed(GlobalElementId),
 }
 
 /// The pointer behind each platform input: one arm per variant, so a new
@@ -2527,6 +2543,7 @@ impl Window {
             ),
             touch_prediction_enabled: true,
             pointer_source: None,
+            touch_routes: FxHashMap::default(),
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
@@ -3828,6 +3845,41 @@ impl Window {
     /// Returns the hitbox that has captured the pointer, if any.
     pub fn captured_hitbox(&self) -> Option<HitboxId> {
         self.captured_hitbox
+    }
+
+    /// Claims a touch for `owner` while the touch's [`TouchPhase::Started`] is
+    /// dispatched, unless a deeper element decided first. Returns whether
+    /// `owner` now owns it: its later phases then reach the touch listeners
+    /// that check [`Window::touch_owner`], and never become mouse, click,
+    /// scroll or long-press events. `on_touch` does this for you.
+    pub fn claim_touch(&mut self, touch: TouchId, owner: &GlobalElementId) -> bool {
+        self.decide_touch(touch, TouchRoute::Claimed(owner.clone()));
+        self.touch_owner(touch) == Some(owner)
+    }
+
+    /// The element that claimed this touch with [`Window::claim_touch`], if any.
+    pub fn touch_owner(&self, touch: TouchId) -> Option<&GlobalElementId> {
+        match self.touch_routes.get(&touch) {
+            Some(TouchRoute::Claimed(owner)) => Some(owner),
+            Some(TouchRoute::Deciding | TouchRoute::Gestures) | None => None,
+        }
+    }
+
+    /// Leaves a touch to the gesture recognizer (taps, pans, long presses)
+    /// while the touch's [`TouchPhase::Started`] is dispatched, unless a deeper
+    /// element decided first. Call it from a `TouchEvent` listener of a custom
+    /// element that handles taps or scrolls itself, when the touch starts over
+    /// it: an ancestor's `on_touch` then cannot take the touch, as for a div
+    /// with `on_click` or `on_scroll` (which calls this for you).
+    pub fn leave_touch_to_gestures(&mut self, touch: TouchId) {
+        self.decide_touch(touch, TouchRoute::Gestures);
+    }
+
+    /// The one transition out of [`TouchRoute::Deciding`]; decided routes stay.
+    fn decide_touch(&mut self, touch: TouchId, decided: TouchRoute) {
+        if let Some(route @ TouchRoute::Deciding) = self.touch_routes.get_mut(&touch) {
+            *route = decided;
+        }
     }
 
     /// Captures the current long press for the given entity.
@@ -6376,6 +6428,30 @@ impl Window {
     /// dispatches whatever it resolves (scroll steps, synthesized taps)
     /// through the ordinary mouse-event path.
     fn dispatch_touch_event(&mut self, event: &TouchEvent, cx: &mut App) {
+        if event.phase == TouchPhase::Started {
+            self.touch_routes.insert(event.id, TouchRoute::Deciding);
+            // Hit-tested where the touch starts; the mouse stays where it was.
+            let mouse_position = mem::replace(&mut self.mouse_position, event.position);
+            self.dispatch_mouse_event(event, cx);
+            self.mouse_position = mouse_position;
+            self.decide_touch(event.id, TouchRoute::Gestures);
+        }
+        let claimed = match self.touch_routes.get(&event.id) {
+            Some(TouchRoute::Claimed(_)) => true,
+            Some(TouchRoute::Deciding | TouchRoute::Gestures) | None => false,
+        };
+        if claimed && event.phase != TouchPhase::Started {
+            self.dispatch_mouse_event(event, cx);
+        }
+        if matches!(event.phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            self.touch_routes.remove(&event.id);
+        }
+        if claimed {
+            if event.phase == TouchPhase::Ended {
+                self.draw_before_touch_release(cx);
+            }
+            return;
+        }
         let mut event = event.clone();
         if !self.touch_prediction_enabled {
             event.predicted_position = None;
@@ -6401,19 +6477,25 @@ impl Window {
         } else if self.touch_gestures.pending_long_press().is_none() {
             self.long_press_timer.take();
         }
-        // The platform's touch-release handler may inspect the input handler
-        // as soon as this dispatch returns (the web platform decides virtual
-        // keyboard visibility there, inside the user gesture). Input handlers
-        // are registered during draw, so draw now to make them reflect any
-        // focus change the tap just caused.
-        if tapped && self.invalidator.is_dirty() {
+        if tapped {
+            self.draw_before_touch_release(cx);
+        }
+        if self.touch_gestures.has_momentum() {
+            self.schedule_touch_momentum_tick();
+        }
+    }
+
+    /// The platform's touch-release handler may inspect the input handler
+    /// as soon as this dispatch returns (the web platform decides virtual
+    /// keyboard visibility there, inside the user gesture). Input handlers
+    /// are registered during draw, so draw now to make them reflect any
+    /// focus change a tap or a claimed touch's release just caused.
+    fn draw_before_touch_release(&mut self, cx: &mut App) {
+        if self.invalidator.is_dirty() {
             // Render sees no pointer source, as outside dispatch.
             let pointer_source = self.pointer_source.take();
             self.draw(cx).clear(cx);
             self.pointer_source = pointer_source;
-        }
-        if self.touch_gestures.has_momentum() {
-            self.schedule_touch_momentum_tick();
         }
     }
 

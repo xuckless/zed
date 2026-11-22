@@ -23,8 +23,9 @@ use crate::{
     KeyboardButton, KeyboardClickEvent, LayoutId, LongPressEvent, ModifiersChangedEvent,
     MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement, PinchEvent, Pixels,
-    Point, Render, ScrollEvent, SharedString, Size, Style, StyleRefinement, Styled, Task,
-    TooltipId, TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
+    Point, PointerSource, Render, ScrollEvent, SharedString, Size, Style, StyleRefinement, Styled,
+    Task, TooltipId, TouchClickEvent, TouchEvent, TouchPhase, Visibility, Window,
+    WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -433,6 +434,18 @@ impl Interactivity {
                     cx.stop_propagation();
                 }
             }));
+    }
+
+    /// Bind the given callback to raw touches that start over this element, opting it out of
+    /// touch-to-mouse emulation: such a touch reaches touch listeners in every phase, even
+    /// after the element or the finger moves, and is never turned into mouse, click, scroll or
+    /// long-press events. A deeper element under the touch that handles touches, taps or
+    /// scrolls takes the touch instead. Needs an element id, like `on_click`.
+    /// The imperative API equivalent to [`StatefulInteractiveElement::on_touch`].
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    pub fn on_touch(&mut self, listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static) {
+        self.touch_listeners.push(Box::new(listener));
     }
 
     /// Bind the given callback to pinch gesture events during the capture phase.
@@ -1629,6 +1642,15 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Bind the given callback to raw touches that start over this element, opting it out of
+    /// touch-to-mouse emulation. The fluent API equivalent to [`Interactivity::on_touch`].
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    fn on_touch(mut self, listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static) -> Self {
+        self.interactivity().on_touch(listener);
+        self
+    }
+
     /// Bind the given callback to click events of this element.
     /// The fluent API equivalent to [`Interactivity::on_click`].
     ///
@@ -1783,6 +1805,8 @@ pub(crate) type PinchListener =
 
 pub(crate) type BackGestureListener =
     Box<dyn Fn(&BackGestureEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+
+pub(crate) type TouchListener = Box<dyn Fn(&TouchEvent, &mut Window, &mut App) + 'static>;
 
 pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
@@ -2262,6 +2286,7 @@ pub struct Interactivity {
     pub(crate) scroll_listeners: Vec<ScrollListener>,
     pub(crate) pinch_listeners: Vec<PinchListener>,
     pub(crate) back_gesture_listeners: Vec<BackGestureListener>,
+    pub(crate) touch_listeners: Vec<TouchListener>,
     pub(crate) key_down_listeners: Vec<KeyDownListener>,
     pub(crate) key_up_listeners: Vec<KeyUpListener>,
     pub(crate) modifiers_changed_listeners: Vec<ModifiersChangedListener>,
@@ -2518,6 +2543,7 @@ impl Interactivity {
             || !self.scroll_listeners.is_empty()
             || self.has_pinch_listeners()
             || !self.back_gesture_listeners.is_empty()
+            || !self.touch_listeners.is_empty()
             || self.drag_listener.is_some()
             || !self.drop_listeners.is_empty()
             || !self.drag_over_styles.is_empty()
@@ -2689,6 +2715,7 @@ impl Interactivity {
                                             }
 
                                             self.paint_mouse_listeners(
+                                                global_id,
                                                 hitbox,
                                                 element_state.as_mut(),
                                                 window,
@@ -2859,11 +2886,51 @@ impl Interactivity {
 
     fn paint_mouse_listeners(
         &mut self,
+        global_id: Option<&GlobalElementId>,
         hitbox: &Hitbox,
         element_state: Option<&mut InteractiveElementState>,
         window: &mut Window,
         cx: &mut App,
     ) {
+        // Deepest wins, like Flutter's gesture arena: the frontmost element under a starting
+        // touch that handles touches, taps or scrolls decides where the touch goes (bubble order
+        // visits it first). To let another handler keep its touches, add it to this list.
+        let handles_gestures = !self.click_listeners.is_empty()
+            || !self.aux_click_listeners.is_empty()
+            || !self.mouse_down_listeners.is_empty()
+            || !self.mouse_up_listeners.is_empty()
+            || !self.scroll_listeners.is_empty()
+            || self.scroll_offset.is_some()
+            || self.drag_listener.is_some();
+        let touch_listeners = mem::take(&mut self.touch_listeners);
+        if let Some(owner) = global_id.filter(|_| !touch_listeners.is_empty()) {
+            let (hitbox, owner) = (hitbox.clone(), owner.clone());
+            window.on_mouse_event(move |event: &TouchEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                if event.phase == TouchPhase::Started && hitbox.is_hovered(window) {
+                    window.claim_touch(event.id, &owner);
+                }
+                // The claim, not a hit test, routes later phases: the element may have moved.
+                if window.touch_owner(event.id) == Some(&owner) {
+                    for listener in &touch_listeners {
+                        listener(event, window, cx);
+                    }
+                }
+            })
+        } else if handles_gestures {
+            let hitbox = hitbox.clone();
+            window.on_mouse_event(move |event: &TouchEvent, phase, window, _| {
+                if phase == DispatchPhase::Bubble
+                    && event.phase == TouchPhase::Started
+                    && hitbox.is_hovered(window)
+                {
+                    window.leave_touch_to_gestures(event.id);
+                }
+            })
+        }
+
         let is_focused = self
             .tracked_focus_handle
             .as_ref()
@@ -3216,10 +3283,23 @@ impl Interactivity {
                             if let Some(mouse_down) = captured_mouse_down.take() {
                                 let btn = mouse_down.button;
 
-                                let mouse_click = ClickEvent::Mouse(MouseClickEvent {
-                                    down: mouse_down,
-                                    up: event.clone(),
-                                });
+                                // A tap's synthesized press and release click as a touch.
+                                let mouse_click = match window.pointer_source() {
+                                    Some(PointerSource {
+                                        synthesized: true, ..
+                                    }) => ClickEvent::Touch(TouchClickEvent {
+                                        position: event.position,
+                                        tap_count: event.click_count,
+                                        long_press: false,
+                                    }),
+                                    Some(PointerSource {
+                                        synthesized: false, ..
+                                    })
+                                    | None => ClickEvent::Mouse(MouseClickEvent {
+                                        down: mouse_down,
+                                        up: event.clone(),
+                                    }),
+                                };
 
                                 match btn {
                                     MouseButton::Left => {
@@ -5866,5 +5946,263 @@ mod tests {
         assert_eq!(bounds("cell-0").origin.x, px(0.));
         assert_eq!(bounds("cell-1").origin.x, px(100.));
         assert_eq!(bounds("cell-2").origin.x, px(300.));
+    }
+
+    /// What the touch arena's elements logged, and where its thumb is.
+    #[derive(Clone, Default)]
+    struct ArenaLog {
+        seen: Rc<RefCell<Vec<String>>>,
+        thumb_x: Rc<Cell<f32>>,
+    }
+
+    /// One handler on an arena element. To test another, add a variant and its arm in `logged`.
+    #[derive(Clone, Copy)]
+    enum Handler {
+        Touch,
+        /// A touch handler whose element follows the finger, like a slider thumb.
+        Follow,
+        Tap,
+        Scroll,
+        /// A custom element that handles taps with mouse listeners and leaves its touches to
+        /// the recognizer with `Window::leave_touch_to_gestures`.
+        Custom,
+    }
+
+    /// A 50x50 element `name` whose handlers log what reaches them. Release handlers refresh
+    /// the window, as a focus change would.
+    fn logged(log: &ArenaLog, name: &'static str, handlers: &[Handler]) -> Stateful<Div> {
+        let element = div().id(name).w(px(50.)).h(px(50.));
+        handlers.iter().fold(element, |element, handler| {
+            let ArenaLog { seen, thumb_x } = log.clone();
+            match handler {
+                Handler::Touch | Handler::Follow => {
+                    let follow = matches!(handler, Handler::Follow);
+                    element
+                        .when(follow, |thumb| thumb.absolute().left(px(thumb_x.get())))
+                        .on_touch(move |event, window, _| {
+                            seen.borrow_mut().push(format!("{name} {:?}", event.phase));
+                            if follow && event.phase == TouchPhase::Moved {
+                                thumb_x.set(f32::from(event.position.x) - 25.);
+                                window.refresh();
+                            }
+                            if event.phase == TouchPhase::Ended {
+                                window.refresh();
+                            }
+                        })
+                }
+                Handler::Tap => element.on_click(move |event, window, _| {
+                    seen.borrow_mut().push(match event {
+                        ClickEvent::Touch(tap) => format!("{name} tap {}", tap.tap_count),
+                        ClickEvent::Mouse(_) | ClickEvent::Keyboard(_) => format!("{name} click"),
+                    });
+                    window.refresh();
+                }),
+                Handler::Scroll => element
+                    .on_scroll(move |_, _, _| seen.borrow_mut().push(format!("{name} scroll"))),
+                Handler::Custom => element.child(
+                    canvas(
+                        |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                        move |_, hitbox, window, _| {
+                            let touched = hitbox.clone();
+                            window.on_mouse_event(move |event: &TouchEvent, phase, window, _| {
+                                if phase == DispatchPhase::Bubble
+                                    && event.phase == TouchPhase::Started
+                                    && touched.is_hovered(window)
+                                {
+                                    window.leave_touch_to_gestures(event.id);
+                                }
+                            });
+                            window.on_mouse_event(move |_: &MouseUpEvent, phase, window, _| {
+                                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                                    seen.borrow_mut().push(format!("{name} release"));
+                                    window.refresh();
+                                }
+                            });
+                        },
+                    )
+                    .size_full(),
+                ),
+            }
+        })
+    }
+
+    struct TouchArena {
+        tree: fn(&ArenaLog) -> Stateful<Div>,
+        log: ArenaLog,
+    }
+
+    impl Render for TouchArena {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child((self.tree)(&self.log))
+        }
+    }
+
+    #[crate::test]
+    fn touch_listeners_opt_an_element_out_of_touch_to_mouse(cx: &mut TestAppContext) {
+        use Handler::{Custom, Follow, Scroll, Tap, Touch};
+        let touch = |phase, x: f32| {
+            TouchEvent {
+                id: TouchId(1),
+                phase,
+                position: point(px(x), px(10.)),
+                predicted_position: None,
+                force: None,
+                device: PointerDevice::Touch,
+            }
+            .to_platform_input()
+        };
+        let tap = |x| vec![touch(TouchPhase::Started, x), touch(TouchPhase::Ended, x)];
+        let pan = || {
+            vec![
+                touch(TouchPhase::Started, 10.),
+                touch(TouchPhase::Moved, 200.),
+                touch(TouchPhase::Ended, 200.),
+            ]
+        };
+        let mouse = |down| {
+            let (position, click_count) = (point(px(10.), px(10.)), 1);
+            if down {
+                MouseDownEvent {
+                    button: MouseButton::Left,
+                    position,
+                    click_count,
+                    ..Default::default()
+                }
+                .to_platform_input()
+            } else {
+                MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    click_count,
+                    ..Default::default()
+                }
+                .to_platform_input()
+            }
+        };
+        fn canvas_with(log: &ArenaLog, child: Stateful<Div>) -> Stateful<Div> {
+            logged(log, "canvas", &[Handler::Touch])
+                .size_full()
+                .child(child)
+        }
+        // (name, element tree, inputs, entries logged in order). After the inputs, a row logs
+        // `undrawn` if the last dispatch returned before drawing a refresh, then the window's
+        // mouse position, which a claimed touch leaves alone.
+        type Row = (
+            &'static str,
+            fn(&ArenaLog) -> Stateful<Div>,
+            Vec<crate::PlatformInput>,
+            &'static [&'static str],
+        );
+        let rows: Vec<Row> = vec![
+            (
+                "tap a button",
+                |log| logged(log, "button", &[Tap]),
+                tap(10.),
+                &["button tap 1", "mouse at 10"],
+            ),
+            (
+                "pan a scroller",
+                |log| logged(log, "list", &[Scroll]),
+                pan(),
+                &["list scroll", "list scroll", "mouse at 10"],
+            ),
+            (
+                "tap a canvas",
+                |log| logged(log, "canvas", &[Touch]),
+                tap(10.),
+                &["canvas Started", "canvas Ended", "mouse at 0"],
+            ),
+            (
+                "tap a canvas that also clicks and scrolls",
+                |log| logged(log, "canvas", &[Touch, Tap, Scroll]),
+                tap(10.),
+                &["canvas Started", "canvas Ended", "mouse at 0"],
+            ),
+            (
+                "pan off a canvas",
+                |log| logged(log, "canvas", &[Touch]),
+                pan(),
+                &[
+                    "canvas Started",
+                    "canvas Moved",
+                    "canvas Ended",
+                    "mouse at 0",
+                ],
+            ),
+            (
+                "tap beside a canvas",
+                |log| logged(log, "canvas", &[Touch]),
+                tap(75.),
+                &["mouse at 75"],
+            ),
+            (
+                "mouse click a canvas that clicks",
+                |log| logged(log, "canvas", &[Touch, Tap]),
+                vec![mouse(true), mouse(false)],
+                &["canvas click", "undrawn", "mouse at 10"],
+            ),
+            (
+                "drag a thumb that follows the finger",
+                |log| logged(log, "thumb", &[Follow]),
+                pan(),
+                &["thumb Started", "thumb Moved", "thumb Ended", "mouse at 0"],
+            ),
+            (
+                "tap a button inside a canvas",
+                |log| canvas_with(log, logged(log, "button", &[Tap])),
+                tap(10.),
+                &["button tap 1", "mouse at 10"],
+            ),
+            (
+                "tap a canvas beside its button",
+                |log| canvas_with(log, logged(log, "button", &[Tap])),
+                tap(75.),
+                &["canvas Started", "canvas Ended", "mouse at 0"],
+            ),
+            (
+                "tap a canvas inside a canvas",
+                |log| canvas_with(log, logged(log, "inner", &[Touch])),
+                tap(10.),
+                &["inner Started", "inner Ended", "mouse at 0"],
+            ),
+            (
+                "tap a custom element inside a canvas",
+                |log| canvas_with(log, logged(log, "custom", &[Custom])),
+                tap(10.),
+                &["custom release", "mouse at 10"],
+            ),
+            (
+                "pan a scroller inside a canvas",
+                |log| canvas_with(log, logged(log, "list", &[Scroll])),
+                pan(),
+                &["list scroll", "list scroll", "mouse at 10"],
+            ),
+        ];
+        for (name, tree, inputs, expected) in rows {
+            let log = ArenaLog::default();
+            let window = cx.add_window({
+                let log = log.clone();
+                move |_, _| TouchArena { tree, log }
+            });
+            let mut undrawn = false;
+            for input in inputs {
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(input, cx);
+                    // Draw between inputs, so each one meets the layout its handlers left.
+                    undrawn = window.invalidator.is_dirty();
+                    window.draw(cx).clear(cx);
+                })
+                .unwrap();
+            }
+            if undrawn {
+                log.seen.borrow_mut().push("undrawn".into());
+            }
+            cx.update_window(window.into(), |_, window, _| {
+                let x = f32::from(window.mouse_position().x);
+                log.seen.borrow_mut().push(format!("mouse at {x}"));
+            })
+            .unwrap();
+            assert_eq!(*log.seen.borrow(), expected, "{name}");
+        }
     }
 }
