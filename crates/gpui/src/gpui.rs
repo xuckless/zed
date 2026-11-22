@@ -21,6 +21,7 @@ pub extern crate subsecond;
 extern crate self as gpui;
 
 pub mod colors;
+pub mod overscroll;
 pub mod prelude;
 pub mod profiler;
 

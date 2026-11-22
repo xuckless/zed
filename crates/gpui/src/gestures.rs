@@ -36,6 +36,8 @@ use crate::{
     ScrollEvent, ScrollSource, TouchEvent, TouchId, TouchPhase, point, px, seal::Sealed,
 };
 
+pub mod scale;
+
 const SCROLL_EVENT_SEPARATION: Duration = Duration::from_millis(28);
 
 fn dominant_axis(delta: Point<Pixels>) -> Axis {
