@@ -188,6 +188,13 @@ impl NativeView {
             .map(|hitbox| hitbox.bounds)
     }
 
+    /// What the window's platform keeps of the view, for that platform's own
+    /// API to reach: on Wayland, `gpui_linux::NativeViewBuffers::of(&view)`,
+    /// through which the app commits its buffers.
+    pub fn platform_attachment(&self) -> &dyn Any {
+        &*self.0._attachment
+    }
+
     /// Makes key bindings for `A` apply before the view sees the key.
     ///
     /// The view otherwise sees every key first and can keep any of them, so
