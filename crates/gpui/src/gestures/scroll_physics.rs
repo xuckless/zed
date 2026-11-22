@@ -1,7 +1,7 @@
 // Ported from flutter/flutter packages/flutter/lib/src/widgets/scroll_physics.dart @ 3.50.1
-// (ae9b586f34a8443573f82ef57c3bf914a908cbf7): `ScrollDecelerationRate`, `ScrollPhysics`' spring, drag threshold and
-// `toleranceFor`, and its `BouncingScrollPhysics` and `ClampingScrollPhysics` subclasses. Copyright 2014 The Flutter
-// Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
+// (ae9b586f34a8443573f82ef57c3bf914a908cbf7): `ScrollDecelerationRate`, `ScrollPhysics`' fling limits, spring,
+// drag threshold and `toleranceFor`, and its `BouncingScrollPhysics` and `ClampingScrollPhysics` subclasses.
+// Copyright 2014 The Flutter Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
 //
 // Flutter's class and its two subclasses are one enum, a variant per subclass, so a const table can name them.
 // Dropped: the `parent` chain (`applyTo`, `buildParent`, `shouldUpdate`); `shouldAcceptUserOffset`,
@@ -9,6 +9,7 @@
 // other physics classes; `ClampingScrollPhysics.applyBoundaryConditions`' debug assertion that the call is redundant
 // (it returns 0.0 then, as Flutter does in release builds); `ScrollMetrics`' axis direction.
 
+use super::constants::{kMaxFlingVelocity, kMinFlingVelocity, kTouchSlop};
 use super::physics::{ScrollSpringSimulation, Simulation, Tolerance};
 use super::scroll_simulation::{BouncingScrollSimulation, ClampingScrollSimulation};
 use crate::{Pixels, SpringConfig, px};
@@ -91,6 +92,37 @@ impl ScrollPhysics {
     /// Android scroll feel: `ClampingScrollPhysics`, Android's `OverScroller`.
     pub const fn android() -> Self {
         Self::Clamping
+    }
+
+    /// The minimum distance an input pointer drag must have moved to be
+    /// considered a scroll fling gesture.
+    ///
+    /// This value is typically compared with the distance traveled along the
+    /// scrolling axis.
+    pub fn min_fling_distance(&self) -> Pixels {
+        kTouchSlop
+    }
+
+    /// The minimum velocity for an input pointer drag to be considered a
+    /// scroll fling.
+    pub fn min_fling_velocity(&self) -> f32 {
+        match self {
+            Self::Bouncing { .. } => kMinFlingVelocity * 2.0,
+            Self::Clamping => kMinFlingVelocity,
+        }
+    }
+
+    /// Scroll fling velocity magnitudes will be clamped to this value.
+    pub fn max_fling_velocity(&self) -> f32 {
+        match self {
+            Self::Bouncing {
+                deceleration_rate: ScrollDecelerationRate::Fast,
+            } => kMaxFlingVelocity * 8.0,
+            Self::Bouncing {
+                deceleration_rate: ScrollDecelerationRate::Normal,
+            }
+            | Self::Clamping => kMaxFlingVelocity,
+        }
     }
 
     /// The minimum amount of pixel distance drags must move by to start motion

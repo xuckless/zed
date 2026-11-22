@@ -25,13 +25,17 @@
 //!   assert!(true)
 //! }
 //! ```
-use crate::{Entity, Subscription, TestAppContext, TestDispatcher, calculate_seeds};
+use crate::{
+    AnyWindowHandle, App, AppContext as _, Entity, PlatformInput, Subscription, TestAppContext,
+    TestDispatcher, Window, calculate_seeds,
+};
 use futures::StreamExt as _;
 use proptest::prelude::{Just, Strategy, any};
 use std::{
     env,
     panic::{self, RefUnwindSafe, UnwindSafe},
     pin::Pin,
+    time::Duration,
 };
 
 /// Strategy injected into `#[gpui::property_test]` tests to control the seed
@@ -169,4 +173,52 @@ pub fn observe<T: 'static>(entity: &Entity<T>, cx: &mut TestAppContext) -> Obser
     let rx = Box::pin(rx);
 
     Observation { rx, _subscription }
+}
+
+/// What [`play_trace`] just did, for its callback.
+#[derive(Debug)]
+pub enum TraceStep<'a> {
+    /// It dispatched this input.
+    Input(&'a PlatformInput),
+    /// It ran the window's next frame (its `on_next_frame` callbacks), this many ms after the trace started.
+    Frame(u64),
+}
+
+/// Plays a recorded input trace (touches, scroll wheels, any platform input) into `window` on the test executor's
+/// clock: each `(at_ms, input)` is dispatched `at_ms` after the call, timers (a long press) fire in between, and
+/// with `frame_ms` a frame runs every `frame_ms` (fling momentum, overscroll), until `until_ms` or the last input.
+/// `on_step` sees each input after its dispatch and each frame after it ran, in time order; at the same time, the
+/// frame comes first. The trace must be in time order.
+pub fn play_trace(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    trace: impl IntoIterator<Item = (u64, PlatformInput)>,
+    frame_ms: Option<u64>,
+    until_ms: u64,
+    mut on_step: impl FnMut(TraceStep<'_>, &mut Window, &mut App),
+) {
+    let mut now = 0;
+    let inputs = trace.into_iter().map(|(at_ms, input)| (at_ms, Some(input)));
+    for (at_ms, input) in inputs.chain([(until_ms, None)]) {
+        while now < at_ms {
+            let step = frame_ms.map_or(at_ms - now, |frame| (frame - now % frame).min(at_ms - now));
+            cx.executor().advance_clock(Duration::from_millis(step));
+            cx.run_until_parked();
+            now += step;
+            if frame_ms.is_some_and(|frame| now % frame == 0) {
+                cx.update_window(window, |_, window, cx| {
+                    window.simulate_next_frame(cx);
+                    on_step(TraceStep::Frame(now), window, cx);
+                })
+                .expect("the trace's window stays open");
+            }
+        }
+        if let Some(input) = input {
+            cx.update_window(window, |_, window, cx| {
+                window.dispatch_event(input.clone(), cx);
+                on_step(TraceStep::Input(&input), window, cx);
+            })
+            .expect("the trace's window stays open");
+        }
+    }
 }

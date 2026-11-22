@@ -3900,6 +3900,13 @@ impl Window {
         self.long_press_capture == Some(entity.entity_id())
     }
 
+    /// Restarts touch recognition with the tuning a test passes, in place of
+    /// the platform's.
+    #[cfg(test)]
+    pub(crate) fn set_gesture_tuning(&mut self, tuning: GestureTuning) {
+        self.touch_gestures = TouchGestureRecognizer::new(tuning);
+    }
+
     /// The current state of the keyboard's modifiers
     pub fn modifiers(&self) -> Modifiers {
         self.modifiers
@@ -6472,14 +6479,28 @@ impl Window {
         if !self.touch_prediction_enabled {
             event.predicted_position = None;
         }
-        let recognized_gestures = self.touch_gestures.handle_event(&event);
+        // The innermost hitbox under the touch: taps count per target.
+        let frame = &self.rendered_frame;
+        let target = frame.hit_test(event.position).ids.first().and_then(|id| {
+            frame
+                .hitboxes
+                .iter()
+                .find(|hitbox| hitbox.id == *id)
+                .map(|hitbox| hitbox.bounds)
+        });
+        let recognized_gestures =
+            self.touch_gestures
+                .handle_event(&event, cx.background_executor().now(), target);
         if event.phase == crate::TouchPhase::Started
             && let Some(touch_drag) = self.touch_gestures.offer_touch_drag(event.id)
         {
             self.dispatch_recognized_touch_gesture(touch_drag, event.device, cx);
         }
         if event.phase == crate::TouchPhase::Started
-            && self.touch_gestures.pending_long_press().is_some()
+            && self
+                .touch_gestures
+                .pending_long_press(cx.background_executor().now())
+                .is_some()
         {
             self.long_press_capture = None;
         }
@@ -6490,7 +6511,11 @@ impl Window {
         }
         if event.phase == crate::TouchPhase::Started {
             self.schedule_long_press_timer(cx);
-        } else if self.touch_gestures.pending_long_press().is_none() {
+        } else if self
+            .touch_gestures
+            .pending_long_press(cx.background_executor().now())
+            .is_none()
+        {
             self.long_press_timer.take();
         }
         if tapped {
@@ -6583,7 +6608,10 @@ impl Window {
 
     fn schedule_long_press_timer(&mut self, cx: &mut App) {
         self.long_press_timer.take();
-        let Some((touch_id, device, duration)) = self.touch_gestures.pending_long_press() else {
+        let Some((touch_id, device, duration)) = self
+            .touch_gestures
+            .pending_long_press(cx.background_executor().now())
+        else {
             return;
         };
         self.long_press_timer = Some(self.spawn(cx, async move |cx| {
@@ -6606,7 +6634,10 @@ impl Window {
 
     fn schedule_touch_momentum_tick(&mut self) {
         self.on_next_frame(|window, cx| {
-            if let Some((device, gesture)) = window.touch_gestures.tick_momentum() {
+            if let Some((device, gesture)) = window
+                .touch_gestures
+                .tick_momentum(cx.background_executor().now())
+            {
                 window.dispatch_recognized_touch_gesture(gesture, device, cx);
             }
             if window.touch_gestures.has_momentum() {
@@ -10504,6 +10535,9 @@ mod tests {
                     assert_eq!(window.pointer_source(), None, "{name}: after dispatch");
                 })
                 .unwrap();
+                // The recognizer reads the executor's clock: a fling needs time
+                // to pass between samples, as between a touch screen's reports.
+                cx.executor().advance_clock(Duration::from_millis(8));
             }
             let mut seen = seen.borrow().clone();
             seen.dedup();
