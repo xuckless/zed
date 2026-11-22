@@ -1,8 +1,8 @@
 //! Conversion from UIKit events to GPUI input events.
 
 use gpui::{
-    BackGestureEvent, BackGesturePhase, Modifiers, Pixels, Point, PointerDevice, ScrollDelta,
-    ScrollEvent, ScrollSource, TouchId, TouchPhase, px,
+    BackGestureEvent, BackGesturePhase, BackGestureSource, Modifiers, Pixels, Point, PointerDevice,
+    ScrollDelta, ScrollEvent, ScrollSource, TouchId, TouchPhase, px,
 };
 use objc2_core_foundation::CGPoint;
 use objc2_ui_kit::{
@@ -57,6 +57,7 @@ pub fn back_event(
         phase,
         start_position,
         progress: progress as f32,
+        source: BackGestureSource::EdgeSwipe,
     })
 }
 

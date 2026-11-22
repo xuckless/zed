@@ -406,7 +406,7 @@ impl MouseEvent for TouchDragEvent {}
 /// gesture when it starts; the platform cancels the gesture if no element does.
 /// Every phase is delivered at the start position, so the claiming element
 /// should stay in place while it animates its contents.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct BackGestureEvent {
     /// The phase of the gesture.
     pub phase: BackGesturePhase,
@@ -414,6 +414,19 @@ pub struct BackGestureEvent {
     pub start_position: Point<Pixels>,
     /// How far the gesture has travelled toward going back, from 0 to 1.
     pub progress: f32,
+    /// What the user did to go back.
+    pub source: BackGestureSource,
+}
+
+/// What produced a [`BackGestureEvent`]. No default: every gesture names
+/// its source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackGestureSource {
+    /// A swipe from the screen edge, recognized from touches (iOS).
+    EdgeSwipe,
+    /// A key or button with no pointer behind it, such as Android's Back key
+    /// or navigation-bar button.
+    Key,
 }
 
 /// The phase of a [`BackGestureEvent`].

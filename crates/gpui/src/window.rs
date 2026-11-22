@@ -27,7 +27,9 @@ use crate::{
     WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
-use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
+use crate::gestures::{
+    BackGestureSource, GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer,
+};
 use crate::interactive::{PointerDevice, PointerSource, TouchEvent, TouchId, TouchPhase};
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -1660,9 +1662,9 @@ enum TouchRoute {
 }
 
 /// The pointer behind each platform input: one arm per variant, so a new
-/// variant must pick its row. Keys carry no pointer. Gestures the core
-/// recognizes from touches are not platform input:
-/// `dispatch_recognized_touch_gesture` names their touch.
+/// variant must pick its row. Keys, and a back gesture driven by a key,
+/// carry no pointer. Gestures the core recognizes from touches are not
+/// platform input: `dispatch_recognized_touch_gesture` names their touch.
 fn pointer_source(event: &PlatformInput) -> Option<PointerSource> {
     let (device, synthesized) = match event {
         PlatformInput::KeyDown(_)
@@ -1680,9 +1682,11 @@ fn pointer_source(event: &PlatformInput) -> Option<PointerSource> {
         | PlatformInput::FileDrop(_) => (PointerDevice::Mouse, false),
         PlatformInput::Touch(touch) => (touch.device, false),
         // The platform recognized these from touches it does not name.
-        PlatformInput::LongPress(_)
-        | PlatformInput::TouchDrag(_)
-        | PlatformInput::BackGesture(_) => (PointerDevice::Touch, true),
+        PlatformInput::LongPress(_) | PlatformInput::TouchDrag(_) => (PointerDevice::Touch, true),
+        PlatformInput::BackGesture(back) => match back.source {
+            BackGestureSource::EdgeSwipe => (PointerDevice::Touch, true),
+            BackGestureSource::Key => return None,
+        },
     };
     Some(PointerSource {
         device,
@@ -8564,15 +8568,15 @@ mod tests {
     };
 
     use crate::{
-        AnyWindowHandle, AppContext as _, BackGestureEvent, BackGesturePhase, Bounds, ContentMask,
-        Context, CursorStyle, DispatchPhase, DragMoveEvent, Empty, ExternalDragPayload,
-        ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle, InputEvent as _,
-        InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke, LongPressEvent, MouseButton,
-        MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, PlatformInput, Point,
-        PointerDevice, PointerSource, Render, RequestFrameOptions, ScaledPixels, ScrollEvent,
-        StatefulInteractiveElement as _, Styled, TestAppContext, ThermalState, TouchDragEvent,
-        TouchEvent, TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance,
-        WindowOptions, canvas, div, hsla, point, px, size,
+        AnyWindowHandle, AppContext as _, BackGestureEvent, BackGesturePhase, BackGestureSource,
+        Bounds, ContentMask, Context, CursorStyle, DispatchPhase, DragMoveEvent, Empty,
+        ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
+        InputEvent as _, InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke,
+        LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+        Pixels, PlatformInput, Point, PointerDevice, PointerSource, Render, RequestFrameOptions,
+        ScaledPixels, ScrollEvent, StatefulInteractiveElement as _, Styled, TestAppContext,
+        ThermalState, TouchDragEvent, TouchEvent, TouchId, TouchPhase, Underline, UnderlineStyle,
+        Window, WindowAppearance, WindowOptions, canvas, div, hsla, point, px, size,
     };
 
     #[gpui::test]
@@ -10170,6 +10174,7 @@ mod tests {
                                 phase: BackGesturePhase::Started,
                                 start_position: point(px(x), px(10.)),
                                 progress: 0.,
+                                source: BackGestureSource::EdgeSwipe,
                             }
                             .to_platform_input(),
                             cx,
@@ -10228,6 +10233,7 @@ mod tests {
                                 phase: BackGesturePhase::Started,
                                 start_position: point(px(x), px(10.)),
                                 progress: 0.,
+                                source: BackGestureSource::Key,
                             }
                             .to_platform_input(),
                             cx,
@@ -10348,6 +10354,15 @@ mod tests {
                 touch(TouchPhase::Ended, 10., device),
             ]
         };
+        let back = |source| {
+            BackGestureEvent {
+                phase: BackGesturePhase::Started,
+                start_position: point(px(10.), px(10.)),
+                progress: 0.,
+                source,
+            }
+            .to_platform_input()
+        };
         let source = |device, synthesized| {
             Some(PointerSource {
                 device,
@@ -10456,15 +10471,13 @@ mod tests {
             ),
             (
                 "edge swipe back",
-                vec![
-                    BackGestureEvent {
-                        phase: BackGesturePhase::Started,
-                        start_position: point(px(10.), px(10.)),
-                        progress: 0.,
-                    }
-                    .to_platform_input(),
-                ],
+                vec![back(BackGestureSource::EdgeSwipe)],
                 vec![render, ("back", source(PointerDevice::Touch, true)), render],
+            ),
+            (
+                "back key",
+                vec![back(BackGestureSource::Key)],
+                vec![render, ("back", None), render],
             ),
         ];
         for (name, inputs, expected) in rows {

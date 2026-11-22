@@ -13,12 +13,13 @@ use super::events::*;
 use super::text_input::TextInputView;
 use super::{CallbackSlot, IosDisplay, platform::IosPlatformState};
 use gpui::{
-    AnyWindowHandle, BackGestureEvent, BackGesturePhase, Bounds, Capslock, Corners, DevicePixels,
-    DispatchEventResult, DisplayId, Edges, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, Scene, Size, TextInputConfiguration, TextInputStateChange,
-    TouchEvent, TouchId, TouchPhase, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowInsets, WindowParams, WindowVisibility, px, size,
+    AnyWindowHandle, BackGestureEvent, BackGesturePhase, BackGestureSource, Bounds, Capslock,
+    Corners, DevicePixels, DispatchEventResult, DisplayId, Edges, GpuSpecs, Modifiers, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PromptButton, PromptLevel, RequestFrameOptions, Scene, Size, TextInputConfiguration,
+    TextInputStateChange, TouchEvent, TouchId, TouchPhase, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets, WindowParams,
+    WindowVisibility, px, size,
 };
 use gpui_apple::{
     main_thread_marker,
@@ -571,6 +572,7 @@ impl IosWindowState {
                     phase: BackGesturePhase::Started,
                     start_position,
                     progress: 0.,
+                    source: BackGestureSource::EdgeSwipe,
                 }))
             })
             .is_some_and(|result| result.default_prevented);
