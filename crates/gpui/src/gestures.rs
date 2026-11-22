@@ -327,16 +327,75 @@ impl GestureKinds {
     };
 }
 
-/// A direct touch drag claimed by an element before touch input becomes a tap,
-/// long press, or scrolling gesture.
+/// A direct touch drag an element took from the touch recognizer: claimed at
+/// touch down, before the touch can become a tap, long press or pan, or won
+/// once it passed the drag's slop ([`Window::compete_for_touch_drag`](crate::Window::compete_for_touch_drag)).
 #[derive(Clone, Debug)]
 pub struct TouchDragEvent {
     /// The phase of the touch drag.
     pub phase: TouchPhase,
+    /// How the drag started: every event of one drag carries the same value.
+    pub start: TouchDragStart,
     /// The position where the touch started.
     pub start_position: Point<Pixels>,
     /// The touch's current position.
     pub position: Point<Pixels>,
+}
+
+/// How a touch drag started, in Flutter's arena terms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchDragStart {
+    /// Offered at touch down (the offer is the `Started` event): claiming it
+    /// with `prevent_default` wins the touch at once, as a drag recognizer
+    /// alone in its arena does.
+    Down,
+    /// Won once the touch moved past this kind's slop, ahead of the tap, the
+    /// long press and the pan it competed with (the `Started` event comes
+    /// then, at the touch's position).
+    PastSlop(TouchDragKind),
+}
+
+/// The drag an element competes for, and so what the touch must travel for it
+/// to win: Flutter's `TapAndHorizontalDragGestureRecognizer` (a text field on
+/// mobile) or `TapAndPanGestureRecognizer` (on desktop). A new kind gets one
+/// arm in each `match` of [`TouchDragKind`]'s methods.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchDragKind {
+    /// Wins when the horizontal travel passes the hit slop.
+    Horizontal,
+    /// Wins when the travel on any axis passes the pan slop.
+    Pan,
+}
+
+// Ported from flutter/flutter packages/flutter/lib/src/gestures/tap_and_drag.dart @ 3.50.1
+// (ae9b586f34a8443573f82ef57c3bf914a908cbf7) (BaseTapAndDragGestureRecognizer._checkDrag;
+// TapAndHorizontalDragGestureRecognizer's and TapAndPanGestureRecognizer's _getDeltaForDetails,
+// _getPrimaryValueFromOffset and _hasSufficientGlobalDistanceToAccept). Copyright 2014 The Flutter Authors.
+// BSD-3-Clause, see third_party/flutter/LICENSE.
+impl TouchDragKind {
+    /// What one move of `delta` adds to `_globalDistanceMoved`:
+    /// `_getDeltaForDetails(delta).distance * (_getPrimaryValueFromOffset(delta) ?? 1).sign`.
+    fn global_distance_moved(self, delta: Point<Pixels>) -> f32 {
+        match self {
+            // Offset(delta.dx, 0.0), signed by dx: the horizontal travel.
+            TouchDragKind::Horizontal => f32::from(delta.x),
+            // The whole delta, unsigned.
+            TouchDragKind::Pan => delta.magnitude() as f32,
+        }
+    }
+
+    /// `_hasSufficientGlobalDistanceToAccept`.
+    fn has_sufficient_global_distance_to_accept(
+        self,
+        global_distance_moved: f32,
+        slops: Slops,
+    ) -> bool {
+        let slop = match self {
+            TouchDragKind::Horizontal => slops.hit,
+            TouchDragKind::Pan => slops.pan,
+        };
+        global_distance_moved.abs() > f32::from(slop)
+    }
 }
 
 impl Sealed for TouchDragEvent {}
@@ -514,7 +573,7 @@ enum TouchGestureState {
         touch: ActiveTouch,
         deadline: Instant,
         long_press_offered: bool,
-        touch_drag_offered: bool,
+        touch_drag: TouchDragOffer,
     },
     /// The touch exceeded `touch_slop`: it is a pan until it ends, and its
     /// movement flows out as scroll events.
@@ -527,7 +586,24 @@ enum TouchGestureState {
     /// movement, not inherited from the fling it stopped.
     Caught(ActiveTouch),
     LongPressing(ActiveTouch),
-    TouchDragging(ActiveTouch),
+    TouchDragging {
+        touch: ActiveTouch,
+        start: TouchDragStart,
+    },
+}
+
+/// A pending touch's drag offer: the touch-down dispatch offers it once.
+#[derive(Clone, Copy)]
+enum TouchDragOffer {
+    NotOffered,
+    /// Offered; nothing competes for it (a claim leaves `Pending`).
+    Offered,
+    /// The deepest element that competes for it, with Flutter's
+    /// `_globalDistanceMoved` so far: the touch's travel as its kind counts it.
+    Competing {
+        kind: TouchDragKind,
+        global_distance_moved: f32,
+    },
 }
 
 /// What a tap lands on: the bounds of the innermost hitbox under the touch
@@ -598,9 +674,8 @@ impl TouchGestureRecognizer {
                 TouchClaim::Possible(touch.id)
             }
             TouchGestureState::Panning { touch, .. } => TouchClaim::Pan(touch.id),
-            TouchGestureState::LongPressing(touch) | TouchGestureState::TouchDragging(touch) => {
-                TouchClaim::Press(touch.id)
-            }
+            TouchGestureState::LongPressing(touch)
+            | TouchGestureState::TouchDragging { touch, .. } => TouchClaim::Press(touch.id),
         }
     }
 
@@ -701,7 +776,7 @@ impl TouchGestureRecognizer {
                             touch,
                             deadline: now + self.tuning.long_press_duration,
                             long_press_offered: false,
-                            touch_drag_offered: false,
+                            touch_drag: TouchDragOffer::NotOffered,
                         };
                     }
                 }
@@ -711,19 +786,47 @@ impl TouchGestureRecognizer {
                     mut touch,
                     deadline,
                     long_press_offered,
-                    touch_drag_offered,
+                    mut touch_drag,
                 } if touch.id == event.id => {
+                    let moved = event.position - touch.last_position;
                     touch
                         .velocity_tracker
                         .add_position(sampled_at, event.position);
                     touch.last_position = event.position;
                     let accumulated = event.position - touch.start_position;
-                    if accumulated.magnitude() > f64::from(self.tuning.touch_slop) {
+                    // A competing drag sees the move before the pan does, as
+                    // the deeper recognizer's route runs first in Flutter: on
+                    // a move both accept, the drag wins.
+                    let pan_axis = (accumulated.magnitude() > f64::from(self.tuning.touch_slop))
+                        .then(|| dominant_axis(accumulated));
+                    let drag_won = match &mut touch_drag {
+                        TouchDragOffer::Competing {
+                            kind,
+                            global_distance_moved,
+                        } => {
+                            *global_distance_moved += kind.global_distance_moved(moved);
+                            kind.has_sufficient_global_distance_to_accept(
+                                *global_distance_moved,
+                                slops(touch.device, Some(self.tuning.touch_slop)),
+                            )
+                            .then_some(*kind)
+                        }
+                        TouchDragOffer::NotOffered | TouchDragOffer::Offered => None,
+                    };
+                    if let Some(kind) = drag_won {
+                        let start = TouchDragStart::PastSlop(kind);
+                        recognized.push(RecognizedTouchGesture::TouchDrag(TouchDragEvent {
+                            phase: TouchPhase::Started,
+                            start,
+                            start_position: touch.start_position,
+                            position: event.position,
+                        }));
+                        self.state = TouchGestureState::TouchDragging { touch, start };
+                    } else if let Some(axis) = pan_axis {
                         // Carry the full movement so far into the first scroll
                         // step: the content catches up to the finger instead
                         // of losing the slop distance.
                         let mut target = event.predicted_position.unwrap_or(event.position);
-                        let axis = dominant_axis(accumulated);
                         let mut delta = target - touch.start_position;
                         lock_delta_to_axis(&mut delta, axis);
                         touch.last_movement = accumulated;
@@ -745,7 +848,7 @@ impl TouchGestureRecognizer {
                             touch,
                             deadline,
                             long_press_offered,
-                            touch_drag_offered,
+                            touch_drag,
                         };
                     }
                 }
@@ -803,14 +906,15 @@ impl TouchGestureRecognizer {
                     }));
                     self.state = TouchGestureState::LongPressing(touch);
                 }
-                TouchGestureState::TouchDragging(mut touch) if touch.id == event.id => {
+                TouchGestureState::TouchDragging { mut touch, start } if touch.id == event.id => {
                     touch.last_position = event.position;
                     recognized.push(RecognizedTouchGesture::TouchDrag(TouchDragEvent {
                         phase: TouchPhase::Moved,
+                        start,
                         start_position: touch.start_position,
                         position: event.position,
                     }));
-                    self.state = TouchGestureState::TouchDragging(touch);
+                    self.state = TouchGestureState::TouchDragging { touch, start };
                 }
                 other => self.state = other,
             },
@@ -936,9 +1040,10 @@ impl TouchGestureRecognizer {
                         position: event.position,
                     }));
                 }
-                TouchGestureState::TouchDragging(touch) if touch.id == event.id => {
+                TouchGestureState::TouchDragging { touch, start } if touch.id == event.id => {
                     recognized.push(RecognizedTouchGesture::TouchDrag(TouchDragEvent {
                         phase: TouchPhase::Ended,
+                        start,
                         start_position: touch.start_position,
                         position: event.position,
                     }));
@@ -963,9 +1068,10 @@ impl TouchGestureRecognizer {
                         position: event.position,
                     }));
                 }
-                TouchGestureState::TouchDragging(touch) if touch.id == event.id => {
+                TouchGestureState::TouchDragging { touch, start } if touch.id == event.id => {
                     recognized.push(RecognizedTouchGesture::TouchDrag(TouchDragEvent {
                         phase: TouchPhase::Cancelled,
+                        start,
                         start_position: touch.start_position,
                         position: event.position,
                     }));
@@ -1053,23 +1159,39 @@ impl TouchGestureRecognizer {
     pub(crate) fn offer_touch_drag(&mut self, id: TouchId) -> Option<RecognizedTouchGesture> {
         let TouchGestureState::Pending {
             touch,
-            touch_drag_offered,
+            touch_drag: touch_drag @ TouchDragOffer::NotOffered,
             ..
         } = &mut self.state
         else {
             return None;
         };
-        if touch.id != id || *touch_drag_offered {
+        if touch.id != id {
             return None;
         }
-        *touch_drag_offered = true;
+        *touch_drag = TouchDragOffer::Offered;
         Some(RecognizedTouchGesture::TouchDrag(TouchDragEvent {
             phase: TouchPhase::Started,
+            start: TouchDragStart::Down,
             start_position: touch.start_position,
             position: touch.last_position,
         }))
     }
 
+    /// While the offer is dispatched: the first (deepest) element to compete
+    /// for it gets it, unless one claims it.
+    pub(crate) fn compete_for_touch_drag(&mut self, kind: TouchDragKind) {
+        if let TouchGestureState::Pending { touch_drag, .. } = &mut self.state
+            && let TouchDragOffer::Offered = touch_drag
+        {
+            *touch_drag = TouchDragOffer::Competing {
+                kind,
+                global_distance_moved: 0.,
+            };
+        }
+    }
+
+    /// After the offer's dispatch: a claim wins the touch now; otherwise it
+    /// stays pending, with any drag that competes for it.
     pub(crate) fn resolve_touch_drag(&mut self, claimed: bool) {
         if !claimed {
             return;
@@ -1078,9 +1200,12 @@ impl TouchGestureRecognizer {
         self.state = match state {
             TouchGestureState::Pending {
                 touch,
-                touch_drag_offered: true,
+                touch_drag: TouchDragOffer::Offered | TouchDragOffer::Competing { .. },
                 ..
-            } => TouchGestureState::TouchDragging(touch),
+            } => TouchGestureState::TouchDragging {
+                touch,
+                start: TouchDragStart::Down,
+            },
             other => other,
         };
     }

@@ -1,5 +1,5 @@
 // Ported from flutter/flutter packages/flutter/test/gestures/tap_test.dart, double_tap_test.dart,
-// long_press_test.dart and drag_test.dart @ 3.50.1 (ae9b586f34a8443573f82ef57c3bf914a908cbf7).
+// long_press_test.dart, drag_test.dart and tap_and_drag_test.dart @ 3.50.1 (ae9b586f34a8443573f82ef57c3bf914a908cbf7).
 // Copyright 2014 The Flutter Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
 
 //! Flutter's recognizer tests as the oracle for the touch recognizer, driven
@@ -15,8 +15,8 @@ use scheduler::Instant;
 use crate::{
     App, Bounds, Context, DispatchPhase, GestureTuning, HitboxBehavior, InputEvent as _,
     IntoElement, LongPressEvent, MouseDownEvent, Pixels, PointerDevice, Render, ScrollDelta,
-    ScrollEvent, TestAppContext, TouchDragEvent, TouchEvent, TouchId, TouchPhase, Window, canvas,
-    point, px, size,
+    ScrollEvent, TestAppContext, TouchDragEvent, TouchDragKind, TouchDragStart, TouchEvent,
+    TouchId, TouchPhase, Window, canvas, point, px, size,
 };
 
 use TouchPhase::{Cancelled, Ended, Moved, Started};
@@ -59,12 +59,16 @@ use Seen::{LongPress, Scroll, Tap, TouchDrag};
 
 /// What the element claims, standing in for the recognizer the Flutter test
 /// builds. Taps and pans are always recognized; a long press or touch drag
-/// only reaches an element that claims it.
+/// only reaches an element that claims it, or that competes for the drag
+/// (`Window::compete_for_touch_drag`, Flutter's tap-and-drag recognizers).
 #[derive(Clone, Copy)]
 enum Claim {
     Nothing,
     LongPress,
     TouchDrag,
+    Compete(TouchDragKind),
+    /// A text field's pair: it claims long presses and competes for drags.
+    LongPressAndCompete(TouchDragKind),
 }
 
 struct Row<'a> {
@@ -121,28 +125,40 @@ impl Render for Recorder {
                         );
                     }
                 });
-                match claim {
-                    Claim::Nothing => {}
-                    Claim::LongPress => {
-                        window.on_mouse_event(move |event: &LongPressEvent, phase, window, cx| {
-                            if phase != DispatchPhase::Bubble {
-                                return;
+                // The drag: `Some(None)` claims it at touch down, `Some(Some(kind))` competes for it.
+                let (long_press, drag) = match claim {
+                    Claim::Nothing => (false, None),
+                    Claim::LongPress => (true, None),
+                    Claim::TouchDrag => (false, Some(None)),
+                    Claim::Compete(kind) => (false, Some(Some(kind))),
+                    Claim::LongPressAndCompete(kind) => (true, Some(Some(kind))),
+                };
+                if long_press {
+                    let record = record.clone();
+                    window.on_mouse_event(move |event: &LongPressEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Bubble {
+                            return;
+                        }
+                        let at = event.position;
+                        record(cx, LongPress(event.phase, at.x.into(), at.y.into()));
+                        window.prevent_default();
+                    })
+                }
+                if let Some(compete) = drag {
+                    window.on_mouse_event(move |event: &TouchDragEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Bubble {
+                            return;
+                        }
+                        match (compete, event.start) {
+                            (Some(kind), TouchDragStart::Down) => {
+                                return window.compete_for_touch_drag(kind);
                             }
-                            let at = event.position;
-                            record(cx, LongPress(event.phase, at.x.into(), at.y.into()));
-                            window.prevent_default();
-                        })
-                    }
-                    Claim::TouchDrag => {
-                        window.on_mouse_event(move |event: &TouchDragEvent, phase, window, cx| {
-                            if phase != DispatchPhase::Bubble {
-                                return;
-                            }
-                            let at = event.position;
-                            record(cx, TouchDrag(event.phase, at.x.into(), at.y.into()));
-                            window.prevent_default();
-                        })
-                    }
+                            (None, _) => window.prevent_default(),
+                            (Some(_), TouchDragStart::PastSlop(_)) => {}
+                        }
+                        let at = event.position;
+                        record(cx, TouchDrag(event.phase, at.x.into(), at.y.into()));
+                    })
                 }
             },
         )
@@ -830,6 +846,153 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             trace: &[touch(0, 1, Started, 10., 10.), touch(0, 1, Ended, 10., 10.)],
             until_ms: 0,
             expected: &[(0, Tap(1))],
+        },
+        // tap_and_drag_test.dart: the element competes for the drag
+        // (`Window::compete_for_touch_drag`), as Flutter's tap-and-drag
+        // recognizers do; GPUI's pan, accepting in any direction, stands in for
+        // the VerticalDragGestureRecognizer or PanGestureRecognizer the test
+        // adds. The drag starts where it wins.
+        Row {
+            name: "TapAndHorizontalDragGestureRecognizer beats VerticalDragGestureRecognizer on a horizontal drag",
+            tuning: flutter,
+            claim: Claim::Compete(TouchDragKind::Horizontal),
+            targets: &[],
+            trace: &[
+                touch(0, 5, Started, 10., 10.),
+                touch(0, 5, Moved, 45., 10.),
+                touch(0, 5, Ended, 45., 10.),
+            ],
+            until_ms: 0,
+            expected: &[
+                (0, TouchDrag(Started, 45., 10.)),
+                (0, TouchDrag(Ended, 45., 10.)),
+            ],
+        },
+        Row {
+            name: "TapAndHorizontalDragGestureRecognizer loses to VerticalDragGestureRecognizer on a vertical drag",
+            tuning: flutter,
+            claim: Claim::Compete(TouchDragKind::Horizontal),
+            targets: &[],
+            trace: &[
+                touch(0, 5, Started, 10., 10.),
+                touch(0, 5, Moved, 10., 45.),
+                touch(0, 5, Moved, 10., 100.),
+                touch(0, 5, Ended, 10., 100.),
+            ],
+            until_ms: 0,
+            expected: &[
+                (0, Scroll(Started, 0., 35.)),
+                (0, Scroll(Moved, 0., 55.)),
+                (0, Scroll(Ended, 0., 0.)),
+            ],
+        },
+        Row {
+            name: "TapAndPanGestureRecognizer loses to VerticalDragGestureRecognizer on a vertical drag",
+            tuning: flutter,
+            claim: Claim::Compete(TouchDragKind::Pan),
+            targets: &[],
+            trace: &[
+                touch(0, 5, Started, 10., 10.),
+                touch(0, 5, Moved, 10., 45.),
+                touch(0, 5, Moved, 10., 100.),
+                touch(0, 5, Ended, 10., 100.),
+            ],
+            until_ms: 0,
+            expected: &[
+                (0, Scroll(Started, 0., 35.)),
+                (0, Scroll(Moved, 0., 55.)),
+                (0, Scroll(Ended, 0., 0.)),
+            ],
+        },
+        Row {
+            name: "Recognizer declares self-victory in a non-empty arena when pointer travels minimum distance to be considered a drag",
+            tuning: flutter,
+            claim: Claim::Compete(TouchDragKind::Pan),
+            targets: &[],
+            trace: &[
+                touch(0, 5, Started, 10., 10.),
+                touch(0, 5, Moved, 40., 45.),
+                touch(0, 5, Ended, 40., 45.),
+            ],
+            until_ms: 0,
+            expected: &[
+                (0, TouchDrag(Started, 40., 45.)),
+                (0, TouchDrag(Ended, 40., 45.)),
+            ],
+        },
+        Row {
+            name: "Recognizer detects tap gesture when pointer does not move past tap tolerance",
+            tuning: flutter,
+            claim: Claim::Compete(TouchDragKind::Pan),
+            targets: &[],
+            trace: &[touch(0, 1, Started, 10., 10.), touch(0, 1, Ended, 11., 9.)],
+            until_ms: 0,
+            expected: &[(0, Tap(1))],
+        },
+        // Not Flutter tests: a text field's pair (a claimed long press and a
+        // competing drag) against GPUI's tap and pan.
+        Row {
+            // `_globalDistanceMoved` adds each move's dx: 10, then 19 > 18.
+            name: "A horizontal drag wins once its travel along x passes the hit slop",
+            tuning: flutter,
+            claim: Claim::LongPressAndCompete(TouchDragKind::Horizontal),
+            targets: &[],
+            trace: &[
+                touch(0, 5, Started, 10., 10.),
+                touch(10, 5, Moved, 20., 10.),
+                touch(20, 5, Moved, 29., 10.),
+                touch(30, 5, Moved, 60., 12.),
+                touch(40, 5, Ended, 60., 12.),
+            ],
+            until_ms: 40,
+            expected: &[
+                (20, TouchDrag(Started, 29., 10.)),
+                (30, TouchDrag(Moved, 60., 12.)),
+                (40, TouchDrag(Ended, 60., 12.)),
+            ],
+        },
+        Row {
+            // 19 px away but only 15 px along x: the pan takes it first.
+            name: "The pan takes a diagonal move before the horizontal drag's slop",
+            tuning: flutter,
+            claim: Claim::LongPressAndCompete(TouchDragKind::Horizontal),
+            targets: &[],
+            trace: &[
+                touch(0, 5, Started, 10., 10.),
+                touch(10, 5, Moved, 25., 22.),
+                touch(20, 5, Ended, 25., 22.),
+            ],
+            until_ms: 20,
+            expected: &[
+                (10, Scroll(Started, 15., 0.)),
+                (20, Scroll(Ended, 0., 0.)),
+            ],
+        },
+        Row {
+            name: "A competing drag leaves the tap",
+            tuning: flutter,
+            claim: Claim::LongPressAndCompete(TouchDragKind::Horizontal),
+            targets: &[],
+            trace: &[touch(0, 1, Started, 10., 10.), touch(50, 1, Ended, 11., 9.)],
+            until_ms: 50,
+            expected: &[(50, Tap(1))],
+        },
+        Row {
+            name: "A long press held past its deadline beats the competing drag",
+            tuning: flutter,
+            claim: Claim::LongPressAndCompete(TouchDragKind::Horizontal),
+            targets: &[],
+            trace: &[
+                touch(0, 5, Started, 10., 10.),
+                touch(600, 5, Moved, 45., 10.),
+                touch(600, 5, Ended, 45., 10.),
+            ],
+            until_ms: 600,
+            expected: &[
+                (500, LongPress(Started, 10., 10.)),
+                (600, LongPress(Moved, 45., 10.)),
+                (600, LongPress(Ended, 45., 10.)),
+            ],
         },
         // Not a Flutter test: Flutter counts double taps per widget, GPUI's
         // one recognizer per window counts them per target (the innermost

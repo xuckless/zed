@@ -3959,6 +3959,21 @@ impl Window {
         self.long_press_capture == Some(entity.entity_id())
     }
 
+    /// Competes for the touch drag being offered, instead of claiming it.
+    /// Call it from a listener of the offer: the `Started`
+    /// [`TouchDragEvent`] with [`TouchDragStart::Down`](crate::TouchDragStart).
+    ///
+    /// The touch stays a tap, a long press or a pan to be. Once it travels
+    /// past `kind`'s slop, before the pan takes it, the drag wins: the
+    /// listeners get a `Started` event with
+    /// [`TouchDragStart::PastSlop`](crate::TouchDragStart) at the touch's
+    /// position, then its moves and its end, as for a claimed drag. A drag
+    /// that loses gets no event. The deepest element to compete gets it; a
+    /// claim (`prevent_default`) beats any competitor.
+    pub fn compete_for_touch_drag(&mut self, kind: crate::TouchDragKind) {
+        self.touch_gestures.compete_for_touch_drag(kind);
+    }
+
     /// The tuning this window's touch recognition runs with: the app's when it
     /// opened ([`App::gesture_tuning`]), or the last
     /// [`Window::set_gesture_tuning`].
