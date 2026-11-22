@@ -28,6 +28,10 @@ mod keyboard_inset;
 #[cfg(target_family = "wasm")]
 mod logging;
 #[cfg(target_family = "wasm")]
+mod native_view_layout;
+#[cfg(target_family = "wasm")]
+mod native_views;
+#[cfg(target_family = "wasm")]
 mod page_lifecycle;
 #[cfg(target_family = "wasm")]
 mod platform;

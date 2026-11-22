@@ -1,6 +1,7 @@
 use crate::display::WebDisplay;
 use crate::events::{ClickState, EventListenerHandle, TouchIds, WebEventListeners};
 use crate::ime_mirror::ImeMirror;
+use crate::native_views::NativeViews;
 use crate::platform::WebWindowLifecycle;
 use crate::viewport::WebViewport;
 use std::sync::Arc;
@@ -92,6 +93,8 @@ pub(crate) struct WebWindowInner {
     /// so the shadow above clears exactly when gpui's recognizer stops treating
     /// the touch as a tap.
     pub(crate) touch_slop: Cell<Pixels>,
+    /// DOM elements shown under the canvas (`NativeView`).
+    pub(crate) native_views: NativeViews,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
     raf_id: Cell<Option<i32>>,
@@ -237,6 +240,7 @@ impl WebWindow {
             gesture_start_visual_viewport_height: Cell::new(0.0),
             touch_tap_candidate: Cell::new(None),
             touch_slop: Cell::new(params.gesture_tuning.touch_slop),
+            native_views: NativeViews::default(),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
             raf_id: Cell::new(None),
@@ -1095,7 +1099,18 @@ impl PlatformWindow for WebWindow {
             drop(state);
         }
 
+        self.inner.place_native_views(scene);
         self.inner.state.borrow_mut().renderer.draw(scene);
+    }
+
+    unsafe fn attach_native_view(
+        &self,
+        id: gpui::NativeViewId,
+        view: std::ptr::NonNull<std::ffi::c_void>,
+    ) -> Option<Box<dyn std::any::Any>> {
+        // SAFETY: `NativeView::new`'s contract on the web: `view` points to a live `web_sys::HtmlElement`.
+        let content = unsafe { view.cast::<web_sys::HtmlElement>().as_ref() }.clone();
+        self.inner.attach_native_view(id, content)
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

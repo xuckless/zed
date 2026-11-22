@@ -41,9 +41,9 @@ impl NativeViewId {
 /// A view owned by the platform's UI toolkit, shown inside a GPUI window.
 ///
 /// macOS shows an `NSView`, iOS a `UIView`, Windows DirectComposition
-/// content (usually a composition swap chain), and Wayland a `wl_surface` the
-/// app created on GPUI's own connection. [`NativeView::new`] fails on every
-/// other platform.
+/// content (usually a composition swap chain), Wayland a `wl_surface` the
+/// app created on GPUI's own connection, and the web a DOM element under the
+/// canvas. [`NativeView::new`] fails on every other platform.
 ///
 /// On a platform whose native views take no input of their own
 /// ([`crate::NativeViewInput::Window`]: iOS, Windows, Wayland), pointer input
@@ -128,7 +128,9 @@ impl NativeView {
     /// and places it, and the app commits every buffer through
     /// `gpui_linux::NativeViewBuffers`, from a thread it stops and joins before
     /// GPUI's connection closes (in `cx.on_app_quit`, or when the window
-    /// closes).
+    /// closes). On the web
+    /// it is a `web_sys::HtmlElement`, which GPUI moves into a slot under the
+    /// canvas (moving an `<iframe>` already in the document reloads it).
     ///
     /// GPUI retains the view and puts it inside a view of its own, until the
     /// last clone of the returned handle is dropped. Until then GPUI decides the
