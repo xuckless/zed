@@ -49,14 +49,14 @@ use crate::{
     AnyWindowHandle, AppContext, AppLifecyclePhase, Arena, ArenaBox, Asset, AssetSource,
     BackgroundExecutor, Bounds, ClipboardItem, ClipboardReadError, CursorStyle, DispatchPhase,
     DisplayChanges, DisplayEvent, DisplayId, EventEmitter, ExternalDragPayload, FocusHandle,
-    FocusMap, ForegroundExecutor, Global, KeyBinding, KeyContext, Keymap, Keystroke, LayoutId,
-    Menu, MenuItem, MissingGlyph, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
-    PlatformKeyboardLayout, PlatformKeyboardMapper, Point, PowerMode, Priority, PromptBuilder,
-    PromptButton, PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle,
-    Reservation, ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
-    SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
-    ThermalState, Window, WindowAppearance, WindowBounds, WindowButtonLayout, WindowHandle,
-    WindowId, WindowInvalidator, WindowingRequest,
+    FocusMap, ForegroundExecutor, GestureTuning, Global, KeyBinding, KeyContext, Keymap, Keystroke,
+    LayoutId, Menu, MenuItem, MissingGlyph, OwnedMenu, PathPromptOptions, Pixels, Platform,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point, PowerMode, Priority,
+    PromptBuilder, PromptButton, PromptHandle, PromptLevel, Render, RenderImage,
+    RenderablePromptHandle, Reservation, ScreenCaptureSource, SharedString, SubscriberSet,
+    Subscription, SvgRenderer, SystemNotification, SystemNotificationResponse, Task,
+    TextRenderingMode, TextSystem, ThermalState, Window, WindowAppearance, WindowBounds,
+    WindowButtonLayout, WindowHandle, WindowId, WindowInvalidator, WindowingRequest,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -975,6 +975,8 @@ pub struct App {
     pub(crate) mode: GpuiMode,
     pub(crate) cursor_hide_mode: CursorHideMode,
     pub(crate) reduce_motion: bool,
+    /// The app's override of the platform's gesture tuning, set by [`App::set_gesture_tuning`].
+    gesture_tuning: Option<GestureTuning>,
     /// Origin of the shared clock that phase-locks synced repeating animations.
     pub(crate) synced_animation_epoch: Instant,
     power_mode: PowerMode,
@@ -1093,6 +1095,7 @@ impl App {
                 quitting: false,
                 cursor_hide_mode: CursorHideMode::default(),
                 reduce_motion: false,
+                gesture_tuning: None,
                 synced_animation_epoch,
                 power_mode,
                 accessibility_force_disabled: false,
@@ -1410,6 +1413,23 @@ impl App {
     /// be rendered in a static state instead of animating.
     pub fn reduce_motion(&self) -> bool {
         self.reduce_motion
+    }
+
+    /// The gesture tuning windows open with: the app's override from
+    /// [`App::set_gesture_tuning`], else the platform's, else GPUI's default.
+    pub fn gesture_tuning(&self) -> GestureTuning {
+        self.gesture_tuning.unwrap_or_else(|| {
+            self.platform
+                .gestures()
+                .map_or_else(GestureTuning::default, |gestures| gestures.tuning())
+        })
+    }
+
+    /// Overrides the platform's gesture tuning (slops, timeouts, scroll physics)
+    /// for windows opened after this call; open windows keep theirs. Call it
+    /// before opening the first window.
+    pub fn set_gesture_tuning(&mut self, tuning: GestureTuning) {
+        self.gesture_tuning = Some(tuning);
     }
 
     /// Sets whether non-essential animations (e.g. loading spinners) should be

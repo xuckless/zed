@@ -84,6 +84,10 @@ pub(crate) struct WebWindowInner {
     /// pans must leave them untouched, or scrolling over editable content
     /// flickers the keyboard and drags the caret around.
     pub(crate) touch_tap_candidate: Cell<Option<(i32, Point<Pixels>)>>,
+    /// The gesture recognizer's touch slop for this window
+    /// (`WindowParams::gesture_tuning`), so the shadow above clears exactly
+    /// when gpui's recognizer stops treating the touch as a tap.
+    pub(crate) touch_slop: Pixels,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
     raf_id: Cell<Option<i32>>,
@@ -143,7 +147,7 @@ impl WebWindow {
 
     pub(crate) fn new(
         _handle: AnyWindowHandle,
-        _params: WindowParams,
+        params: WindowParams,
         context: &WgpuContext,
         canvas: web_sys::HtmlCanvasElement,
         surface: wgpu::Surface<'static>,
@@ -223,6 +227,7 @@ impl WebWindow {
             suppress_focus_status_events: Cell::new(false),
             gesture_start_visual_viewport_height: Cell::new(0.0),
             touch_tap_candidate: Cell::new(None),
+            touch_slop: params.gesture_tuning.touch_slop,
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
             raf_id: Cell::new(None),

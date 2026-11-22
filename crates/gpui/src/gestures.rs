@@ -17,8 +17,8 @@ mod velocity_tracker_data;
 mod velocity_tracker_test;
 
 use constants::{
-    kDoubleTapMinTime, kDoubleTapSlop, kDoubleTapTimeout, kLongPressTimeout, kMaxFlingVelocity,
-    kPanSlop, kPrecisePointerHitSlop, kPrecisePointerPanSlop, kPrecisePointerScaleSlop, kScaleSlop,
+    kDoubleTapMinTime, kDoubleTapSlop, kDoubleTapTimeout, kLongPressTimeout, kPanSlop,
+    kPrecisePointerHitSlop, kPrecisePointerPanSlop, kPrecisePointerScaleSlop, kScaleSlop,
     kTouchSlop,
 };
 pub use velocity_tracker::VelocityTrackerKind;
@@ -147,6 +147,8 @@ pub struct GestureTuning {
     /// Minimum release velocity, in pixels per second, required to start
     /// scroll momentum.
     pub min_fling_velocity: f32,
+    /// Release velocities are clamped to this magnitude, in pixels per second.
+    pub max_fling_velocity: f32,
     /// How a touch's release velocity is estimated: one of Flutter's
     /// per-platform velocity trackers.
     pub velocity_tracker: VelocityTrackerKind,
@@ -167,8 +169,9 @@ impl Default for GestureTuning {
             multi_tap_min_interval: kDoubleTapMinTime,
             long_press_duration: kLongPressTimeout,
             scroll_physics: ScrollPhysics::ios(),
-            // BouncingScrollPhysics' kMinFlingVelocity * 2, with the iOS physics above.
+            // BouncingScrollPhysics' fling limits, with the iOS physics above.
             min_fling_velocity: ScrollPhysics::ios().min_fling_velocity(),
+            max_fling_velocity: ScrollPhysics::ios().max_fling_velocity(),
             velocity_tracker: VelocityTrackerKind::IOSScrollViewFling,
         }
     }
@@ -794,7 +797,7 @@ impl TouchGestureRecognizer {
                         && distance > f32::from(self.tuning.scroll_physics.min_fling_distance())
                     {
                         let direction = point(velocity.x / speed, velocity.y / speed);
-                        let speed = speed.min(kMaxFlingVelocity);
+                        let speed = speed.min(self.tuning.max_fling_velocity);
                         if let Some(simulation) =
                             fling_simulation(self.tuning.scroll_physics, speed)
                         {
@@ -1662,6 +1665,39 @@ mod tests {
                 None,
             );
             assert_eq!(recognizer.has_momentum(), flings, "{name}");
+        }
+    }
+
+    /// A 20000 px/s flick flings at the tuning's `max_fling_velocity`:
+    /// (row, max fling velocity).
+    #[test]
+    fn fling_is_clamped_to_the_tunings_max_velocity() {
+        let rows = [
+            ("kMaxFlingVelocity", 8000.),
+            ("BouncingScrollPhysics(fast): kMaxFlingVelocity * 8", 64000.),
+        ];
+        for (name, max_fling_velocity) in rows {
+            let mut recognizer = TouchGestureRecognizer::new(GestureTuning {
+                max_fling_velocity,
+                ..GestureTuning::default()
+            });
+            let now = Instant::now();
+            let touch = TouchId(1);
+            for (ms, y, phase) in [
+                (0, 0., TouchPhase::Started),
+                (10, 200., TouchPhase::Moved),
+                (20, 400., TouchPhase::Moved),
+                (30, 600., TouchPhase::Moved),
+                (30, 600., TouchPhase::Ended),
+            ] {
+                let at = now + Duration::from_millis(ms);
+                recognizer.handle_event_at(&touch_event(touch, phase, 0., y), at, None);
+            }
+            let speed = recognizer
+                .momentum
+                .as_ref()
+                .map(|momentum| momentum.simulation.dx(0.) as f32);
+            assert_eq!(speed, Some(max_fling_velocity.min(20000.)), "{name}");
         }
     }
 

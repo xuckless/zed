@@ -39,11 +39,11 @@ pub(crate) type PlatformScreenCaptureFrame =
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds, Corners,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
-    FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap,
-    LineLayout, MissingGlyphSink, Pixels, PlatformGestures, PlatformInput, Point, Priority,
-    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph,
-    ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea,
-    hash, point, px, size,
+    FontId, FontMetrics, FontRun, ForegroundExecutor, GestureTuning, GlyphId, GpuSpecs, Hsla,
+    ImageSource, Keymap, LineLayout, MissingGlyphSink, Pixels, PlatformGestures, PlatformInput,
+    Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene,
+    ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window,
+    WindowControlArea, hash, point, px, size,
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
@@ -2922,6 +2922,10 @@ pub struct WindowParams {
 
     #[cfg(target_os = "macos")]
     pub use_display_p3: bool,
+
+    /// The tuning the window's gesture recognizer runs with ([`crate::App::gesture_tuning`]).
+    /// A backend that mirrors a recognizer rule, such as the web's tap slop, reads it here.
+    pub gesture_tuning: GestureTuning,
 }
 
 /// Represents the status of how a window should be opened.

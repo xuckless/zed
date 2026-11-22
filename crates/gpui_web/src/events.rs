@@ -1,8 +1,8 @@
 use std::{collections::HashMap, rc::Rc};
 
 use gpui::{
-    Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, GestureTuning,
-    Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
+    Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, Image,
+    ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
     Pixels, PlatformInput, Point, PointerDevice, ScrollDelta, ScrollEvent, ScrollSource,
     TouchEvent, TouchId, TouchPhase, point, px,
@@ -580,8 +580,7 @@ impl WebWindowInner {
                 // pointerup handler.
                 if let Some((pointer_id, start_position)) = this.touch_tap_candidate.get()
                     && pointer_id == event.pointer_id()
-                    && (position - start_position).magnitude()
-                        > f64::from(GestureTuning::default().touch_slop)
+                    && (position - start_position).magnitude() > f64::from(this.touch_slop)
                 {
                     this.touch_tap_candidate.set(None);
                 }

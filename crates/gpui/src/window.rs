@@ -27,9 +27,7 @@ use crate::{
     WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
-use crate::gestures::{
-    BackGestureSource, GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer,
-};
+use crate::gestures::{BackGestureSource, RecognizedTouchGesture, TouchGestureRecognizer};
 use crate::interactive::{PointerDevice, PointerSource, TouchEvent, TouchId, TouchPhase};
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -1752,6 +1750,7 @@ impl Window {
             .map(|(_, bounds)| bounds);
         let window_bounds = window_bounds
             .unwrap_or_else(|| default_bounds(active_window_bounds, display.as_deref()));
+        let gesture_tuning = cx.gesture_tuning();
         let mut platform_window = cx.platform.open_window(
             handle,
             WindowParams {
@@ -1772,6 +1771,7 @@ impl Window {
                 tabbing_identifier,
                 #[cfg(target_os = "macos")]
                 use_display_p3,
+                gesture_tuning,
             },
         )?;
 
@@ -2540,11 +2540,7 @@ impl Window {
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
             last_input_modality: InputModality::Mouse,
-            touch_gestures: TouchGestureRecognizer::new(
-                cx.platform
-                    .gestures()
-                    .map_or_else(GestureTuning::default, |gestures| gestures.tuning()),
-            ),
+            touch_gestures: TouchGestureRecognizer::new(gesture_tuning),
             touch_prediction_enabled: true,
             pointer_source: None,
             touch_routes: FxHashMap::default(),
@@ -3903,7 +3899,7 @@ impl Window {
     /// Restarts touch recognition with the tuning a test passes, in place of
     /// the platform's.
     #[cfg(test)]
-    pub(crate) fn set_gesture_tuning(&mut self, tuning: GestureTuning) {
+    pub(crate) fn set_gesture_tuning(&mut self, tuning: crate::GestureTuning) {
         self.touch_gestures = TouchGestureRecognizer::new(tuning);
     }
 
@@ -8614,12 +8610,13 @@ mod tests {
         AnyWindowHandle, AppContext as _, BackGestureEvent, BackGesturePhase, BackGestureSource,
         Bounds, ContentMask, Context, CursorStyle, DispatchPhase, DragMoveEvent, Empty,
         ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
-        InputEvent as _, InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke,
-        LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-        Pixels, PlatformInput, Point, PointerDevice, PointerSource, Render, RequestFrameOptions,
-        ScaledPixels, ScrollEvent, StatefulInteractiveElement as _, Styled, TestAppContext,
-        ThermalState, TouchDragEvent, TouchEvent, TouchId, TouchPhase, Underline, UnderlineStyle,
-        Window, WindowAppearance, WindowOptions, canvas, div, hsla, point, px, size,
+        GestureTuning, InputEvent as _, InteractiveElement as _, IntoElement, KeyDownEvent,
+        Keystroke, LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+        ParentElement, Pixels, PlatformInput, Point, PointerDevice, PointerSource, Render,
+        RequestFrameOptions, ScaledPixels, ScrollEvent, StatefulInteractiveElement as _, Styled,
+        TestAppContext, ThermalState, TouchDragEvent, TouchEvent, TouchId, TouchPhase, Underline,
+        UnderlineStyle, Window, WindowAppearance, WindowOptions, canvas, div, hsla, point, px,
+        size,
     };
 
     #[gpui::test]
@@ -10540,6 +10537,50 @@ mod tests {
                 cx.executor().advance_clock(Duration::from_millis(8));
             }
             let mut seen = seen.borrow().clone();
+            seen.dedup();
+            assert_eq!(seen, expected, "{name}");
+        }
+    }
+
+    #[gpui::test]
+    fn app_gesture_tuning_overrides_the_platform_for_new_windows(cx: &mut TestAppContext) {
+        let tuning = |touch_slop| GestureTuning {
+            touch_slop: px(touch_slop),
+            ..GestureTuning::default()
+        };
+        let tap = [("down", true), ("up", true)];
+        let pan = [("scroll", true)];
+        // (name, override set before the window opens, finger travel, events seen). The row
+        // without an override runs first: an override stays for the rest of the app.
+        let rows: [(&str, Option<GestureTuning>, f32, &[(&str, bool)]); 4] = [
+            ("no override: kTouchSlop's 18 px, 12 px taps", None, 12., &tap),
+            (
+                "override 8 px (Android's ViewConfiguration): 12 px pans",
+                Some(tuning(8.)),
+                12.,
+                &pan,
+            ),
+            ("override 8 px: 6 px taps", Some(tuning(8.)), 6., &tap),
+            ("override 4 px: 6 px pans", Some(tuning(4.)), 6., &pan),
+        ];
+        for (name, tuning, travel, expected) in rows {
+            if let Some(tuning) = tuning {
+                cx.update(|cx| cx.set_gesture_tuning(tuning));
+            }
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let window = cx.add_window({
+                let seen = seen.clone();
+                move |_, _| PointerSourceRecorder { seen }
+            });
+            dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 10.);
+            dispatch_touch(window, cx, TouchId(1), TouchPhase::Moved, 10. + travel);
+            dispatch_touch(window, cx, TouchId(1), TouchPhase::Ended, 10. + travel);
+            let mut seen: Vec<_> = seen
+                .borrow()
+                .iter()
+                .filter(|(kind, _)| *kind != "render")
+                .map(|(kind, source)| (*kind, source.is_some()))
+                .collect();
             seen.dedup();
             assert_eq!(seen, expected, "{name}");
         }
