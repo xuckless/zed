@@ -70,6 +70,14 @@ pub struct Layout {
     pub stacking: Option<Vec<NativeViewId>>,
 }
 
+impl Layout {
+    /// Whether the scene moves, resizes, shows, hides or restacks a view, whose frame must then reach the screen with
+    /// the scene that moves its opening (`MetalRenderer::draw_placing_native_views`).
+    pub fn places_views(&self) -> bool {
+        !self.placements.is_empty() || self.stacking.is_some()
+    }
+}
+
 /// Works out which attached views the scene moves, shows, hides, or restacks. `attached` is each attached view with
 /// where it was last placed, `stacking` the order the last scene showed them in, back to front.
 pub fn plan_layout(
@@ -267,6 +275,7 @@ mod tests {
             let mut scene = Scene::default();
             scene.native_views = shown;
             let layout = plan_layout(attached, &stacking, &scene, 1., [0., 0., 100., 100.], YAxis::Down);
+            assert_eq!(layout.places_views(), !placements.is_empty() || restacked.is_some(), "{name}");
             assert_eq!(layout.placements, placements, "{name}");
             assert_eq!(layout.stacking, restacked, "{name}");
         }

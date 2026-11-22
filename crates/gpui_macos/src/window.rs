@@ -2219,9 +2219,15 @@ impl PlatformWindow for MacWindow {
         let native_view_layout = native_views::plan_layout(&this, scene);
         native_views::update_background(&mut this, scene);
         native_views::scene_drawn(&mut this, scene);
-        this.renderer.draw(scene);
+        let presented = this
+            .renderer
+            .draw_placing_native_views(scene, native_view_layout.places_views());
         drop(this);
-        native_views::apply_layout(&self.0, native_view_layout);
+        // A scene that never reached the screen has no opening for the views to
+        // move to; the next one plans them again.
+        if presented {
+            native_views::apply_layout(&self.0, native_view_layout);
+        }
     }
 
     unsafe fn attach_native_view(

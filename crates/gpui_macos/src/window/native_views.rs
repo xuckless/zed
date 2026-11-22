@@ -281,8 +281,9 @@ extern "C" fn container_perform_key_equivalent(_: &AnyObject, _: Sel, _: *mut An
 /// A view's frame change reaches the screen a frame or two before the scene
 /// that moves its opening, so the opening briefly uncovers whatever is behind
 /// the views. That is the window's background, which is given the color the
-/// scene asks for. Presenting scenes in step with AppKit would close the gap,
-/// but costs every frame of a window that shows a native view.
+/// scene asks for. A scene that places a view is presented in step with
+/// AppKit's transaction, which closes the gap; the color still covers any
+/// frame the compositor shows early.
 ///
 /// The color stays until a scene without native views is drawn. The last
 /// view's opening is still on screen when the view goes, and would show the

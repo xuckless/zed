@@ -509,13 +509,22 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        self.draw_placing_native_views(scene, false);
+    }
+
+    /// Draws `scene`. `places_native_views` says whether the platform moves, resizes, shows or hides a native view
+    /// with this scene: such a frame is presented with the Core Animation transaction that places the view, so the
+    /// hole and the view reach the screen together. Every other frame presents on its own, as `draw` does, so a
+    /// window waits for the GPU only on frames that place a view. Returns whether the scene was presented: when it
+    /// wasn't, the platform must not place its views either.
+    pub fn draw_placing_native_views(&mut self, scene: &Scene, places_native_views: bool) -> bool {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
                 log::error!(
                     "draw() called on headless renderer - use render_scene_to_image() instead"
                 );
-                return;
+                return false;
             }
         };
         // Native views sit beneath the layer, so it can only be opaque, and
@@ -524,12 +533,25 @@ impl MetalRenderer {
         if shows_native_views != self.shows_native_views {
             self.shows_native_views = shows_native_views;
             layer.setOpaque(self.opaque && !shows_native_views);
+            // The pixels are premultiplied BGRA either way; only whether Core Animation blends them changes.
+            log::info!(
+                "metal layer alpha: {}",
+                if layer.isOpaque() {
+                    "opaque"
+                } else {
+                    "premultiplied, native views show through"
+                }
+            );
+        }
+        let with_transaction = self.presents_with_transaction || places_native_views;
+        if layer.presentsWithTransaction() != with_transaction {
+            layer.setPresentsWithTransaction(with_transaction);
         }
         let drawable = match &mut self.display_link_mode {
             DisplayLinkMode::Attached { drawable } => {
                 let Some(drawable) = drawable.take() else {
                     log::error!("skipped a frame drawn outside its display link's update");
-                    return;
+                    return false;
                 };
                 drawable
             }
@@ -539,7 +561,7 @@ impl MetalRenderer {
                         "failed to retrieve next drawable, drawable size: {:?}",
                         layer.drawableSize()
                     );
-                    return;
+                    return false;
                 };
                 drawable
             }
@@ -556,11 +578,11 @@ impl MetalRenderer {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
                 log::error!("failed to render: {error:#}");
-                return;
+                return false;
             }
         };
 
-        if self.presents_with_transaction {
+        if with_transaction {
             command_buffer.commit();
             command_buffer.waitUntilScheduled();
             drawable.present();
@@ -568,6 +590,7 @@ impl MetalRenderer {
             command_buffer.presentDrawable(ProtocolObject::from_ref(&*drawable));
             command_buffer.commit();
         }
+        true
     }
 
     fn render_frame(
