@@ -1660,9 +1660,11 @@ enum TouchRoute {
     Deciding,
     /// The gesture recognizer, which turns it into mouse and scroll events,
     /// and the pinches of the elements that joined it, deepest first
-    /// ([`Window::join_pinch`]).
+    /// ([`Window::join_pinch`]). `holds_scroll`: it landed on a scroll
+    /// container its overscroll physics is moving ([`Window::hold_scroll`]).
     Gestures {
         pinch: SmallVec<[GlobalElementId; 1]>,
+        holds_scroll: bool,
     },
     /// The element that claimed it: every later phase goes to its touch
     /// listeners wherever it is drawn now, and no events are synthesized.
@@ -3887,8 +3889,20 @@ impl Window {
             touch,
             TouchRoute::Gestures {
                 pinch: SmallVec::new(),
+                holds_scroll: false,
             },
         );
+    }
+
+    /// While a touch's [`TouchPhase::Started`] is dispatched, after the touch
+    /// was left to gestures: it landed on a scroll container whose overscroll
+    /// physics is moving it (a fling, a spring back). As Flutter's
+    /// `HoldScrollActivity`, the touch holds it: it is a drag from its first
+    /// pixel and never a tap (`BallisticScrollActivity.shouldIgnorePointer`).
+    pub(crate) fn hold_scroll(&mut self, touch: TouchId) {
+        if let Some(TouchRoute::Gestures { holds_scroll, .. }) = self.touch_routes.get_mut(&touch) {
+            *holds_scroll = true;
+        }
     }
 
     /// Adds a touch to `owner`'s pinch while the touch's
@@ -3906,6 +3920,7 @@ impl Window {
             touch,
             TouchRoute::Gestures {
                 pinch: smallvec::smallvec![owner.clone()],
+                holds_scroll: false,
             },
         );
     }
@@ -3919,9 +3934,13 @@ impl Window {
         };
         match (route, decided) {
             (route @ TouchRoute::Deciding, decided) => *route = decided,
-            (TouchRoute::Gestures { pinch }, TouchRoute::Gestures { pinch: joins }) => {
-                pinch.extend(joins)
-            }
+            (
+                TouchRoute::Gestures { pinch, .. },
+                TouchRoute::Gestures {
+                    pinch: joins,
+                    holds_scroll: _,
+                },
+            ) => pinch.extend(joins),
             (TouchRoute::Gestures { .. } | TouchRoute::Claimed(_), _) => {}
         }
     }
@@ -3938,6 +3957,18 @@ impl Window {
     /// Returns whether the given entity has captured the current long press.
     pub fn has_long_press_capture<T: 'static>(&self, entity: &Entity<T>) -> bool {
         self.long_press_capture == Some(entity.entity_id())
+    }
+
+    /// The tuning this window's touch recognition runs with.
+    pub(crate) fn gesture_tuning(&self) -> crate::GestureTuning {
+        self.touch_gestures.tuning()
+    }
+
+    /// The finger velocity of the touch fling in progress, in pixels per
+    /// second; zero when none.
+    pub(crate) fn touch_fling_velocity(&self, cx: &App) -> Point<f32> {
+        self.touch_gestures
+            .fling_velocity(cx.background_executor().now())
     }
 
     /// Restarts touch recognition with the tuning a test passes, in place of
@@ -6499,10 +6530,13 @@ impl Window {
             self.mouse_position = mouse_position;
             self.leave_touch_to_gestures(event.id);
         }
-        let (claimed, pinch) = match self.touch_routes.get(&event.id) {
-            Some(TouchRoute::Claimed(_)) => (true, SmallVec::new()),
-            Some(TouchRoute::Gestures { pinch }) => (false, pinch.clone()),
-            Some(TouchRoute::Deciding) | None => (false, SmallVec::new()),
+        let (claimed, pinch, holds_scroll) = match self.touch_routes.get(&event.id) {
+            Some(TouchRoute::Claimed(_)) => (true, SmallVec::new(), false),
+            Some(TouchRoute::Gestures {
+                pinch,
+                holds_scroll,
+            }) => (false, pinch.clone(), *holds_scroll),
+            Some(TouchRoute::Deciding) | None => (false, SmallVec::new(), false),
         };
         if claimed && event.phase != TouchPhase::Started {
             self.dispatch_mouse_event(event, cx);
@@ -6548,9 +6582,15 @@ impl Window {
                 .find(|hitbox| hitbox.id == *id)
                 .map(|hitbox| hitbox.bounds)
         });
-        let recognized_gestures =
+        let mut recognized_gestures =
             self.touch_gestures
                 .handle_event(&event, cx.background_executor().now(), target);
+        if event.phase == crate::TouchPhase::Started
+            && holds_scroll
+            && let Some(hold) = self.touch_gestures.hold(event.id)
+        {
+            recognized_gestures.push((event.device, hold));
+        }
         if event.phase == crate::TouchPhase::Started
             && let Some(touch_drag) = self.touch_gestures.offer_touch_drag(event.id)
         {

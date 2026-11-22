@@ -46,6 +46,9 @@ where
         interactivity: Interactivity {
             element_id: Some(id),
             base_style: Box::new(base_style),
+            // Its visible range assumes an in-range offset: a hard stop
+            // (`StatefulInteractiveElement::overscroll`).
+            overscroll: Some(crate::overscroll::Overscroll::None),
             ..Interactivity::new()
         },
         scroll_handle: None,

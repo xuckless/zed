@@ -270,6 +270,9 @@ pub(crate) unsafe fn platform_input_from_native(
                 let phase = match native_event.phase() {
                     NSEventPhase::MayBegin | NSEventPhase::Began => TouchPhase::Started,
                     NSEventPhase::Ended => TouchPhase::Ended,
+                    // Fingers rested on the trackpad (MayBegin) and lifted without
+                    // scrolling: the pan that started ends, as Flutter's kPanZoomEnd.
+                    NSEventPhase::Cancelled => TouchPhase::Cancelled,
                     _ => TouchPhase::Moved,
                 };
 

@@ -15,6 +15,10 @@
 //! and Tailwind-like styling that you can use to build your own custom elements. Div is
 //! constructed by combining these two systems into an all-in-one element.
 
+use crate::overscroll::{
+    AxisDirection, AxisExtents, DragSource, DragStep, GLOW_COLOR, Overscroll, OverscrollPosition,
+    ScrollInput, stretch_displacement,
+};
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, BackGestureEvent, Bounds, ClickEvent,
     DispatchPhase, Display, Element, ElementId, Entity, EntityId, ExternalDragPayload,
@@ -27,6 +31,7 @@ use crate::{
     Task, TooltipId, TouchClickEvent, TouchEvent, TouchPhase, Visibility, Window,
     WindowControlArea, point, px, size,
 };
+use crate::{ContentMask, Hsla, PathBuilder, rgb};
 use collections::HashMap;
 use gpui_util::ResultExt;
 use refineable::Refineable;
@@ -1609,6 +1614,16 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// What this container does when a touch or trackpad drags or flings it
+    /// past an edge, in place of the window's
+    /// [`GestureTuning::overscroll`](crate::GestureTuning::overscroll);
+    /// `Overscroll::None` opts it out. A `uniform_list` starts with `None`:
+    /// its visible range assumes an in-range offset.
+    fn overscroll(mut self, overscroll: Overscroll) -> Self {
+        self.interactivity().overscroll = Some(overscroll);
+        self
+    }
+
     /// Restrict scrolling of this element to the axis of the input gesture.
     ///
     /// See [`Style::restrict_scroll_to_axis`](crate::Style::restrict_scroll_to_axis) for details.
@@ -2150,6 +2165,8 @@ impl Element for Div {
             (child_max - child_min).into()
         };
 
+        let overscroll_position = self.interactivity.overscroll_position.clone();
+        let child_layout_ids = &request_layout.child_layout_ids;
         self.interactivity.prepaint(
             global_id,
             inspector_id,
@@ -2163,18 +2180,48 @@ impl Element for Div {
                     return hitbox;
                 }
 
+                let stretch = overscroll_position.as_ref().map_or((0., 0.), |position| {
+                    let position = position.borrow();
+                    (position.x.stretch_strength(), position.y.stretch_strength())
+                });
+                // The overscroll stretch moves each child as scaling the
+                // content about the stretched edge would.
+                let child_count = self.children.len();
+                let mut prepaint_child = |index: usize, window: &mut Window, cx: &mut App| {
+                    let Some(child) = self.children.get_mut(index) else {
+                        return;
+                    };
+                    let offset = match (stretch, child_layout_ids.get(index)) {
+                        ((0., 0.), _) | (_, None) => Point::default(),
+                        ((x, y), Some(layout_id)) => {
+                            let center = window.layout_bounds(*layout_id).center();
+                            point(
+                                px(stretch_displacement(
+                                    x,
+                                    center.x.to_f64(),
+                                    bounds.left().to_f64(),
+                                    bounds.right().to_f64(),
+                                ) as f32),
+                                px(stretch_displacement(
+                                    y,
+                                    center.y.to_f64(),
+                                    bounds.top().to_f64(),
+                                    bounds.bottom().to_f64(),
+                                ) as f32),
+                            )
+                        }
+                    };
+                    window.with_element_offset(offset, |window| child.prepaint(window, cx));
+                };
                 window.with_image_cache(image_cache, |window| {
                     window.with_element_offset(scroll_offset, |window| {
                         if let Some(order_fn) = &self.prepaint_order_fn {
-                            let order = order_fn(window, cx);
-                            for idx in order {
-                                if let Some(child) = self.children.get_mut(idx) {
-                                    child.prepaint(window, cx);
-                                }
+                            for index in order_fn(window, cx) {
+                                prepaint_child(index, window, cx);
                             }
                         } else {
-                            for child in &mut self.children {
-                                child.prepaint(window, cx);
+                            for index in 0..child_count {
+                                prepaint_child(index, window, cx);
                             }
                         }
                     });
@@ -2205,6 +2252,7 @@ impl Element for Div {
             .as_mut()
             .map(|provider| provider.provide(window, cx));
 
+        let overscroll_position = self.interactivity.overscroll_position.clone();
         window.with_image_cache(image_cache, |window| {
             self.interactivity.paint(
                 global_id,
@@ -2221,6 +2269,23 @@ impl Element for Div {
 
                     for child in &mut self.children {
                         child.paint(window, cx);
+                    }
+
+                    // Material 2's overscroll glow, over the children.
+                    let glows = overscroll_position
+                        .as_ref()
+                        .map(|position| position.borrow().glow_shapes(bounds));
+                    for glow in glows.into_iter().flatten() {
+                        let mut path = PathBuilder::fill();
+                        path.add_polygon(&glow.outline, true);
+                        let Ok(path) = path.build() else {
+                            continue;
+                        };
+                        let color = Hsla::from(rgb(GLOW_COLOR)).opacity(glow.opacity);
+                        window
+                            .with_content_mask(Some(ContentMask { bounds: glow.clip }), |window| {
+                                window.paint_path(path, color)
+                            });
                     }
                 },
             )
@@ -2273,6 +2338,9 @@ pub struct Interactivity {
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
+    /// This container's overscroll; `None` takes the window's gesture tuning.
+    pub(crate) overscroll: Option<Overscroll>,
+    pub(crate) overscroll_position: Option<Rc<RefCell<OverscrollPosition>>>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
     /// by focus, active, etc.
@@ -2401,6 +2469,8 @@ impl Interactivity {
                     let scroll_handle_state = scroll_handle.0.borrow();
                     self.scroll_offset = Some(scroll_handle_state.offset.clone());
                     self.ongoing_scroll = Some(scroll_handle_state.ongoing_scroll.clone());
+                    self.overscroll_position =
+                        Some(scroll_handle_state.overscroll_position.clone());
                 } else if (self.base_style.overflow.x == Some(Overflow::Scroll)
                     || self.base_style.overflow.y == Some(Overflow::Scroll))
                     && let Some(element_state) = element_state.as_mut()
@@ -2415,6 +2485,12 @@ impl Interactivity {
                         element_state
                             .ongoing_scroll
                             .get_or_insert_with(|| Rc::new(RefCell::new(OngoingScroll::default())))
+                            .clone(),
+                    );
+                    self.overscroll_position = Some(
+                        element_state
+                            .overscroll_position
+                            .get_or_insert_with(Rc::default)
                             .clone(),
                     );
                 }
@@ -2568,7 +2644,7 @@ impl Interactivity {
         bounds: Bounds<Pixels>,
         style: &Style,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Point<Pixels> {
         fn round_to_two_decimals(pixels: Pixels) -> Pixels {
             const ROUNDING_FACTOR: f32 = 100.0;
@@ -2617,11 +2693,57 @@ impl Interactivity {
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
             // were removed or the bounds became larger).
             let mut scroll_offset = scroll_offset.borrow_mut();
+            let scroll_offset = &mut *scroll_offset;
 
-            scroll_offset.x = scroll_offset.x.clamp(-scroll_max.x, px(0.));
+            // While a touch drags or flings an axis, the overscroll physics
+            // owns it and may leave it past the edge; it springs back itself.
+            let mut moving = Point::<bool>::default();
+            let tuning = window.gesture_tuning();
+            if let Some(position) = self.overscroll_position.as_ref()
+                && self.overscroll.unwrap_or(tuning.overscroll) != Overscroll::None
+            {
+                let now = cx.background_executor().now();
+                let scale = f64::from(window.scale_factor());
+                let mut animating = false;
+                let OverscrollPosition { x, y } = &mut *position.borrow_mut();
+                for (axis, max, viewport, cross, offset, moving) in [
+                    (
+                        x,
+                        scroll_max.x,
+                        bounds.size.width,
+                        bounds.size.height,
+                        &mut scroll_offset.x,
+                        &mut moving.x,
+                    ),
+                    (
+                        y,
+                        scroll_max.y,
+                        bounds.size.height,
+                        bounds.size.width,
+                        &mut scroll_offset.y,
+                        &mut moving.y,
+                    ),
+                ] {
+                    let extents = AxisExtents {
+                        max_scroll_extent: max.to_f64(),
+                        viewport: viewport.to_f64(),
+                        cross_extent: cross.to_f64(),
+                        scale,
+                    };
+                    axis.layout(extents, offset, tuning.scroll_physics, now);
+                    *moving = axis.is_moving();
+                    animating |= axis.is_animating();
+                }
+                if animating {
+                    window.request_animation_frame();
+                }
+            }
+            if !moving.x {
+                scroll_offset.x = scroll_offset.x.clamp(-scroll_max.x, px(0.));
+            }
             if scroll_to_bottom {
                 scroll_offset.y = -scroll_max.y;
-            } else {
+            } else if !moving.y {
                 scroll_offset.y = scroll_offset.y.clamp(-scroll_max.y, px(0.));
             }
 
@@ -2935,6 +3057,7 @@ impl Interactivity {
             })
         } else if handles_gestures || pinch_owner.is_some() {
             let (hitbox, pinch_owner) = (hitbox.clone(), pinch_owner.clone());
+            let overscroll_position = self.overscroll_position.clone();
             window.on_mouse_event(move |event: &TouchEvent, phase, window, _| {
                 if phase == DispatchPhase::Bubble
                     && event.phase == TouchPhase::Started
@@ -2943,6 +3066,12 @@ impl Interactivity {
                     match &pinch_owner {
                         Some(owner) => window.join_pinch(event.id, owner),
                         None => window.leave_touch_to_gestures(event.id),
+                    }
+                    if overscroll_position
+                        .as_ref()
+                        .is_some_and(|position| position.borrow().holds_touch())
+                    {
+                        window.hold_scroll(event.id);
                     }
                 }
             })
@@ -3548,6 +3677,8 @@ impl Interactivity {
     ) {
         if let Some(scroll_offset) = self.scroll_offset.clone() {
             let ongoing_scroll = self.ongoing_scroll.clone();
+            let overscroll_position = self.overscroll_position.clone();
+            let overscroll = self.overscroll;
             let overflow = style.overflow;
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
@@ -3557,6 +3688,7 @@ impl Interactivity {
             window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
+                    let scroll_offset = &mut *scroll_offset;
                     let old_scroll_offset = *scroll_offset;
                     let mut delta = event.delta.pixel_delta(line_height);
 
@@ -3594,8 +3726,81 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
-                    scroll_offset.y += delta_y;
-                    scroll_offset.x += delta_x;
+                    let tuning = window.gesture_tuning();
+                    let overscroll = overscroll.unwrap_or(tuning.overscroll);
+                    let overscrolling = overscroll_position
+                        .as_ref()
+                        .filter(|_| overscroll != Overscroll::None);
+                    let now = cx.background_executor().now();
+                    let input = overscrolling.map(|position| {
+                        let input = position.borrow().scroll_input(
+                            event.source,
+                            event.touch_phase,
+                            event.delta.precise(),
+                        );
+                        (position, input)
+                    });
+                    if let Some((position, input @ (ScrollInput::Touch | ScrollInput::Trackpad))) =
+                        input
+                    {
+                        let velocity = window.touch_fling_velocity(cx);
+                        let pan = event.position - hitbox.origin;
+                        let OverscrollPosition { x, y } = &mut *position.borrow_mut();
+                        let axes = [
+                            (
+                                x,
+                                overflow.x,
+                                delta_x,
+                                velocity.x,
+                                pan.y,
+                                AxisDirection::Right,
+                            ),
+                            (
+                                y,
+                                overflow.y,
+                                delta_y,
+                                velocity.y,
+                                pan.x,
+                                AxisDirection::Down,
+                            ),
+                        ];
+                        let offsets = [&mut scroll_offset.x, &mut scroll_offset.y];
+                        for ((axis, overflow, delta, velocity, cross, direction), offset) in
+                            axes.into_iter().zip(offsets)
+                        {
+                            if overflow != Overflow::Scroll {
+                                continue;
+                            }
+                            let source = if input == ScrollInput::Touch {
+                                DragSource::Touch {
+                                    velocity: f64::from(velocity),
+                                }
+                            } else {
+                                DragSource::Trackpad
+                            };
+                            let step = DragStep {
+                                phase: event.touch_phase,
+                                delta: delta.to_f64(),
+                                source,
+                                cross_axis_offset: cross.to_f64(),
+                            };
+                            axis.handle_drag(step, offset, &tuning, overscroll, direction, now);
+                        }
+                        // The stretch can change without the offset.
+                        cx.notify(current_view);
+                    } else if let Some((_, ScrollInput::Momentum)) = input {
+                        // The axes fling themselves.
+                    } else {
+                        // A wheel stops a drag or fling and never overscrolls,
+                        // as in Flutter.
+                        if let Some((position, _)) = input {
+                            let OverscrollPosition { x, y } = &mut *position.borrow_mut();
+                            x.stop(scroll_offset.x, now);
+                            y.stop(scroll_offset.y, now);
+                        }
+                        scroll_offset.y += delta_y;
+                        scroll_offset.x += delta_x;
+                    }
                     if *scroll_offset != old_scroll_offset {
                         cx.notify(current_view);
                     }
@@ -3840,6 +4045,7 @@ pub struct InteractiveElementState {
     pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
+    overscroll_position: Option<Rc<RefCell<OverscrollPosition>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
     long_press_tooltip_active: Option<Rc<Cell<bool>>>,
 }
@@ -4428,6 +4634,7 @@ impl ScrollAnchor {
 struct ScrollHandleState {
     offset: Rc<RefCell<Point<Pixels>>>,
     ongoing_scroll: Rc<RefCell<OngoingScroll>>,
+    overscroll_position: Rc<RefCell<OverscrollPosition>>,
     bounds: Bounds<Pixels>,
     max_offset: Point<Pixels>,
     child_bounds: Vec<Bounds<Pixels>>,

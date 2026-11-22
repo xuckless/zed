@@ -21,8 +21,9 @@ use constants::{
     kPrecisePointerHitSlop, kPrecisePointerPanSlop, kPrecisePointerScaleSlop, kScaleSlop,
     kTouchSlop,
 };
+use velocity_tracker::VelocityEstimate;
+pub(crate) use velocity_tracker::VelocityTracker;
 pub use velocity_tracker::VelocityTrackerKind;
-use velocity_tracker::{VelocityEstimate, VelocityTracker};
 
 use std::mem;
 use std::time::Duration;
@@ -33,7 +34,8 @@ use smallvec::SmallVec;
 use crate::{
     Axis, Bounds, GestureEvent, InputEvent, IsZero, Modifiers, MouseButton, MouseDownEvent,
     MouseEvent, MouseUpEvent, Pixels, PlatformInput, Point, PointerDevice, ScrollDelta,
-    ScrollEvent, ScrollSource, TouchEvent, TouchId, TouchPhase, point, px, seal::Sealed,
+    ScrollEvent, ScrollSource, TouchEvent, TouchId, TouchPhase, overscroll::Overscroll, point, px,
+    seal::Sealed,
 };
 
 mod pinch;
@@ -157,6 +159,10 @@ pub struct GestureTuning {
     /// How a touch's release velocity is estimated: one of Flutter's
     /// per-platform velocity trackers.
     pub velocity_tracker: VelocityTrackerKind,
+    /// What scroll containers do when a touch drags or flings them past an
+    /// edge, unless a container sets its own
+    /// ([`StatefulInteractiveElement::overscroll`](crate::StatefulInteractiveElement::overscroll)).
+    pub overscroll: Overscroll,
 }
 
 // Flutter's gesture constants (constants.rs), whose recognizer tests these
@@ -178,7 +184,19 @@ impl Default for GestureTuning {
             min_fling_velocity: ScrollPhysics::ios().min_fling_velocity(),
             max_fling_velocity: ScrollPhysics::ios().max_fling_velocity(),
             velocity_tracker: VelocityTrackerKind::IOSScrollViewFling,
+            // GPUI's hard stop at the edge; platforms that overscroll set it.
+            overscroll: Overscroll::None,
         }
+    }
+}
+
+impl GestureTuning {
+    /// Flutter's `isFlingGesture` (monodrag.dart): a release is a fling when
+    /// its speed (px/s) and the distance its estimate covers (px) both pass
+    /// the minimums.
+    pub(crate) fn is_fling_gesture(&self, speed: f32, distance: f32) -> bool {
+        speed > self.min_fling_velocity
+            && distance > f32::from(self.scroll_physics.min_fling_distance())
     }
 }
 
@@ -829,11 +847,7 @@ impl TouchGestureRecognizer {
                     let distance = (offset.x.powi(2) + offset.y.powi(2)).sqrt();
                     let mut release_delta = event.position - touch.emitted_position;
                     lock_delta_to_axis(&mut release_delta, axis);
-                    // Flutter's isFlingGesture (monodrag.dart): fast enough,
-                    // and far enough over the samples the estimate used.
-                    if speed > self.tuning.min_fling_velocity
-                        && distance > f32::from(self.tuning.scroll_physics.min_fling_distance())
-                    {
+                    if self.tuning.is_fling_gesture(speed, distance) {
                         let direction = point(velocity.x / speed, velocity.y / speed);
                         let speed = speed.min(self.tuning.max_fling_velocity);
                         if let Some(simulation) =
@@ -974,6 +988,25 @@ impl TouchGestureRecognizer {
         };
     }
 
+    /// A touch that holds a moving scroll container (Flutter's
+    /// `HoldScrollActivity`) is a pan from its first pixel, as one that
+    /// catches this recognizer's fling is: it opens the scroll stream at once
+    /// and never taps or long-presses.
+    pub(crate) fn hold(&mut self, id: TouchId) -> Option<RecognizedTouchGesture> {
+        match mem::replace(&mut self.state, TouchGestureState::Idle) {
+            TouchGestureState::Pending { touch, .. } if touch.id == id => {
+                let started =
+                    scroll_event(touch.start_position, Point::default(), TouchPhase::Started);
+                self.state = TouchGestureState::Caught(touch);
+                Some(RecognizedTouchGesture::Scroll(started))
+            }
+            other => {
+                self.state = other;
+                None
+            }
+        }
+    }
+
     pub(crate) fn offer_touch_drag(&mut self, id: TouchId) -> Option<RecognizedTouchGesture> {
         let TouchGestureState::Pending {
             touch,
@@ -1011,6 +1044,19 @@ impl TouchGestureRecognizer {
 
     pub(crate) fn has_momentum(&self) -> bool {
         self.momentum.is_some()
+    }
+
+    /// The finger velocity of the fling in progress at `now`, in pixels per
+    /// second (zero when none): during the release's scroll step, the
+    /// release velocity Flutter's `DragEndDetails` carries.
+    pub(crate) fn fling_velocity(&self, now: Instant) -> Point<f32> {
+        self.momentum
+            .as_ref()
+            .map_or_else(Point::default, |momentum| {
+                let elapsed = now.duration_since(momentum.started_at).as_secs_f64();
+                let speed = momentum.simulation.dx(elapsed) as f32;
+                point(momentum.direction.x * speed, momentum.direction.y * speed)
+            })
     }
 
     /// Advances post-fling momentum by one frame, returning the scroll step
@@ -1070,7 +1116,7 @@ fn scroll_event(
 }
 
 #[cfg(test)]
-mod recognizer_tests;
+pub(crate) mod recognizer_tests;
 
 #[cfg(test)]
 mod tests {
