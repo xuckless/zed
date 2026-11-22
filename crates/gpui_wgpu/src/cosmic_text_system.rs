@@ -129,27 +129,22 @@ impl CosmicTextSystem {
     }
 
     pub fn new(system_font_fallback: &str) -> Self {
-        let font_system = FontSystem::new();
-
-        Self(RwLock::new(CosmicTextSystemState {
-            font_system,
-            scratch: ShapeBuffer::default(),
-            swash_scale_context: ScaleContext::new(),
-            pending_glyph_images: HashMap::default(),
-            loaded_fonts: Vec::new(),
-            loaded_font_ids_by_key: HashMap::default(),
-            font_ids_by_family_cache: HashMap::default(),
-            system_font_fallback: system_font_fallback.to_string(),
-            missing_glyph_sink: None,
-        }))
+        Self::new_with_font_system(FontSystem::new(), system_font_fallback)
     }
 
     pub fn new_without_system_fonts(system_font_fallback: &str) -> Self {
-        let font_system = FontSystem::new_with_locale_and_db(
-            "en-US".to_string(),
-            cosmic_text::fontdb::Database::new(),
-        );
+        Self::new_with_font_system(
+            FontSystem::new_with_locale_and_db(
+                "en-US".to_string(),
+                cosmic_text::fontdb::Database::new(),
+            ),
+            system_font_fallback,
+        )
+    }
 
+    /// Uses a caller-built `FontSystem`: its font database, locale and fallback lists. For platforms
+    /// where fontdb finds no system fonts (Android) or where the caller picks the fonts and their order.
+    pub fn new_with_font_system(font_system: FontSystem, system_font_fallback: &str) -> Self {
         Self(RwLock::new(CosmicTextSystemState {
             font_system,
             scratch: ShapeBuffer::default(),
