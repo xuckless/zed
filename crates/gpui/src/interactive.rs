@@ -134,6 +134,34 @@ pub struct TouchEvent {
     pub predicted_position: Option<Point<Pixels>>,
     /// Normalized touch force in `0.0..=1.0`, if the hardware reports it.
     pub force: Option<f32>,
+    /// The device making contact: a finger, or a stylus or mouse button the
+    /// platform reports as a touch.
+    pub device: PointerDevice,
+}
+
+/// The kind of device behind a pointer event.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PointerDevice {
+    /// A mouse, trackpad or other indirect pointer.
+    Mouse,
+    /// A finger on a touch screen. The default, so a [`TouchEvent`] built
+    /// with `..Default::default()` stays a finger.
+    #[default]
+    Touch,
+    /// A stylus.
+    Pen,
+}
+
+/// Where the pointer event being dispatched came from; see
+/// [`Window::pointer_source`](crate::Window::pointer_source).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PointerSource {
+    /// The device that produced the input.
+    pub device: PointerDevice,
+    /// Whether GPUI or the platform built this event from touches (a tap's
+    /// mouse press and release, a pan's scroll, a long press) rather than
+    /// the device reporting it directly.
+    pub synthesized: bool,
 }
 
 impl Sealed for TouchEvent {}

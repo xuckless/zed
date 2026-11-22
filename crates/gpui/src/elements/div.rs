@@ -4541,7 +4541,7 @@ mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, Context, GestureTuning, InputEvent, IntoElement,
-        Keystroke, MouseMoveEvent, TestAppContext, TouchEvent, TouchId, canvas,
+        Keystroke, MouseMoveEvent, PointerDevice, TestAppContext, TouchEvent, TouchId, canvas,
         util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
@@ -5030,6 +5030,7 @@ mod tests {
                         position: touch_position,
                         predicted_position: None,
                         force: None,
+                        device: PointerDevice::Touch,
                     }
                     .to_platform_input(),
                     cx,
@@ -5056,6 +5057,7 @@ mod tests {
                         position: moved_position,
                         predicted_position: None,
                         force: None,
+                        device: PointerDevice::Touch,
                     }
                     .to_platform_input(),
                     cx,
@@ -5077,6 +5079,7 @@ mod tests {
                         position: moved_position,
                         predicted_position: None,
                         force: None,
+                        device: PointerDevice::Touch,
                     }
                     .to_platform_input(),
                     cx,
@@ -5361,6 +5364,7 @@ mod tests {
                     phase: TouchPhase::Started,
                     position: point(px(75.), px(75.)),
                     force: None,
+                    device: PointerDevice::Touch,
                     predicted_position: None,
                 };
                 window.dispatch_event(started.clone().to_platform_input(), cx);
@@ -5420,6 +5424,7 @@ mod tests {
                             position: point(px(75.), px(vertical_position)),
                             predicted_position: None,
                             force: None,
+                            device: PointerDevice::Touch,
                         }
                         .to_platform_input(),
                         cx,

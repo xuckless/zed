@@ -4,8 +4,8 @@ use gpui::{
     Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, GestureTuning,
     Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
-    Pixels, PlatformInput, Point, ScrollDelta, ScrollEvent, ScrollSource, TouchEvent, TouchId,
-    TouchPhase, point, px,
+    Pixels, PlatformInput, Point, PointerDevice, ScrollDelta, ScrollEvent, ScrollSource,
+    TouchEvent, TouchId, TouchPhase, point, px,
 };
 use wasm_bindgen::prelude::*;
 
@@ -274,6 +274,7 @@ impl WebWindowInner {
                     position,
                     predicted_position: None,
                     force: None,
+                    device: PointerDevice::Touch,
                 }));
                 // Keyboard and IME focus intentionally do not change here:
                 // whether this touch is a tap or a pan is only known at
@@ -347,6 +348,7 @@ impl WebWindowInner {
                     position,
                     predicted_position: None,
                     force: None,
+                    device: PointerDevice::Touch,
                 }));
 
                 // A keyboard opening or closing mid-gesture reflows the
@@ -459,6 +461,7 @@ impl WebWindowInner {
                     position: pointer_position_in_element(&event),
                     predicted_position: None,
                     force: None,
+                    device: PointerDevice::Touch,
                 }));
             } else {
                 this.pressed_button.set(None);
@@ -588,6 +591,7 @@ impl WebWindowInner {
                     position,
                     predicted_position: predicted_pointer_position(&event, position),
                     force: None,
+                    device: PointerDevice::Touch,
                 }));
                 return;
             }

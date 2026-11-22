@@ -28,7 +28,7 @@ use crate::{
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
-use crate::interactive::TouchEvent;
+use crate::interactive::{PointerDevice, PointerSource, TouchEvent};
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 use derive_more::{Deref, DerefMut};
@@ -1303,6 +1303,8 @@ pub struct Window {
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
     touch_prediction_enabled: bool,
+    /// `Some` only while a pointer event is being dispatched.
+    pointer_source: Option<PointerSource>,
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
@@ -1639,6 +1641,37 @@ fn default_bounds(
         (false, false) => display_bounds.origin,
     };
     window_bounds_ctor(Bounds::new(final_origin, base_size))
+}
+
+/// The pointer behind each platform input: one arm per variant, so a new
+/// variant must pick its row. Keys carry no pointer. Gestures the core
+/// recognizes from touches are not platform input:
+/// `dispatch_recognized_touch_gesture` names their touch.
+fn pointer_source(event: &PlatformInput) -> Option<PointerSource> {
+    let (device, synthesized) = match event {
+        PlatformInput::KeyDown(_)
+        | PlatformInput::KeyUp(_)
+        | PlatformInput::ModifiersChanged(_) => {
+            return None;
+        }
+        PlatformInput::MouseDown(_)
+        | PlatformInput::MouseUp(_)
+        | PlatformInput::MousePressure(_)
+        | PlatformInput::MouseMove(_)
+        | PlatformInput::MouseExited(_)
+        | PlatformInput::Scroll(_)
+        | PlatformInput::Pinch(_)
+        | PlatformInput::FileDrop(_) => (PointerDevice::Mouse, false),
+        PlatformInput::Touch(touch) => (touch.device, false),
+        // The platform recognized these from touches it does not name.
+        PlatformInput::LongPress(_)
+        | PlatformInput::TouchDrag(_)
+        | PlatformInput::BackGesture(_) => (PointerDevice::Touch, true),
+    };
+    Some(PointerSource {
+        device,
+        synthesized,
+    })
 }
 
 impl Window {
@@ -2493,6 +2526,7 @@ impl Window {
                     .map_or_else(GestureTuning::default, |gestures| gestures.tuning()),
             ),
             touch_prediction_enabled: true,
+            pointer_source: None,
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
@@ -3824,6 +3858,15 @@ impl Window {
     /// Returns whether the last input event came from a touch screen.
     pub fn last_input_was_touch(&self) -> bool {
         self.last_input_modality == InputModality::Touch
+    }
+
+    /// The device behind the pointer event being dispatched, and whether it
+    /// was synthesized from touches. Valid for exactly the duration of each
+    /// pointer event's dispatch, including the mouse and scroll events
+    /// recognized from a touch; `None` at any other time (during key events,
+    /// render, or after the event returns).
+    pub fn pointer_source(&self) -> Option<PointerSource> {
+        self.pointer_source
     }
 
     /// The current state of the keyboard's capslock
@@ -6130,6 +6173,9 @@ impl Window {
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
 
+        // Restored afterwards, so a nested dispatch cannot leave a stale value.
+        let outer_pointer_source = mem::replace(&mut self.pointer_source, pointer_source(&event));
+
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.
@@ -6267,6 +6313,7 @@ impl Window {
         // Must run after the move is dispatched: the platform owns the gesture afterwards, so this
         // is the last chance for drag listeners to see the pointer leave and reset their state.
         self.promote_external_drag_to_platform(&event, cx);
+        self.pointer_source = outer_pointer_source;
 
         let caused_invalidation = self.invalidator.update_count() > update_count_before;
         if caused_invalidation {
@@ -6337,7 +6384,7 @@ impl Window {
         if event.phase == crate::TouchPhase::Started
             && let Some(touch_drag) = self.touch_gestures.offer_touch_drag(event.id)
         {
-            self.dispatch_recognized_touch_gesture(touch_drag, cx);
+            self.dispatch_recognized_touch_gesture(touch_drag, event.device, cx);
         }
         if event.phase == crate::TouchPhase::Started
             && self.touch_gestures.pending_long_press().is_some()
@@ -6345,9 +6392,9 @@ impl Window {
             self.long_press_capture = None;
         }
         let mut tapped = false;
-        for gesture in recognized_gestures {
+        for (device, gesture) in recognized_gestures {
             tapped |= matches!(gesture, RecognizedTouchGesture::Tap { .. });
-            self.dispatch_recognized_touch_gesture(gesture, cx);
+            self.dispatch_recognized_touch_gesture(gesture, device, cx);
         }
         if event.phase == crate::TouchPhase::Started {
             self.schedule_long_press_timer(cx);
@@ -6360,14 +6407,29 @@ impl Window {
         // are registered during draw, so draw now to make them reflect any
         // focus change the tap just caused.
         if tapped && self.invalidator.is_dirty() {
+            // Render sees no pointer source, as outside dispatch.
+            let pointer_source = self.pointer_source.take();
             self.draw(cx).clear(cx);
+            self.pointer_source = pointer_source;
         }
         if self.touch_gestures.has_momentum() {
             self.schedule_touch_momentum_tick();
         }
     }
 
-    fn dispatch_recognized_touch_gesture(&mut self, gesture: RecognizedTouchGesture, cx: &mut App) {
+    /// `device` is that of the touch the gesture was recognized from, so a pen
+    /// and a finger down together each label their own gestures.
+    fn dispatch_recognized_touch_gesture(
+        &mut self,
+        gesture: RecognizedTouchGesture,
+        device: PointerDevice,
+        cx: &mut App,
+    ) {
+        // Timers (long press, momentum) dispatch outside `dispatch_event`.
+        let outer_pointer_source = self.pointer_source.replace(PointerSource {
+            device,
+            synthesized: true,
+        });
         match gesture {
             RecognizedTouchGesture::Scroll(scroll_wheel) => {
                 self.mouse_position = scroll_wheel.position;
@@ -6418,11 +6480,12 @@ impl Window {
                 }
             }
         }
+        self.pointer_source = outer_pointer_source;
     }
 
     fn schedule_long_press_timer(&mut self, cx: &mut App) {
         self.long_press_timer.take();
-        let Some((touch_id, duration)) = self.touch_gestures.pending_long_press() else {
+        let Some((touch_id, device, duration)) = self.touch_gestures.pending_long_press() else {
             return;
         };
         self.long_press_timer = Some(self.spawn(cx, async move |cx| {
@@ -6430,7 +6493,7 @@ impl Window {
             cx.update(move |window, cx| {
                 window.long_press_timer.take();
                 if let Some(gesture) = window.touch_gestures.offer_long_press(touch_id) {
-                    window.dispatch_recognized_touch_gesture(gesture, cx);
+                    window.dispatch_recognized_touch_gesture(gesture, device, cx);
                 }
             })
             .with_context(|| {
@@ -6445,8 +6508,8 @@ impl Window {
 
     fn schedule_touch_momentum_tick(&mut self) {
         self.on_next_frame(|window, cx| {
-            if let Some(gesture) = window.touch_gestures.tick_momentum() {
-                window.dispatch_recognized_touch_gesture(gesture, cx);
+            if let Some((device, gesture)) = window.touch_gestures.tick_momentum() {
+                window.dispatch_recognized_touch_gesture(gesture, device, cx);
             }
             if window.touch_gestures.has_momentum() {
                 window.schedule_touch_momentum_tick();
@@ -8424,10 +8487,10 @@ mod tests {
         ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle, InputEvent as _,
         InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke, LongPressEvent, MouseButton,
         MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, PlatformInput, Point,
-        Render, RequestFrameOptions, ScaledPixels, StatefulInteractiveElement as _, Styled,
-        TestAppContext, ThermalState, TouchDragEvent, TouchEvent, TouchId, TouchPhase, Underline,
-        UnderlineStyle, Window, WindowAppearance, WindowOptions, canvas, div, hsla, point, px,
-        size,
+        PointerDevice, PointerSource, Render, RequestFrameOptions, ScaledPixels, ScrollEvent,
+        StatefulInteractiveElement as _, Styled, TestAppContext, ThermalState, TouchDragEvent,
+        TouchEvent, TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance,
+        WindowOptions, canvas, div, hsla, point, px, size,
     };
 
     #[gpui::test]
@@ -10085,6 +10148,206 @@ mod tests {
         }
     }
 
+    type SeenSources = Rc<RefCell<Vec<(&'static str, Option<PointerSource>)>>>;
+
+    struct PointerSourceRecorder {
+        seen: SeenSources,
+    }
+
+    fn record_source<E: crate::MouseEvent>(
+        window: &mut Window,
+        kind: &'static str,
+        seen: &SeenSources,
+    ) {
+        let seen = seen.clone();
+        window.on_mouse_event(move |_: &E, phase, window, _| {
+            if phase.bubble() {
+                seen.borrow_mut().push((kind, window.pointer_source()));
+                // Like a focus change, so a tap redraws before its dispatch returns.
+                window.refresh();
+            }
+        });
+    }
+
+    impl Render for PointerSourceRecorder {
+        fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.seen
+                .borrow_mut()
+                .push(("render", window.pointer_source()));
+            let seen = self.seen.clone();
+            canvas(
+                |_, _, _| {},
+                move |_, _, window, _| {
+                    record_source::<MouseDownEvent>(window, "down", &seen);
+                    record_source::<MouseUpEvent>(window, "up", &seen);
+                    record_source::<ScrollEvent>(window, "scroll", &seen);
+                    record_source::<BackGestureEvent>(window, "back", &seen);
+                },
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn pointer_source_names_the_device_and_synthesis_of_each_event(cx: &mut TestAppContext) {
+        // A finger is touch 1 and a pen touch 2, so a row can hold both down at once.
+        let touch = |phase, x: f32, device| {
+            TouchEvent {
+                id: TouchId(match device {
+                    PointerDevice::Pen => 2,
+                    PointerDevice::Touch | PointerDevice::Mouse => 1,
+                }),
+                phase,
+                position: point(px(x), px(10.)),
+                predicted_position: None,
+                force: None,
+                device,
+            }
+            .to_platform_input()
+        };
+        let tap = |device| {
+            vec![
+                touch(TouchPhase::Started, 10., device),
+                touch(TouchPhase::Ended, 10., device),
+            ]
+        };
+        let source = |device, synthesized| {
+            Some(PointerSource {
+                device,
+                synthesized,
+            })
+        };
+        let mouse_down = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(10.), px(10.)),
+            click_count: 1,
+            ..Default::default()
+        }
+        .to_platform_input();
+        // Each listener refreshes the window, so every row ends with a render. A tap draws
+        // before its dispatch returns, and that render must see `None` too.
+        let render = ("render", None);
+        let pen_tap = [
+            ("down", source(PointerDevice::Pen, true)),
+            ("up", source(PointerDevice::Pen, true)),
+        ];
+        // (name, inputs, distinct (listener or render, source) pairs seen, in order)
+        let rows = [
+            (
+                "backend mouse press",
+                vec![mouse_down],
+                vec![
+                    render,
+                    ("down", source(PointerDevice::Mouse, false)),
+                    render,
+                ],
+            ),
+            (
+                "finger tap",
+                tap(PointerDevice::Touch),
+                vec![
+                    render,
+                    ("down", source(PointerDevice::Touch, true)),
+                    ("up", source(PointerDevice::Touch, true)),
+                    render,
+                ],
+            ),
+            (
+                "pen tap",
+                tap(PointerDevice::Pen),
+                [&[render][..], &pen_tap, &[render]].concat(),
+            ),
+            (
+                "pen tap while a finger is down",
+                vec![
+                    touch(TouchPhase::Started, 10., PointerDevice::Pen),
+                    touch(TouchPhase::Started, 60., PointerDevice::Touch),
+                    touch(TouchPhase::Ended, 10., PointerDevice::Pen),
+                    touch(TouchPhase::Ended, 60., PointerDevice::Touch),
+                ],
+                [&[render][..], &pen_tap, &[render]].concat(),
+            ),
+            (
+                "finger tap after a pen lifted",
+                [tap(PointerDevice::Pen), tap(PointerDevice::Touch)].concat(),
+                [
+                    &[render][..],
+                    &pen_tap,
+                    &[
+                        render,
+                        ("down", source(PointerDevice::Touch, true)),
+                        ("up", source(PointerDevice::Touch, true)),
+                        render,
+                    ],
+                ]
+                .concat(),
+            ),
+            (
+                "finger pan",
+                vec![
+                    touch(TouchPhase::Started, 10., PointerDevice::Touch),
+                    touch(TouchPhase::Moved, 60., PointerDevice::Touch),
+                    touch(TouchPhase::Ended, 60., PointerDevice::Touch),
+                ],
+                vec![
+                    render,
+                    ("scroll", source(PointerDevice::Touch, true)),
+                    render,
+                    ("scroll", source(PointerDevice::Touch, true)),
+                    render,
+                ],
+            ),
+            (
+                "finger catches a pen's fling",
+                vec![
+                    touch(TouchPhase::Started, 10., PointerDevice::Pen),
+                    touch(TouchPhase::Moved, 60., PointerDevice::Pen),
+                    touch(TouchPhase::Ended, 60., PointerDevice::Pen),
+                    touch(TouchPhase::Started, 60., PointerDevice::Touch),
+                ],
+                // The fling's closing scroll is the pen's, the catching drag the finger's.
+                vec![
+                    render,
+                    ("scroll", source(PointerDevice::Pen, true)),
+                    render,
+                    ("scroll", source(PointerDevice::Pen, true)),
+                    render,
+                    ("scroll", source(PointerDevice::Pen, true)),
+                    ("scroll", source(PointerDevice::Touch, true)),
+                    render,
+                ],
+            ),
+            (
+                "edge swipe back",
+                vec![
+                    BackGestureEvent {
+                        phase: BackGesturePhase::Started,
+                        start_position: point(px(10.), px(10.)),
+                        progress: 0.,
+                    }
+                    .to_platform_input(),
+                ],
+                vec![render, ("back", source(PointerDevice::Touch, true)), render],
+            ),
+        ];
+        for (name, inputs, expected) in rows {
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let window = cx.add_window({
+                let seen = seen.clone();
+                move |_, _| PointerSourceRecorder { seen }
+            });
+            for input in inputs {
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(input, cx);
+                    assert_eq!(window.pointer_source(), None, "{name}: after dispatch");
+                })
+                .unwrap();
+            }
+            let mut seen = seen.borrow().clone();
+            seen.dedup();
+            assert_eq!(seen, expected, "{name}");
+        }
+    }
+
     #[gpui::test]
     fn long_press_is_claimed_only_when_started_prevents_default(cx: &mut TestAppContext) {
         for response in [
@@ -10811,6 +11074,7 @@ mod tests {
                         position: point(px(x), px(0.)),
                         predicted_position: None,
                         force: None,
+                        device: PointerDevice::Touch,
                     }
                     .to_platform_input(),
                     cx,

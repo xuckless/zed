@@ -15,8 +15,8 @@ use smallvec::SmallVec;
 
 use crate::{
     Axis, GestureEvent, InputEvent, IsZero, Modifiers, MouseButton, MouseDownEvent, MouseEvent,
-    MouseUpEvent, Pixels, PlatformInput, Point, ScrollDelta, ScrollEvent, ScrollSource, TouchEvent,
-    TouchId, TouchPhase, point, px, seal::Sealed,
+    MouseUpEvent, Pixels, PlatformInput, Point, PointerDevice, ScrollDelta, ScrollEvent,
+    ScrollSource, TouchEvent, TouchId, TouchPhase, point, px, seal::Sealed,
 };
 
 const SCROLL_EVENT_SEPARATION: Duration = Duration::from_millis(28);
@@ -575,6 +575,8 @@ enum TouchGestureState {
 
 struct ActiveTouch {
     id: TouchId,
+    /// What the gestures recognized from this touch report as their device.
+    device: PointerDevice,
     start_position: Point<Pixels>,
     /// The latest raw position reported for this touch.
     last_position: Point<Pixels>,
@@ -600,6 +602,8 @@ struct CompletedTap {
 /// exactly frame-rate independent: a stalled frame simply resumes further
 /// along the same curve.
 struct Momentum {
+    /// The device of the touch that flung.
+    device: PointerDevice,
     /// Where the pan started; synthesized scroll events keep hit-testing
     /// there so momentum stays with the container the gesture began on.
     position: Point<Pixels>,
@@ -623,11 +627,24 @@ impl TouchGestureRecognizer {
         }
     }
 
+    /// Each gesture is paired with the device it reports: the touch's own,
+    /// except the closing step of a fling this touch catches, which keeps the
+    /// device of the touch that flung, like the momentum steps before it.
     pub(crate) fn handle_event(
         &mut self,
         event: &TouchEvent,
-    ) -> SmallVec<[RecognizedTouchGesture; 2]> {
-        self.handle_event_at(event, Instant::now())
+    ) -> SmallVec<[(PointerDevice, RecognizedTouchGesture); 2]> {
+        let flung_by = match event.phase {
+            TouchPhase::Started => self.momentum.as_ref().map(|momentum| momentum.device),
+            TouchPhase::Moved | TouchPhase::Ended | TouchPhase::Cancelled => None,
+        };
+        let mut gestures = self.handle_event_at(event, Instant::now()).into_iter();
+        // A touch that catches a fling closes the fling's scroll first.
+        let fling_end = flung_by.and_then(|device| Some((device, gestures.next()?)));
+        fling_end
+            .into_iter()
+            .chain(gestures.map(|gesture| (event.device, gesture)))
+            .collect()
     }
 
     fn handle_event_at(
@@ -638,6 +655,7 @@ impl TouchGestureRecognizer {
         let mut recognized = SmallVec::new();
         match event.phase {
             TouchPhase::Started => {
+                // Pushed first: `handle_event` tags it with the momentum's device.
                 let caught_fling = if let Some(momentum) = self.momentum.take() {
                     recognized.push(RecognizedTouchGesture::Scroll(scroll_event(
                         momentum.position,
@@ -653,6 +671,7 @@ impl TouchGestureRecognizer {
                     velocity_tracker.push(now, event.position);
                     let touch = ActiveTouch {
                         id: event.id,
+                        device: event.device,
                         start_position: event.position,
                         last_position: event.position,
                         emitted_position: event.position,
@@ -878,6 +897,7 @@ impl TouchGestureRecognizer {
                                 0.
                             };
                             self.momentum = Some(Momentum {
+                                device: touch.device,
                                 position: touch.start_position,
                                 direction,
                                 speed,
@@ -940,7 +960,7 @@ impl TouchGestureRecognizer {
         recognized
     }
 
-    pub(crate) fn pending_long_press(&self) -> Option<(TouchId, Duration)> {
+    pub(crate) fn pending_long_press(&self) -> Option<(TouchId, PointerDevice, Duration)> {
         let TouchGestureState::Pending {
             touch,
             deadline,
@@ -950,7 +970,11 @@ impl TouchGestureRecognizer {
         else {
             return None;
         };
-        Some((touch.id, deadline.saturating_duration_since(Instant::now())))
+        Some((
+            touch.id,
+            touch.device,
+            deadline.saturating_duration_since(Instant::now()),
+        ))
     }
 
     pub(crate) fn offer_long_press(&mut self, id: TouchId) -> Option<RecognizedTouchGesture> {
@@ -1030,8 +1054,10 @@ impl TouchGestureRecognizer {
     /// Advances post-fling momentum by one frame, returning the scroll step
     /// to dispatch, or `None` when no momentum is in progress. The final step
     /// carries [`TouchPhase::Ended`] to close the synthetic scroll stream.
-    pub(crate) fn tick_momentum(&mut self) -> Option<RecognizedTouchGesture> {
-        self.tick_momentum_at(Instant::now())
+    /// Paired with the device of the touch that flung.
+    pub(crate) fn tick_momentum(&mut self) -> Option<(PointerDevice, RecognizedTouchGesture)> {
+        let device = self.momentum.as_ref()?.device;
+        Some((device, self.tick_momentum_at(Instant::now())?))
     }
 
     fn tick_momentum_at(&mut self, now: Instant) -> Option<RecognizedTouchGesture> {
@@ -2282,7 +2308,7 @@ mod tests {
                 .is_empty()
         );
         let cancelled = recognizer.handle_event(&touch_event(touch, TouchPhase::Cancelled, 6., 7.));
-        let [RecognizedTouchGesture::LongPress(cancelled)] = cancelled.as_slice() else {
+        let [(_, RecognizedTouchGesture::LongPress(cancelled))] = cancelled.as_slice() else {
             panic!("expected cancelled long press, got {cancelled:?}");
         };
         assert_eq!(cancelled.phase, TouchPhase::Cancelled);
@@ -2326,6 +2352,7 @@ mod tests {
             position: point(px(x), px(y)),
             predicted_position: None,
             force: None,
+            device: PointerDevice::Touch,
         }
     }
 }

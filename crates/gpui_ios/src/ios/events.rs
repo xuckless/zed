@@ -1,13 +1,13 @@
 //! Conversion from UIKit events to GPUI input events.
 
 use gpui::{
-    BackGestureEvent, BackGesturePhase, Modifiers, Pixels, Point, ScrollDelta, ScrollEvent,
-    ScrollSource, TouchId, TouchPhase, px,
+    BackGestureEvent, BackGesturePhase, Modifiers, Pixels, Point, PointerDevice, ScrollDelta,
+    ScrollEvent, ScrollSource, TouchId, TouchPhase, px,
 };
 use objc2_core_foundation::CGPoint;
 use objc2_ui_kit::{
     UIGestureRecognizerState, UIKeyModifierFlags, UIPanGestureRecognizer, UIRectEdge,
-    UIScreenEdgePanGestureRecognizer, UITouch, UITouchPhase, UIView,
+    UIScreenEdgePanGestureRecognizer, UITouch, UITouchPhase, UITouchType, UIView,
 };
 
 /// A release faster than this, in points per second toward going back, commits
@@ -125,4 +125,18 @@ pub fn touch_force(touch: &UITouch) -> Option<f32> {
         return None;
     }
     Some((touch.force() / maximum_force).clamp(0.0, 1.0) as f32)
+}
+
+/// The device behind a touch: Apple Pencil is a pen, and an iPad pointer's
+/// click arrives as an indirect-pointer touch.
+pub fn touch_device(touch: &UITouch) -> PointerDevice {
+    match touch.r#type() {
+        UITouchType::Pencil => PointerDevice::Pen,
+        UITouchType::IndirectPointer => PointerDevice::Mouse,
+        // `Indirect` is a remote's touch surface: a finger too.
+        UITouchType::Direct | UITouchType::Indirect => PointerDevice::Touch,
+        // objc2 makes `UITouchType` an open newtype, so a match needs this arm; a
+        // type UIKit adds later reads as a finger.
+        _ => PointerDevice::Touch,
+    }
 }
