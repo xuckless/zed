@@ -493,12 +493,14 @@ impl IosWindow {
         // Make the window visible
         window.makeKeyAndVisible();
 
-        // Create a hidden text input view for keyboard handling.
+        // Create a transparent text input view for keyboard handling.
         // Uses our custom GPUITextInputView which implements UIKeyInput
-        // so iOS actually routes keyboard text to us.
-        let text_input_frame = CGRect::new(CGPoint::ZERO, CGSize::new(1.0, 1.0));
-        let text_input_view = TextInputView::new(text_input_frame, main_thread);
-        text_input_view.setAlpha(0.01);
+        // so iOS actually routes keyboard text to us. It covers the view, where
+        // UIKit draws its selection UI; it takes only touches on edited text.
+        let text_input_view = TextInputView::new(view.bounds(), main_thread);
+        text_input_view.setAutoresizingMask(
+            UIViewAutoresizing::FlexibleWidth | UIViewAutoresizing::FlexibleHeight,
+        );
         text_input_view.setUserInteractionEnabled(true);
         view.addSubview(&text_input_view);
 

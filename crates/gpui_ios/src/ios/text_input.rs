@@ -9,7 +9,7 @@ use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_clas
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
     NSArray, NSAttributedStringKey, NSComparisonResult, NSCopying, NSDictionary,
-    NSObjectNSDelayedPerforming, NSObjectProtocol, NSRange, NSString, ns_string,
+    NSObjectNSDelayedPerforming, NSObjectProtocol, NSRange, NSSet, NSString, ns_string,
 };
 use objc2_ui_kit::*;
 use std::{
@@ -131,6 +131,28 @@ define_class!(
     }
 );
 
+define_class!(
+    // UIKit's caret for a field whose app paints its own: an empty view, so it draws nothing whatever frame, alpha
+    // or hidden flag UIKit gives it. Flutter hides UIKit's caret with a clear `insertionPointColor` below iOS 17 only
+    // (on iOS 17+ that colour also fills the selected IME candidate, flutter/flutter#132548); on iOS 17+ the
+    // selection display interaction's caret is this view instead.
+    #[unsafe(super(UIView, UIResponder, objc2_foundation::NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "GPUIEmptyTextCursorView"]
+    #[ivars = Cell<bool>]
+    struct EmptyCursorView;
+    unsafe impl NSObjectProtocol for EmptyCursorView {}
+    unsafe impl UICoordinateSpace for EmptyCursorView {}
+    unsafe impl UITextCursorView for EmptyCursorView {
+        #[unsafe(method(isBlinking))]
+        fn is_blinking(&self) -> bool { self.ivars().get() }
+        #[unsafe(method(setBlinking:))]
+        fn set_blinking(&self, blinking: bool) { self.ivars().set(blinking) }
+        #[unsafe(method(resetBlinkAnimation))]
+        fn reset_blink_animation(&self) {}
+    }
+);
+
 pub(super) struct TextInputIvars {
     window: WindowReference,
     input_field: Cell<Option<gpui::FocusId>>,
@@ -147,6 +169,8 @@ pub(super) struct TextInputIvars {
     content_changed: Cell<bool>,
     native_edit: Cell<bool>,
     temporarily_deleted_composed_character: RefCell<Option<Retained<NSString>>>,
+    /// UIKit's selection UI (`sync_text_interaction`), installed while this view is first responder.
+    text_interaction: RefCell<Option<Retained<UITextInteraction>>>,
 }
 
 define_class!(
@@ -165,6 +189,16 @@ define_class!(
                 && self.ivars().keyboard_eligible.get()
         }
 
+        // UIKit can make this view first responder itself (not only `reconcileTextInput`), so the selection UI comes
+        // with the responder wherever it starts.
+        #[unsafe(method(becomeFirstResponder))]
+        fn become_first_responder(&self) -> bool {
+            // SAFETY: UIResponder's own `becomeFirstResponder`, on the main thread.
+            let became: bool = unsafe { msg_send![super(self), becomeFirstResponder] };
+            self.sync_text_interaction();
+            became
+        }
+
         #[unsafe(method(resignFirstResponder))]
         fn resign_first_responder(&self) -> bool {
             let was_first_responder = self.isFirstResponder();
@@ -175,7 +209,58 @@ define_class!(
                 self.ivars().keyboard_desired.set(false);
                 self.ivars().keyboard_eligible.set(false);
             }
+            self.sync_text_interaction();
             resigned
+        }
+
+        // This view covers GPUI's view. While editing, touches on the field's text hit it, for UITextInteraction's
+        // gestures; the rest, and every touch while not editing, reach GPUI's view (or UIKit's selection views).
+        // The text is where the app's rects for the whole document are (`selectionRectsForRange:`), not wherever
+        // `character_index_for_point` answers: an app may clamp that to the nearest character for any point.
+        #[unsafe(method_id(hitTest:withEvent:))]
+        fn hit_test(&self, point: CGPoint, event: Option<&UIEvent>) -> Option<Retained<UIView>> {
+            let editing = self.ivars().text_interaction.borrow().is_some();
+            let on_text = editing && (self.on_text(point) || self.near_selection_end(point));
+            if on_text {
+                Some(self.retain().into_super())
+            } else {
+                let hit: Option<Retained<UIView>> =
+                    unsafe { msg_send![super(self), hitTest: point, withEvent: event] };
+                hit.filter(|hit| !std::ptr::eq(Retained::as_ptr(hit).cast::<TextInputView>(), self))
+            }
+        }
+
+        // Ported from flutter/flutter FlutterTextInputPlugin.mm @ 3.50.1: "Forward touches to the viewResponder to
+        // allow tapping inside the UITextField as normal." GPUI's view is the superview. Copyright 2014 The Flutter
+        // Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
+        #[unsafe(method(touchesBegan:withEvent:))]
+        fn touches_began(&self, touches: &NSSet<UITouch>, event: Option<&UIEvent>) {
+            if let Some(view) = self.superview() { view.touchesBegan_withEvent(touches, event); }
+        }
+
+        #[unsafe(method(touchesMoved:withEvent:))]
+        fn touches_moved(&self, touches: &NSSet<UITouch>, event: Option<&UIEvent>) {
+            if let Some(view) = self.superview() { view.touchesMoved_withEvent(touches, event); }
+        }
+
+        #[unsafe(method(touchesEnded:withEvent:))]
+        fn touches_ended(&self, touches: &NSSet<UITouch>, event: Option<&UIEvent>) {
+            if let Some(view) = self.superview() { view.touchesEnded_withEvent(touches, event); }
+        }
+
+        #[unsafe(method(touchesCancelled:withEvent:))]
+        fn touches_cancelled(&self, touches: &NSSet<UITouch>, event: Option<&UIEvent>) {
+            if let Some(view) = self.superview() { view.touchesCancelled_withEvent(touches, event); }
+        }
+
+        // Ported from flutter/flutter FlutterTextInputPlugin.mm @ 3.50.1 (`selectionHighlightColor`): "Prevent UIKit
+        // from showing selection handles or highlights." The app paints its own selection; UIKit's handles stay
+        // (Flutter's clear `selectionBarColor` is not ported: GPUI apps have no handles of their own on iOS).
+        // Copyright 2014 The Flutter Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
+        #[unsafe(method_id(selectionHighlightColor))]
+        fn selection_highlight_color(&self) -> Retained<AnyObject> {
+            // SAFETY: `+[UIColor clearColor]` returns a UIColor, on the main thread.
+            unsafe { msg_send![objc2::class!(UIColor), clearColor] }
         }
 
         #[unsafe(method(reconcileTextInput))]
@@ -196,6 +281,7 @@ define_class!(
                 self.resignFirstResponder();
                 self.ivars().reconciling_responder.set(previous);
             }
+            self.sync_text_interaction();
             if self.ivars().configuration_changed.replace(false) && self.isFirstResponder() {
                 self.reloadInputViews();
             }
@@ -410,9 +496,10 @@ define_class!(
 
     unsafe impl UITextInput for TextInputView {
         #[unsafe(method_id(textInRange:))]
-        fn text_in_range(&self, range: &UITextRange) -> Option<Retained<NSString>> {
+        fn text_in_range(&self, range: Option<&UITextRange>) -> Option<Retained<NSString>> {
             (|| {
-            let range = self.validated_range(range)?;
+            // UIKit can ask with nil (FlutterTextInputPlugin.mm @ 3.50.1 `textInRange:`).
+            let range = self.validated_range(range?)?;
             self.with_handler(|handler| {
                 // Sanitize the range to prevent going out of bounds: UIKit keeps ranges across app edits.
                 let document = document_range(handler)?;
@@ -588,7 +675,10 @@ define_class!(
             let Some(range) = self.validated_range(range) else { return NSArray::new(); };
             let bounds = self.with_handler(|handler| {
                 if !allowed_range(handler, &range) { return Vec::new(); }
-                handler.selection_bounds_for_range(range)
+                let rects = handler.selection_bounds_for_range(range.clone());
+                // UIKit draws no highlight or handles without rects; an app that gives none (a one-line field)
+                // has its first rect.
+                if rects.is_empty() { handler.bounds_for_range(range).into_iter().collect() } else { rects }
             }).unwrap_or_default();
             let count = bounds.len();
             let rectangles = bounds.into_iter().enumerate().map(|(index, bounds)| {
@@ -635,9 +725,8 @@ define_class!(
         }
         #[unsafe(method_id(textInputView))]
         fn text_input_view(&self) -> Retained<UIView> {
-            // GPUI's bounds and hit testing use the rendering view's coordinate space,
-            // not the hidden responder's one-point frame.
-            self.superview().unwrap_or_else(|| self.retain().into_super())
+            // This view covers GPUI's view (the window sizes it), so their coordinate spaces are the same.
+            self.retain().into_super()
         }
     }
 
@@ -661,6 +750,7 @@ impl TextInputView {
             content_changed: Cell::new(false),
             native_edit: Cell::new(false),
             temporarily_deleted_composed_character: RefCell::new(None),
+            text_interaction: RefCell::new(None),
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -719,6 +809,60 @@ impl TextInputView {
 
     fn document_range(&self) -> Option<Range<usize>> {
         self.with_handler(document_range).flatten()
+    }
+
+    /// UIKit's own selection UI (caret, handles, loupe, edit menu) while this view edits, as UITextView has: a
+    /// `UITextInteraction`, made as Flutter's `-[FlutterTextInputView textInteraction]` (FlutterTextInputPlugin.mm
+    /// @ 3.50.1) makes it. Its gestures sit on this view, which claims touches on the field's text (`hitTest:`) and
+    /// hands GPUI the ones the gestures leave (`touches…`).
+    /// The slot is never borrowed across `addInteraction:` / `removeInteraction:`: UIKit asks this view back
+    /// (`hitTest:`) inside them, and a borrow panic there would abort in an `extern "C"` frame.
+    fn sync_text_interaction(&self) {
+        let installed = self.ivars().text_interaction.borrow().clone();
+        match (self.isFirstResponder(), installed) {
+            (true, None) => {
+                let interaction =
+                    UITextInteraction::textInteractionForMode(UITextInteractionMode::Editable, self.mtm());
+                // SAFETY: this view implements UITextInput, which `textInput` requires.
+                unsafe { interaction.setTextInput(Some(self)) };
+                self.ivars().text_interaction.replace(Some(interaction.clone()));
+                self.addInteraction(ProtocolObject::from_ref(&*interaction));
+                // The interaction brings a selection display interaction (iOS 17+), whose caret the app paints.
+                let cursor = EmptyCursorView::alloc(self.mtm()).set_ivars(Cell::new(false));
+                let cursor: Retained<EmptyCursorView> = unsafe { msg_send![super(cursor), init] };
+                for added in self.interactions() {
+                    let added: &AnyObject = (*added).as_ref();
+                    if let Some(display) = added.downcast_ref::<UITextSelectionDisplayInteraction>() {
+                        // SAFETY: the view implements UITextCursorView, which `cursorView` requires.
+                        unsafe { display.setCursorView(&cursor) };
+                    }
+                }
+            }
+            (false, Some(interaction)) => {
+                self.ivars().text_interaction.replace(None);
+                self.removeInteraction(ProtocolObject::from_ref(&*interaction));
+            }
+            (true, Some(_)) | (false, None) => {}
+        }
+    }
+
+    /// Whether `point` can grab a selection handle: within half of Apple's 44 pt minimum touch target of either
+    /// end's caret, so a knob drawn outside the text still takes its drag.
+    fn near_selection_end(&self, point: CGPoint) -> bool {
+        const HALF_TOUCH_TARGET: f64 = 22.;
+        let near = |caret: CGRect| caret != CGRect::ZERO && within(caret, HALF_TOUCH_TARGET, point);
+        self.selectedTextRange().is_some_and(|range| {
+            near(self.caretRectForPosition(&range.start())) || near(self.caretRectForPosition(&range.end()))
+        })
+    }
+
+    /// Whether `point` is on the field's text: inside one of the rects the app gives for its whole document, the
+    /// ones UIKit highlights for Select All. An empty field has none; its caret is `near_selection_end`.
+    fn on_text(&self, point: CGPoint) -> bool {
+        self.textRangeFromPosition_toPosition(&self.beginningOfDocument(), &self.endOfDocument())
+            .is_some_and(|document| {
+                self.selectionRectsForRange(&document).iter().any(|rect| within(rect.rect(), 0., point))
+            })
     }
 
     /// An edit action is UIKit's call but not the keyboard's edit, so the input delegate hears of it around the
@@ -897,6 +1041,12 @@ fn native_rect(bounds: gpui::Bounds<gpui::Pixels>) -> CGRect {
         CGPoint::new(f64::from(bounds.origin.x), f64::from(bounds.origin.y)),
         CGSize::new(f64::from(bounds.size.width), f64::from(bounds.size.height)),
     )
+}
+
+/// Whether `point` is inside `rect` grown by `slack` on every side.
+fn within(rect: CGRect, slack: f64, point: CGPoint) -> bool {
+    (rect.origin.x - slack..=rect.origin.x + rect.size.width + slack).contains(&point.x)
+        && (rect.origin.y - slack..=rect.origin.y + rect.size.height + slack).contains(&point.y)
 }
 
 fn nonempty_caret_rect(mut rect: CGRect) -> CGRect {
@@ -1201,8 +1351,23 @@ pub(super) mod tests {
         view.ivars().keyboard_eligible.set(true);
         assert!(view.becomeFirstResponder());
         assert!(view.isFirstResponder());
+        // UIKit's selection UI comes with the responder (`becomeFirstResponder`), and leaves with it.
+        let interaction = view.ivars().text_interaction.borrow().clone();
+        assert_eq!(
+            interaction.as_ref().and_then(|interaction| interaction.view()),
+            Some(view.clone().into_super())
+        );
+        // UIKit draws no caret over the app's: its selection display shows the empty cursor view.
+        assert!(view.interactions().iter().any(|added| {
+            let added: &AnyObject = (*added).as_ref();
+            added
+                .downcast_ref::<UITextSelectionDisplayInteraction>()
+                .is_some_and(|display| display.cursorView().isKindOfClass(<EmptyCursorView as objc2::ClassType>::class()))
+        }));
         assert!(view.resignFirstResponder());
         assert!(!view.isFirstResponder());
+        assert!(view.ivars().text_interaction.borrow().is_none());
+        assert!(interaction.and_then(|interaction| interaction.view()).is_none());
         assert!(
             !view.ivars().keyboard_desired.get(),
             "native resignation must cancel the outstanding keyboard request"
