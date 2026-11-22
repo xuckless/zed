@@ -131,6 +131,9 @@ pub struct MetalRenderer {
     opaque: bool,
     /// Whether the last scene drawn to the layer let native views show through it.
     shows_native_views: bool,
+    /// How far inside each native view its hole is cut
+    /// ([`set_native_view_hole_inset`](Self::set_native_view_hole_inset)).
+    native_view_hole_inset: ScaledPixels,
     command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     path_tiles_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     shadows_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
@@ -400,6 +403,7 @@ impl MetalRenderer {
             is_unified_memory,
             opaque,
             shows_native_views: false,
+            native_view_hole_inset: ScaledPixels(0.),
             command_queue,
             path_tiles_pipeline_state,
             shadows_pipeline_state,
@@ -489,6 +493,13 @@ impl MetalRenderer {
         if let Some(layer) = &self.layer {
             layer.setPresentsWithTransaction(presents_with_transaction);
         }
+    }
+
+    /// Cuts each native view's hole this far inside its bounds:
+    /// `native_view_placement::hole_inset`, one pixel where the compositor resamples the layer, so its own pixels
+    /// cover the view's blended edges.
+    pub fn set_native_view_hole_inset(&mut self, inset: ScaledPixels) {
+        self.native_view_hole_inset = inset;
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
@@ -604,7 +615,7 @@ impl MetalRenderer {
             &self.instance_buffer_pool,
             self.is_unified_memory,
         )?;
-        let instance_bindings = write_instances(scene, &mut writer).with_context(|| {
+        let instance_bindings = write_instances(scene, self.native_view_hole_inset, &mut writer).with_context(|| {
             format!(
                 "writing instance data: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
                 scene.paths.len(),
@@ -1501,7 +1512,11 @@ struct InstanceBindings {
     native_views: InstanceBinding,
 }
 
-fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
+fn write_instances(
+    scene: &Scene,
+    native_view_hole_inset: ScaledPixels,
+    writer: &mut InstanceBufferWriter,
+) -> Result<InstanceBindings> {
     let mut path_paints = Vec::with_capacity(scene.paths.len());
     let mut path_curves = Vec::new();
     let mut path_tiles = Vec::new();
@@ -1523,7 +1538,7 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
         }))?,
         native_views: writer.write_iter(scene.native_views.iter().map(|native_view| {
             SurfaceBounds {
-                bounds: native_view.bounds,
+                bounds: native_view.bounds.inset(native_view_hole_inset),
                 content_mask: native_view.content_mask,
             }
         }))?,
