@@ -1,6 +1,6 @@
 use super::window::{IosWindowState, WindowReference};
 use gpui::{
-    Autocapitalize, PlatformInputHandler, TextInputAction, TextInputConfiguration,
+    Autocapitalize, KeyboardType, PlatformInputHandler, TextInputAction, TextInputConfiguration,
     TextInputStateChange, px,
 };
 use objc2::rc::{Retained, Weak};
@@ -269,8 +269,22 @@ define_class!(
     }
 
     unsafe impl UITextInputTraits for TextInputView {
+        // Ported from flutter/flutter FlutterTextInputPlugin.mm's `ToUIKeyboardType` @ 3.50.1, for GPUI's keyboard
+        // types. Copyright 2014 The Flutter Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
         #[unsafe(method(keyboardType))]
-        fn keyboard_type(&self) -> UIKeyboardType { UIKeyboardType::Default }
+        fn keyboard_type(&self) -> UIKeyboardType {
+            match self.ivars().configuration.borrow().keyboard_type {
+                KeyboardType::Text => UIKeyboardType::Default,
+                KeyboardType::Number => UIKeyboardType::NumberPad,
+                KeyboardType::Decimal => UIKeyboardType::DecimalPad,
+                KeyboardType::Phone => UIKeyboardType::PhonePad,
+                KeyboardType::Email => UIKeyboardType::EmailAddress,
+                KeyboardType::Url => UIKeyboardType::URL,
+                KeyboardType::Search => UIKeyboardType::WebSearch,
+            }
+        }
+        #[unsafe(method(isSecureTextEntry))]
+        fn is_secure_text_entry(&self) -> bool { self.ivars().configuration.borrow().secure }
         #[unsafe(method(autocorrectionType))]
         fn autocorrection_type(&self) -> UITextAutocorrectionType {
             if self.ivars().configuration.borrow().autocorrect { UITextAutocorrectionType::Yes } else { UITextAutocorrectionType::No }
