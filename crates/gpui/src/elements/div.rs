@@ -2851,6 +2851,7 @@ impl Interactivity {
                                             self.paint_mouse_listeners(
                                                 global_id,
                                                 hitbox,
+                                                style.overflow,
                                                 element_state.as_mut(),
                                                 window,
                                                 cx,
@@ -3022,6 +3023,7 @@ impl Interactivity {
         &mut self,
         global_id: Option<&GlobalElementId>,
         hitbox: &Hitbox,
+        overflow: Point<Overflow>,
         element_state: Option<&mut InteractiveElementState>,
         window: &mut Window,
         cx: &mut App,
@@ -3058,6 +3060,11 @@ impl Interactivity {
         } else if handles_gestures || pinch_owner.is_some() {
             let (hitbox, pinch_owner) = (hitbox.clone(), pinch_owner.clone());
             let overscroll_position = self.overscroll_position.clone();
+            // A scroll container's axes: its pan accepts only on them.
+            let scroll_axes = self
+                .scroll_offset
+                .is_some()
+                .then_some((overflow.x == Overflow::Scroll, overflow.y == Overflow::Scroll));
             window.on_mouse_event(move |event: &TouchEvent, phase, window, _| {
                 if phase == DispatchPhase::Bubble
                     && event.phase == TouchPhase::Started
@@ -3072,6 +3079,9 @@ impl Interactivity {
                         .is_some_and(|position| position.borrow().holds_touch())
                     {
                         window.hold_scroll(event.id);
+                    }
+                    if let Some((horizontal, vertical)) = scroll_axes {
+                        window.scroll_container_under_touch(event.id, horizontal, vertical);
                     }
                 }
             })

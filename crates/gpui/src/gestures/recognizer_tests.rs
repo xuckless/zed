@@ -1,5 +1,6 @@
 // Ported from flutter/flutter packages/flutter/test/gestures/tap_test.dart, double_tap_test.dart,
-// long_press_test.dart, drag_test.dart and tap_and_drag_test.dart @ 3.50.1 (ae9b586f34a8443573f82ef57c3bf914a908cbf7).
+// long_press_test.dart, drag_test.dart and tap_and_drag_test.dart @ 3.50.1 (ae9b586f34a8443573f82ef57c3bf914a908cbf7),
+// with rows for packages/flutter/lib/src/gestures/monodrag.dart's `_hasSufficientGlobalDistanceToAccept`.
 // Copyright 2014 The Flutter Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
 
 //! Flutter's recognizer tests as the oracle for the touch recognizer, driven
@@ -13,7 +14,7 @@ use std::{cell::RefCell, rc::Rc, time::Duration};
 use scheduler::Instant;
 
 use crate::{
-    App, Bounds, Context, DispatchPhase, GestureTuning, HitboxBehavior, InputEvent as _,
+    App, Axis, Bounds, Context, DispatchPhase, GestureTuning, HitboxBehavior, InputEvent as _,
     IntoElement, LongPressEvent, MouseDownEvent, Pixels, PointerDevice, Render, ScrollDelta,
     ScrollEvent, TestAppContext, TouchDragEvent, TouchDragKind, TouchDragStart, TouchEvent,
     TouchId, TouchPhase, Window, canvas, point, px, size,
@@ -71,10 +72,21 @@ enum Claim {
     LongPressAndCompete(TouchDragKind),
 }
 
+/// The scroll container the element sits in, standing in for the drag
+/// recognizer a Flutter test adds next to the one under test:
+/// `VerticalDragGestureRecognizer` for a vertical one. `None`: no container,
+/// GPUI's pan accepts in any direction.
+#[derive(Clone, Copy)]
+enum Container {
+    None,
+    Scrolls(Axis),
+}
+
 struct Row<'a> {
     name: &'static str,
     tuning: GestureTuning,
     claim: Claim,
+    container: Container,
     /// Hitboxes the element inserts: what a tap lands on (none: every tap
     /// lands on nothing, the same target).
     targets: &'a [Bounds<Pixels>],
@@ -87,6 +99,7 @@ struct Row<'a> {
 
 struct Recorder {
     claim: Claim,
+    container: Container,
     targets: Vec<Bounds<Pixels>>,
     started_at: Instant,
     seen: Rc<RefCell<Vec<(u64, Seen)>>>,
@@ -95,6 +108,7 @@ struct Recorder {
 impl Render for Recorder {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let (seen, started_at, claim) = (self.seen.clone(), self.started_at, self.claim);
+        let container = self.container;
         let targets = self.targets.clone();
         let record = move |cx: &App, gesture| {
             let at = cx.background_executor().now().duration_since(started_at);
@@ -107,6 +121,19 @@ impl Render for Recorder {
                 }
             },
             move |_, _, window, _| {
+                // What a scroll container's div does when a touch starts on it.
+                if let Container::Scrolls(axis) = container {
+                    window.on_mouse_event(move |event: &TouchEvent, phase, window, _| {
+                        if phase == DispatchPhase::Bubble && event.phase == Started {
+                            window.leave_touch_to_gestures(event.id);
+                            window.scroll_container_under_touch(
+                                event.id,
+                                axis == Axis::Horizontal,
+                                axis == Axis::Vertical,
+                            );
+                        }
+                    });
+                }
                 let on_tap = record.clone();
                 window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
                     if phase == DispatchPhase::Bubble {
@@ -171,10 +198,11 @@ fn replay(row: &Row, cx: &mut TestAppContext) -> Vec<(u64, Seen)> {
     let started_at = cx.executor().now();
     let window = cx.add_window({
         let seen = seen.clone();
-        let claim = row.claim;
+        let (claim, container) = (row.claim, row.container);
         let targets = row.targets.to_vec();
         move |_, _| Recorder {
             claim,
+            container,
             targets,
             started_at,
             seen,
@@ -229,6 +257,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Should recognize tap",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[touch(0, 1, Started, 10., 10.), touch(0, 1, Ended, 11., 9.)],
             until_ms: 0,
@@ -239,6 +268,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "No duplicate tap events",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 1, Started, 10., 10.),
@@ -253,6 +283,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Should not recognize two overlapping taps (FIFO)",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 1, Started, 10., 10.),
@@ -267,6 +298,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Should not recognize two overlapping taps (FILO)",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 1, Started, 10., 10.),
@@ -282,6 +314,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Distance cancels tap",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 3, Started, 10., 10.),
@@ -296,6 +329,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Short distance does not cancel tap",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 4, Started, 10., 10.),
@@ -309,6 +343,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Timeout does not cancel tap",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 1, Started, 10., 10.),
@@ -321,6 +356,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "PointerCancelEvent cancels tap",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -333,6 +369,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "PointerCancelEvent after exceeding deadline cancels tap",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -345,6 +382,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "losing tap gesture recognizer does not send onTapCancel",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[touch(0, 3, Started, 10., 10.), touch(0, 3, Moved, 25., 25.)],
             until_ms: 0,
@@ -354,6 +392,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "non-primary pointers does not trigger timeout",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 1, Started, 10., 10.),
@@ -368,6 +407,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "A second tap after rejection is ignored",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 1, Started, 0., 0.),
@@ -384,6 +424,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Should recognize double tap",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 1, Started, 10., 10.),
@@ -398,6 +439,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Inter-tap distance cancels double tap",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 1, Started, 10., 10.),
@@ -412,6 +454,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Intra-tap distance cancels double tap",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 4, Started, 10., 10.),
@@ -431,6 +474,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Inter-tap delay cancels double tap",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 1, Started, 10., 10.),
@@ -445,6 +489,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Inter-tap delay resets double tap, allowing third tap to be a double-tap",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 1, Started, 10., 10.),
@@ -461,6 +506,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Intra-tap delay does not cancel double tap",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 1, Started, 10., 10.),
@@ -475,6 +521,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Should not recognize two overlapping taps",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 1, Started, 10., 10.),
@@ -489,6 +536,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Should recognize one tap of group followed by second tap",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 1, Started, 10., 10.),
@@ -505,6 +553,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Should not recognize two over-rapid taps",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 1, Started, 10., 10.),
@@ -519,6 +568,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Over-rapid taps resets double tap, allowing third tap to be a double-tap",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 1, Started, 10., 10.),
@@ -536,6 +586,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Long press: Should recognize long press",
             tuning: flutter,
             claim: Claim::LongPress,
+            container: Container::None,
             targets: &[],
             trace: &[touch(0, 5, Started, 10., 10.)],
             until_ms: 1000,
@@ -548,6 +599,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
                 ..flutter
             },
             claim: Claim::LongPress,
+            container: Container::None,
             targets: &[],
             trace: &[touch(0, 5, Started, 10., 10.)],
             until_ms: 100,
@@ -558,6 +610,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Long press: Up cancels long press",
             tuning: flutter,
             claim: Claim::LongPress,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -570,6 +623,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Long press: Moving before accept cancels",
             tuning: flutter,
             claim: Claim::LongPress,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -586,6 +640,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Long press: Moving after accept is ok",
             tuning: flutter,
             claim: Claim::LongPress,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -603,6 +658,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Long press: Should recognize long press up",
             tuning: flutter,
             claim: Claim::LongPress,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -618,6 +674,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "long press drag: Should recognize long press down",
             tuning: flutter,
             claim: Claim::LongPress,
+            container: Container::None,
             targets: &[],
             trace: &[touch(0, 5, Started, 10., 10.)],
             until_ms: 1000,
@@ -627,6 +684,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "long press drag: Short up cancels long press",
             tuning: flutter,
             claim: Claim::LongPress,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -639,6 +697,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "long press drag: Moving before accept cancels",
             tuning: flutter,
             claim: Claim::LongPress,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -655,6 +714,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "long press drag: Moving after accept does not cancel",
             tuning: flutter,
             claim: Claim::LongPress,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -672,6 +732,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "A primary long press recognizer forms competition with a primary tap recognizer",
             tuning: flutter,
             claim: Claim::LongPress,
+            container: Container::None,
             targets: &[],
             trace: &[touch(0, 5, Started, 10., 10.), touch(0, 5, Ended, 11., 9.)],
             until_ms: 0,
@@ -686,6 +747,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Should recognize pan",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -705,6 +767,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Should report most recent point to onStart by default",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::Scrolls(Axis::Horizontal),
             targets: &[],
             trace: &[touch(0, 5, Started, 10., 10.), touch(0, 5, Moved, 30., 0.)],
             until_ms: 0,
@@ -714,6 +777,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Should report most recent point to onStart with a start configuration",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::Scrolls(Axis::Horizontal),
             targets: &[],
             trace: &[touch(0, 5, Started, 10., 10.), touch(0, 5, Moved, 30., 0.)],
             until_ms: 0,
@@ -724,6 +788,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Should report initial down point to onStart with a down configuration",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::Scrolls(Axis::Horizontal),
             targets: &[],
             trace: &[touch(0, 5, Started, 10., 10.), touch(0, 5, Moved, 30., 0.)],
             until_ms: 0,
@@ -733,6 +798,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Should recognize drag (line 137)",
             tuning: flutter,
             claim: Claim::TouchDrag,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -752,6 +818,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "DragGestureRecognizer.onStart behavior test (no competing)",
             tuning: flutter,
             claim: Claim::TouchDrag,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(100, 5, Started, 10., 10.),
@@ -771,6 +838,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "DragGestureRecognizer.onStart behavior test (with competing)",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(600, 5, Started, 10., 10.),
@@ -787,6 +855,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Should report original timestamps",
             tuning: flutter,
             claim: Claim::TouchDrag,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(100, 5, Started, 10., 10.),
@@ -804,6 +873,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Should recognize drag (line 1603)",
             tuning: flutter,
             claim: Claim::TouchDrag,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -823,6 +893,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Should recognize drag (line 1665)",
             tuning: flutter,
             claim: Claim::TouchDrag,
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -842,6 +913,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "A primary pan recognizer forms competition with a primary tap recognizer",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[],
             trace: &[touch(0, 1, Started, 10., 10.), touch(0, 1, Ended, 10., 10.)],
             until_ms: 0,
@@ -849,13 +921,14 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
         },
         // tap_and_drag_test.dart: the element competes for the drag
         // (`Window::compete_for_touch_drag`), as Flutter's tap-and-drag
-        // recognizers do; GPUI's pan, accepting in any direction, stands in for
-        // the VerticalDragGestureRecognizer or PanGestureRecognizer the test
+        // recognizers do; GPUI's pan stands in for the VerticalDragGestureRecognizer
+        // (in a vertical container) or PanGestureRecognizer (in none) the test
         // adds. The drag starts where it wins.
         Row {
             name: "TapAndHorizontalDragGestureRecognizer beats VerticalDragGestureRecognizer on a horizontal drag",
             tuning: flutter,
             claim: Claim::Compete(TouchDragKind::Horizontal),
+            container: Container::Scrolls(Axis::Vertical),
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -872,6 +945,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "TapAndHorizontalDragGestureRecognizer loses to VerticalDragGestureRecognizer on a vertical drag",
             tuning: flutter,
             claim: Claim::Compete(TouchDragKind::Horizontal),
+            container: Container::Scrolls(Axis::Vertical),
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -890,6 +964,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "TapAndPanGestureRecognizer loses to VerticalDragGestureRecognizer on a vertical drag",
             tuning: flutter,
             claim: Claim::Compete(TouchDragKind::Pan),
+            container: Container::Scrolls(Axis::Vertical),
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -905,9 +980,27 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             ],
         },
         Row {
+            name: "TapAndPanGestureRecognizer beats VerticalDragGestureRecognizer on a horizontal pan",
+            tuning: flutter,
+            claim: Claim::Compete(TouchDragKind::Pan),
+            container: Container::Scrolls(Axis::Vertical),
+            targets: &[],
+            trace: &[
+                touch(0, 5, Started, 10., 10.),
+                touch(0, 5, Moved, 45., 25.),
+                touch(0, 5, Ended, 45., 25.),
+            ],
+            until_ms: 0,
+            expected: &[
+                (0, TouchDrag(Started, 45., 25.)),
+                (0, TouchDrag(Ended, 45., 25.)),
+            ],
+        },
+        Row {
             name: "Recognizer declares self-victory in a non-empty arena when pointer travels minimum distance to be considered a drag",
             tuning: flutter,
             claim: Claim::Compete(TouchDragKind::Pan),
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -924,18 +1017,127 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Recognizer detects tap gesture when pointer does not move past tap tolerance",
             tuning: flutter,
             claim: Claim::Compete(TouchDragKind::Pan),
+            container: Container::None,
             targets: &[],
             trace: &[touch(0, 1, Started, 10., 10.), touch(0, 1, Ended, 11., 9.)],
             until_ms: 0,
             expected: &[(0, Tap(1))],
         },
+        // Not Flutter tests: monodrag.dart's `_hasSufficientGlobalDistanceToAccept`.
+        // In a container scrolling on one axis the pan, as Flutter's
+        // VerticalDragGestureRecognizer, accepts only on that axis' travel.
+        Row {
+            // 30 px sideways is no vertical drag; 20 px down is.
+            name: "A vertical container's pan accepts only past the hit slop along y",
+            tuning: flutter,
+            claim: Claim::Nothing,
+            container: Container::Scrolls(Axis::Vertical),
+            targets: &[],
+            trace: &[
+                touch(0, 5, Started, 10., 10.),
+                touch(10, 5, Moved, 40., 10.),
+                touch(20, 5, Moved, 40., 30.),
+                touch(30, 5, Ended, 40., 30.),
+            ],
+            until_ms: 30,
+            expected: &[
+                (20, Scroll(Started, 0., 20.)),
+                (30, Scroll(Ended, 0., 0.)),
+            ],
+        },
+        Row {
+            name: "A horizontal container's pan accepts only past the hit slop along x",
+            tuning: flutter,
+            claim: Claim::Nothing,
+            container: Container::Scrolls(Axis::Horizontal),
+            targets: &[],
+            trace: &[
+                touch(0, 5, Started, 10., 10.),
+                touch(10, 5, Moved, 10., 40.),
+                touch(20, 5, Moved, 30., 40.),
+                touch(30, 5, Ended, 30., 40.),
+            ],
+            until_ms: 30,
+            expected: &[
+                (20, Scroll(Started, 20., 0.)),
+                (30, Scroll(Ended, 0., 0.)),
+            ],
+        },
+        // Not Flutter tests: tap.dart and long_press.dart reject past
+        // `kTouchSlop` (PrimaryPointerGestureRecognizer's
+        // `preAcceptSlopTolerance`) whatever the drag recognizers do, so a
+        // cross-axis move in a one-axis container is neither.
+        Row {
+            name: "A vertical container: 40 px sideways then release is no tap",
+            tuning: flutter,
+            claim: Claim::Nothing,
+            container: Container::Scrolls(Axis::Vertical),
+            targets: &[],
+            trace: &[
+                touch(0, 5, Started, 10., 10.),
+                touch(10, 5, Moved, 50., 10.),
+                touch(20, 5, Ended, 50., 10.),
+            ],
+            until_ms: 20,
+            expected: &[],
+        },
+        Row {
+            name: "A vertical container: 40 px sideways held past the deadline is no long press",
+            tuning: flutter,
+            claim: Claim::LongPress,
+            container: Container::Scrolls(Axis::Vertical),
+            targets: &[],
+            trace: &[
+                touch(0, 5, Started, 10., 10.),
+                touch(100, 5, Moved, 50., 10.),
+                touch(700, 5, Ended, 50., 10.),
+            ],
+            until_ms: 700,
+            expected: &[],
+        },
+        Row {
+            name: "A horizontal container: a sideways stray within the slop still taps",
+            tuning: flutter,
+            claim: Claim::Nothing,
+            container: Container::Scrolls(Axis::Horizontal),
+            targets: &[],
+            trace: &[
+                touch(0, 5, Started, 10., 10.),
+                touch(10, 5, Moved, 10., 25.),
+                touch(20, 5, Ended, 10., 25.),
+            ],
+            until_ms: 20,
+            expected: &[(20, Tap(1))],
+        },
         // Not Flutter tests: a text field's pair (a claimed long press and a
         // competing drag) against GPUI's tap and pan.
+        Row {
+            // A desktop field in a vertical list: 25 px sideways would win a
+            // pan in any direction, but the list only takes vertical travel;
+            // the field's pan wins past the 36 px pan slop along its path.
+            name: "A Pan-kind field drag in a vertical list wins a horizontal drag past the pan slop",
+            tuning: flutter,
+            claim: Claim::LongPressAndCompete(TouchDragKind::Pan),
+            container: Container::Scrolls(Axis::Vertical),
+            targets: &[],
+            trace: &[
+                touch(0, 5, Started, 10., 10.),
+                touch(10, 5, Moved, 35., 10.),
+                touch(20, 5, Moved, 50., 12.),
+                touch(30, 5, Ended, 50., 12.),
+            ],
+            until_ms: 30,
+            expected: &[
+                (20, TouchDrag(Started, 50., 12.)),
+                (30, TouchDrag(Ended, 50., 12.)),
+            ],
+        },
         Row {
             // `_globalDistanceMoved` adds each move's dx: 10, then 19 > 18.
             name: "A horizontal drag wins once its travel along x passes the hit slop",
             tuning: flutter,
             claim: Claim::LongPressAndCompete(TouchDragKind::Horizontal),
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -956,6 +1158,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "The pan takes a diagonal move before the horizontal drag's slop",
             tuning: flutter,
             claim: Claim::LongPressAndCompete(TouchDragKind::Horizontal),
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -972,6 +1175,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "A competing drag leaves the tap",
             tuning: flutter,
             claim: Claim::LongPressAndCompete(TouchDragKind::Horizontal),
+            container: Container::None,
             targets: &[],
             trace: &[touch(0, 1, Started, 10., 10.), touch(50, 1, Ended, 11., 9.)],
             until_ms: 50,
@@ -981,6 +1185,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "A long press held past its deadline beats the competing drag",
             tuning: flutter,
             claim: Claim::LongPressAndCompete(TouchDragKind::Horizontal),
+            container: Container::None,
             targets: &[],
             trace: &[
                 touch(0, 5, Started, 10., 10.),
@@ -1001,6 +1206,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "Double tap on one target counts 2",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[BUTTON_A, BUTTON_B],
             trace: &[
                 touch(0, 1, Started, 10., 10.),
@@ -1015,6 +1221,7 @@ fn flutter_recognizer_tests_pass(cx: &mut TestAppContext) {
             name: "A tap on another target starts a new count",
             tuning: flutter,
             claim: Claim::Nothing,
+            container: Container::None,
             targets: &[BUTTON_A, BUTTON_B],
             trace: &[
                 touch(0, 1, Started, 10., 10.),

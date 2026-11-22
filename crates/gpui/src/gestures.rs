@@ -398,6 +398,62 @@ impl TouchDragKind {
     }
 }
 
+/// The scroll axes of the containers under a touch: which travel lets GPUI's
+/// pan, standing in for their drag recognizers, accept the touch. Every
+/// scroll container under the touch joins in while its `Started` is
+/// dispatched (`Window::scroll_container_under_touch`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PanAxes {
+    /// No scroll container: the pan accepts in any direction.
+    NoContainer,
+    /// Only containers scrolling on this axis: Flutter's
+    /// `VerticalDragGestureRecognizer` or `HorizontalDragGestureRecognizer`.
+    One(Axis),
+    /// Containers on both axes, or one that scrolls on both: the pan
+    /// accepts in any direction, as Flutter's `PanGestureRecognizer`.
+    Both,
+}
+
+impl PanAxes {
+    /// A container that scrolls on x (`horizontal`) and on y (`vertical`).
+    pub(crate) fn of(horizontal: bool, vertical: bool) -> Self {
+        match (horizontal, vertical) {
+            (false, false) => PanAxes::NoContainer,
+            (true, false) => PanAxes::One(Axis::Horizontal),
+            (false, true) => PanAxes::One(Axis::Vertical),
+            (true, true) => PanAxes::Both,
+        }
+    }
+
+    /// The axes once another container under the touch joins.
+    pub(crate) fn join(self, other: PanAxes) -> Self {
+        match (self, other) {
+            (PanAxes::NoContainer, joined) | (joined, PanAxes::NoContainer) => joined,
+            (PanAxes::One(axis), PanAxes::One(other)) if axis == other => PanAxes::One(axis),
+            (PanAxes::One(_) | PanAxes::Both, PanAxes::One(_) | PanAxes::Both) => PanAxes::Both,
+        }
+    }
+
+    /// The axis the pan locks to once `accumulated` (the travel since the
+    /// touch started) passes `touch_slop`; `None` while it has not. One axis:
+    /// monodrag.dart's `_hasSufficientGlobalDistanceToAccept`, the travel
+    /// along that axis past the hit slop. Otherwise any direction, locked to
+    /// the dominant axis.
+    fn accepts(self, accumulated: Point<Pixels>, touch_slop: Pixels) -> Option<Axis> {
+        match self {
+            PanAxes::One(axis @ Axis::Vertical) => {
+                (accumulated.y.abs() > touch_slop).then_some(axis)
+            }
+            PanAxes::One(axis @ Axis::Horizontal) => {
+                (accumulated.x.abs() > touch_slop).then_some(axis)
+            }
+            PanAxes::NoContainer | PanAxes::Both => (accumulated.magnitude()
+                > f64::from(touch_slop))
+            .then(|| dominant_axis(accumulated)),
+        }
+    }
+}
+
 impl Sealed for TouchDragEvent {}
 impl InputEvent for TouchDragEvent {
     fn to_platform_input(self) -> PlatformInput {
@@ -567,13 +623,15 @@ pub(crate) enum TouchClaim {
 
 enum TouchGestureState {
     Idle,
-    /// The touch is still within `touch_slop` of where it started: it can
-    /// still resolve into either a tap or a pan.
+    /// No pan or drag has accepted the touch yet: it can still resolve into a
+    /// pan, a drag, or (while `press_slop` is `Within`) a tap or long press.
     Pending {
         touch: ActiveTouch,
         deadline: Instant,
         long_press_offered: bool,
         touch_drag: TouchDragOffer,
+        pan_axes: PanAxes,
+        press_slop: PressSlop,
     },
     /// The touch exceeded `touch_slop`: it is a pan until it ends, and its
     /// movement flows out as scroll events.
@@ -590,6 +648,17 @@ enum TouchGestureState {
         touch: ActiveTouch,
         start: TouchDragStart,
     },
+}
+
+/// Whether a pending touch is still a tap or long press to be: Flutter's
+/// `PrimaryPointerGestureRecognizer` rejects both once the touch strays past
+/// `preAcceptSlopTolerance` (`kTouchSlop`) from where it went down, whatever
+/// the drag recognizers do. A one-axis container's pan or a competing drag can
+/// still win an `Exceeded` touch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PressSlop {
+    Within,
+    Exceeded,
 }
 
 /// A pending touch's drag offer: the touch-down dispatch offers it once.
@@ -777,6 +846,8 @@ impl TouchGestureRecognizer {
                             deadline: now + self.tuning.long_press_duration,
                             long_press_offered: false,
                             touch_drag: TouchDragOffer::NotOffered,
+                            pan_axes: PanAxes::NoContainer,
+                            press_slop: PressSlop::Within,
                         };
                     }
                 }
@@ -787,6 +858,8 @@ impl TouchGestureRecognizer {
                     deadline,
                     long_press_offered,
                     mut touch_drag,
+                    pan_axes,
+                    press_slop,
                 } if touch.id == event.id => {
                     let moved = event.position - touch.last_position;
                     touch
@@ -794,11 +867,18 @@ impl TouchGestureRecognizer {
                         .add_position(sampled_at, event.position);
                     touch.last_position = event.position;
                     let accumulated = event.position - touch.start_position;
+                    let press_slop = match press_slop {
+                        PressSlop::Within
+                            if accumulated.magnitude() > f64::from(self.tuning.touch_slop) =>
+                        {
+                            PressSlop::Exceeded
+                        }
+                        kept => kept,
+                    };
                     // A competing drag sees the move before the pan does, as
                     // the deeper recognizer's route runs first in Flutter: on
                     // a move both accept, the drag wins.
-                    let pan_axis = (accumulated.magnitude() > f64::from(self.tuning.touch_slop))
-                        .then(|| dominant_axis(accumulated));
+                    let pan_axis = pan_axes.accepts(accumulated, self.tuning.touch_slop);
                     let drag_won = match &mut touch_drag {
                         TouchDragOffer::Competing {
                             kind,
@@ -849,6 +929,8 @@ impl TouchGestureRecognizer {
                             deadline,
                             long_press_offered,
                             touch_drag,
+                            pan_axes,
+                            press_slop,
                         };
                     }
                 }
@@ -919,7 +1001,20 @@ impl TouchGestureRecognizer {
                 other => self.state = other,
             },
             TouchPhase::Ended => match mem::replace(&mut self.state, TouchGestureState::Idle) {
-                TouchGestureState::Pending { touch, .. } if touch.id == event.id => {
+                TouchGestureState::Pending {
+                    touch,
+                    press_slop: PressSlop::Exceeded,
+                    ..
+                } if touch.id == event.id => {
+                    // Strayed past the tap's slop: no tap, and a double tap's
+                    // first tap is rejected with it (multitap.dart `_reject`).
+                    self.last_tap = None;
+                }
+                TouchGestureState::Pending {
+                    touch,
+                    press_slop: PressSlop::Within,
+                    ..
+                } if touch.id == event.id => {
                     // Ported from flutter/flutter packages/flutter/lib/src/gestures/multitap.dart
                     // @ 3.50.1 (ae9b586f34a8443573f82ef57c3bf914a908cbf7)
                     // (DoubleTapGestureRecognizer.addAllowedPointer, _TapTracker).
@@ -1090,6 +1185,7 @@ impl TouchGestureRecognizer {
             touch,
             deadline,
             long_press_offered: false,
+            press_slop: PressSlop::Within,
             ..
         } = &self.state
         else {
@@ -1106,6 +1202,7 @@ impl TouchGestureRecognizer {
         let TouchGestureState::Pending {
             touch,
             long_press_offered,
+            press_slop: PressSlop::Within,
             ..
         } = &mut self.state
         else {
@@ -1153,6 +1250,18 @@ impl TouchGestureRecognizer {
                 self.state = other;
                 None
             }
+        }
+    }
+
+    /// After the touch's `Started` dispatch: the scroll axes under it, which
+    /// decide when its pan accepts.
+    pub(crate) fn set_pan_axes(&mut self, id: TouchId, axes: PanAxes) {
+        if let TouchGestureState::Pending {
+            touch, pan_axes, ..
+        } = &mut self.state
+            && touch.id == id
+        {
+            *pan_axes = axes;
         }
     }
 
@@ -1290,6 +1399,24 @@ pub(crate) mod recognizer_tests;
 mod tests {
     use super::*;
     use crate::point;
+
+    #[test]
+    fn pan_axes_join_the_containers_under_a_touch() {
+        use Axis::{Horizontal, Vertical};
+        use PanAxes::{Both, NoContainer, One};
+        // (name, axes so far, the joining container, joined)
+        let rows = [
+            ("a first container sets the axes", NoContainer, One(Vertical), One(Vertical)),
+            ("no container joins nothing", One(Vertical), NoContainer, One(Vertical)),
+            ("the same axis stays one axis", One(Vertical), One(Vertical), One(Vertical)),
+            ("a vertical list in a horizontal pager pans both ways", One(Horizontal), One(Vertical), Both),
+            ("a two-axis container pans both ways", One(Vertical), Both, Both),
+            ("both stay both", Both, One(Horizontal), Both),
+        ];
+        for (name, axes, joining, joined) in rows {
+            assert_eq!(axes.join(joining), joined, "{name}");
+        }
+    }
 
     #[test]
     fn ongoing_scroll_locks_to_dominant_axis() {

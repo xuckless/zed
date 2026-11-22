@@ -11,7 +11,7 @@ use crate::{
     Along as _, AnyElement, App, AvailableSpace, Axis, Bounds, ContentMask, DispatchPhase, Edges,
     Element, EntityId, FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId,
     Overflow, Pixels, Point, ScrollDelta, ScrollEvent, Size, Style, StyleRefinement, Styled,
-    Window, point, px, size,
+    TouchEvent, TouchPhase, Window, point, px, size,
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
@@ -1627,6 +1627,20 @@ impl Element for List {
         let scroll_top = prepaint.layout.scroll_top;
         let hitbox_id = prepaint.hitbox.id;
         let mut accumulated_scroll_delta = ScrollDelta::default();
+        // A list scrolls on y: like a div that scrolls, it reports its axis while
+        // a touch on it starts, so GPUI's pan accepts only vertical travel and a
+        // horizontal drag competing in a row can win
+        // (`Window::scroll_container_under_touch`).
+        let hitbox = prepaint.hitbox.clone();
+        window.on_mouse_event(move |event: &TouchEvent, phase, window, _| {
+            if phase == DispatchPhase::Bubble
+                && event.phase == TouchPhase::Started
+                && hitbox.is_hovered(window)
+            {
+                window.leave_touch_to_gestures(event.id);
+                window.scroll_container_under_touch(event.id, false, true);
+            }
+        });
         window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
                 accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
@@ -1951,6 +1965,87 @@ mod test {
         let offset = state.logical_scroll_top();
         assert_eq!(offset.item_ix, 0);
         assert_eq!(offset.offset_in_item, px(0.));
+    }
+
+    #[gpui::test]
+    fn test_list_scrolls_on_y_so_a_row_wins_a_sideways_drag(cx: &mut TestAppContext) {
+        use crate::{
+            DispatchPhase, PointerDevice, TouchDragEvent, TouchDragKind, TouchDragStart,
+            TouchEvent, TouchId, TouchPhase,
+        };
+        let state = ListState::new(5, crate::ListAlignment::Top, px(10.));
+        let won = Rc::new(Cell::new(false));
+
+        struct TestView {
+            state: ListState,
+            won: Rc<Cell<bool>>,
+        }
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let won = self.won.clone();
+                list(self.state.clone(), move |_, _, _| {
+                    let won = won.clone();
+                    // A row that competes for horizontal drags, as a text field does.
+                    canvas(
+                        |_, _, _| {},
+                        move |_, _, window, _| {
+                            let won = won.clone();
+                            window.on_mouse_event(
+                                move |event: &TouchDragEvent, phase, window, _| match (
+                                    phase,
+                                    event.start,
+                                    event.phase,
+                                ) {
+                                    (
+                                        DispatchPhase::Bubble,
+                                        TouchDragStart::Down,
+                                        TouchPhase::Started,
+                                    ) => window.compete_for_touch_drag(TouchDragKind::Horizontal),
+                                    (
+                                        DispatchPhase::Bubble,
+                                        TouchDragStart::PastSlop(_),
+                                        TouchPhase::Started,
+                                    ) => won.set(true),
+                                    _ => {}
+                                },
+                            );
+                        },
+                    )
+                    .h(px(20.))
+                    .w_full()
+                    .into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        // The list is the window's root view: a touch's dispatch may redraw it.
+        let (_, cx) = cx.add_window_view(|_, _| TestView {
+            state: state.clone(),
+            won: won.clone(),
+        });
+        cx.run_until_parked();
+
+        // 19 px from the start but 12 px down: a pan in any direction would take it here; the list's pan takes only
+        // vertical travel, so the row's drag wins once it is 35 px sideways.
+        for (phase, x, y) in [
+            (TouchPhase::Started, 10., 10.),
+            (TouchPhase::Moved, 25., 22.),
+            (TouchPhase::Moved, 45., 22.),
+            (TouchPhase::Ended, 45., 22.),
+        ] {
+            cx.simulate_event(TouchEvent {
+                id: TouchId(1),
+                phase,
+                position: point(px(x), px(y)),
+                predicted_position: None,
+                force: None,
+                device: PointerDevice::Touch,
+                time_stamp: None,
+            });
+        }
+        assert!(won.get(), "the row's horizontal drag should win in a list");
     }
 
     #[gpui::test]

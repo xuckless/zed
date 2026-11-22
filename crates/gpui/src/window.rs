@@ -28,7 +28,8 @@ use crate::{
 };
 
 use crate::gestures::{
-    BackGestureSource, PinchArena, PinchChange, RecognizedTouchGesture, TouchGestureRecognizer,
+    BackGestureSource, PanAxes, PinchArena, PinchChange, RecognizedTouchGesture,
+    TouchGestureRecognizer,
 };
 use crate::interactive::{
     PinchEvent, PointerDevice, PointerSource, TouchEvent, TouchId, TouchPhase,
@@ -1662,9 +1663,12 @@ enum TouchRoute {
     /// and the pinches of the elements that joined it, deepest first
     /// ([`Window::join_pinch`]). `holds_scroll`: it landed on a scroll
     /// container its overscroll physics is moving ([`Window::hold_scroll`]).
+    /// `pan_axes`: the scroll axes of the containers it landed on
+    /// ([`Window::scroll_container_under_touch`]).
     Gestures {
         pinch: SmallVec<[GlobalElementId; 1]>,
         holds_scroll: bool,
+        pan_axes: PanAxes,
     },
     /// The element that claimed it: every later phase goes to its touch
     /// listeners wherever it is drawn now, and no events are synthesized.
@@ -3890,6 +3894,7 @@ impl Window {
             TouchRoute::Gestures {
                 pinch: SmallVec::new(),
                 holds_scroll: false,
+                pan_axes: PanAxes::NoContainer,
             },
         );
     }
@@ -3902,6 +3907,24 @@ impl Window {
     pub(crate) fn hold_scroll(&mut self, touch: TouchId) {
         if let Some(TouchRoute::Gestures { holds_scroll, .. }) = self.touch_routes.get_mut(&touch) {
             *holds_scroll = true;
+        }
+    }
+
+    /// While a touch's [`TouchPhase::Started`] is dispatched, after the touch
+    /// was left to gestures: it landed on a scroll container that scrolls on
+    /// x (`horizontal`) and on y (`vertical`). As in Flutter's arena, where
+    /// every scrollable under the touch adds its drag recognizer, a touch
+    /// only on containers of one axis pans once it travels along that axis,
+    /// so a deeper drag competing on the other axis can still win
+    /// ([`Window::compete_for_touch_drag`]).
+    pub(crate) fn scroll_container_under_touch(
+        &mut self,
+        touch: TouchId,
+        horizontal: bool,
+        vertical: bool,
+    ) {
+        if let Some(TouchRoute::Gestures { pan_axes, .. }) = self.touch_routes.get_mut(&touch) {
+            *pan_axes = pan_axes.join(PanAxes::of(horizontal, vertical));
         }
     }
 
@@ -3921,6 +3944,7 @@ impl Window {
             TouchRoute::Gestures {
                 pinch: smallvec::smallvec![owner.clone()],
                 holds_scroll: false,
+                pan_axes: PanAxes::NoContainer,
             },
         );
     }
@@ -3939,6 +3963,7 @@ impl Window {
                 TouchRoute::Gestures {
                     pinch: joins,
                     holds_scroll: _,
+                    pan_axes: _,
                 },
             ) => pinch.extend(joins),
             (TouchRoute::Gestures { .. } | TouchRoute::Claimed(_), _) => {}
@@ -6560,13 +6585,16 @@ impl Window {
             self.mouse_position = mouse_position;
             self.leave_touch_to_gestures(event.id);
         }
-        let (claimed, pinch, holds_scroll) = match self.touch_routes.get(&event.id) {
-            Some(TouchRoute::Claimed(_)) => (true, SmallVec::new(), false),
+        let (claimed, pinch, holds_scroll, pan_axes) = match self.touch_routes.get(&event.id) {
+            Some(TouchRoute::Claimed(_)) => (true, SmallVec::new(), false, PanAxes::NoContainer),
             Some(TouchRoute::Gestures {
                 pinch,
                 holds_scroll,
-            }) => (false, pinch.clone(), *holds_scroll),
-            Some(TouchRoute::Deciding) | None => (false, SmallVec::new(), false),
+                pan_axes,
+            }) => (false, pinch.clone(), *holds_scroll, *pan_axes),
+            Some(TouchRoute::Deciding) | None => {
+                (false, SmallVec::new(), false, PanAxes::NoContainer)
+            }
         };
         if claimed && event.phase != TouchPhase::Started {
             self.dispatch_mouse_event(event, cx);
@@ -6615,6 +6643,9 @@ impl Window {
         let mut recognized_gestures =
             self.touch_gestures
                 .handle_event(&event, cx.background_executor().now(), target);
+        if event.phase == crate::TouchPhase::Started {
+            self.touch_gestures.set_pan_axes(event.id, pan_axes);
+        }
         if event.phase == crate::TouchPhase::Started
             && holds_scroll
             && let Some(hold) = self.touch_gestures.hold(event.id)
