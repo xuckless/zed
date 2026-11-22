@@ -14,6 +14,7 @@ mod display;
 mod events;
 mod keyboard;
 mod platform;
+mod native_views;
 mod pointer;
 mod system_notifications;
 mod system_settings;

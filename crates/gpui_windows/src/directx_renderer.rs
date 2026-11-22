@@ -20,7 +20,7 @@ use windows::{
     core::{HSTRING, Interface},
 };
 
-use crate::directx_renderer::native_view_tree::NativeViewHole;
+use crate::directx_renderer::native_view_tree::{NativeViewHole, NativeViewTree, NativeViews};
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use crate::*;
 
@@ -46,6 +46,7 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
+    native_views: NativeViews,
     font_info: &'static FontInfo,
 
     width: u32,
@@ -117,10 +118,13 @@ impl Drop for Annotation<'_> {
     }
 }
 
+/// Under the target's root visual: the native views' visuals, then GPUI's own swap chain visual above them.
 struct DirectComposition {
     comp_device: IDCompositionDevice,
-    comp_target: IDCompositionTarget,
+    /// Holds the tree on the window; never read once its root is set.
+    _comp_target: IDCompositionTarget,
     comp_visual: IDCompositionVisual,
+    view_tree: NativeViewTree,
 }
 
 impl DirectXRendererDevices {
@@ -168,8 +172,15 @@ impl DirectXRenderer {
             .context("Creating DirectX devices")?;
         let atlas = Arc::new(DirectXAtlas::new(&devices.device, &devices.device_context));
 
-        let resources = DirectXResources::new(&devices, 1, 1, hwnd, disable_direct_composition)
-            .context("Creating DirectX resources")?;
+        let native_views = NativeViews::default();
+        let resources = DirectXResources::new(
+            &devices,
+            1,
+            1,
+            hwnd,
+            disable_direct_composition,
+        )
+        .context("Creating DirectX resources")?;
         let globals = DirectXGlobalElements::new(&devices.device)
             .context("Creating DirectX global elements")?;
         let pipelines = DirectXRenderPipelines::new(&devices.device)
@@ -194,6 +205,7 @@ impl DirectXRenderer {
             globals,
             pipelines,
             direct_composition,
+            native_views,
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
@@ -327,9 +339,10 @@ impl DirectXRenderer {
         let direct_composition = if disable_direct_composition {
             None
         } else {
-            let composition =
+            let mut composition =
                 DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), self.hwnd)?;
             composition.set_swap_chain(&resources.swap_chain)?;
+            composition.reattach_native_views(&self.native_views)?;
             Some(composition)
         };
 
@@ -361,8 +374,9 @@ impl DirectXRenderer {
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
+        let native_views = self.prepare_native_views(scene, background_appearance)?;
         self.render(scene, background_appearance)?;
-        self.present()
+        self.present_native_views(native_views)
     }
 
     /// Clear the render target for `background_appearance` and encode every
@@ -1039,19 +1053,26 @@ impl DirectComposition {
     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
         let comp_device = get_comp_device(dxgi_device)?;
         let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, false) }?;
+        let root_visual = unsafe { comp_device.CreateVisual() }?;
+        let view_tree = NativeViewTree::new(&comp_device, &root_visual)?;
         let comp_visual = unsafe { comp_device.CreateVisual() }?;
+        unsafe {
+            // Inserting with no reference visual and insertAbove false puts it above every sibling.
+            root_visual.AddVisual(&comp_visual, false, None)?;
+            comp_target.SetRoot(&root_visual)?;
+        }
 
         Ok(Self {
             comp_device,
-            comp_target,
+            _comp_target: comp_target,
             comp_visual,
+            view_tree,
         })
     }
 
     pub fn set_swap_chain(&self, swap_chain: &IDXGISwapChain1) -> Result<()> {
         unsafe {
             self.comp_visual.SetContent(swap_chain)?;
-            self.comp_target.SetRoot(&self.comp_visual)?;
             self.comp_device.Commit()?;
         }
         Ok(())

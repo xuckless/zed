@@ -1033,6 +1033,29 @@ impl PlatformWindow for WindowsWindow {
             .set(Some(callback));
     }
 
+    /// `view` is any COM object `IDCompositionVisual::SetContent` takes, usually a composition swap chain the app
+    /// presents to on its own device; it shows under GPUI's content through DirectComposition, never a child window.
+    unsafe fn attach_native_view(
+        &self,
+        id: NativeViewId,
+        view: std::ptr::NonNull<std::ffi::c_void>,
+    ) -> Option<Box<dyn std::any::Any>> {
+        let raw = view.as_ptr();
+        // SAFETY: the caller guarantees `view` is a live COM object; the clone is a reference of our own.
+        let content = unsafe { IUnknown::from_raw_borrowed(&raw) }?.clone();
+        self.state
+            .renderer
+            .borrow_mut()
+            .attach_native_view(id, content, &self.0)
+            .context("attaching a native view")
+            .log_err()
+    }
+
+    /// A DirectComposition visual takes no input: the window's own messages carry the mouse over it.
+    fn native_view_input(&self) -> NativeViewInput {
+        NativeViewInput::Window
+    }
+
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
         self.0
             .state
