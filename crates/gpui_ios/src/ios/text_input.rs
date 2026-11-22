@@ -4,12 +4,12 @@ use gpui::{
     TextInputStateChange, px,
 };
 use objc2::rc::{Retained, Weak};
-use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
     NSArray, NSAttributedStringKey, NSComparisonResult, NSCopying, NSDictionary,
-    NSObjectNSDelayedPerforming, NSObjectProtocol, NSRange, NSString,
+    NSObjectNSDelayedPerforming, NSObjectProtocol, NSRange, NSString, ns_string,
 };
 use objc2_ui_kit::*;
 use std::{
@@ -214,6 +214,71 @@ define_class!(
             }
         }
 
+        // Ported from flutter/flutter FlutterTextInputPlugin.mm `-canPerformAction:withSender:` and its
+        // UIResponderStandardEditActions overrides @ 3.50.1. Copyright 2014 The Flutter Authors. BSD-3-Clause, see
+        // third_party/flutter/LICENSE. UIKit's edit menu (UITextInteraction) and hardware shortcuts send these.
+        #[unsafe(method(canPerformAction:withSender:))]
+        fn can_perform_action(&self, action: Sel, sender: Option<&AnyObject>) -> bool {
+            if action == sel!(paste:) {
+                // Forbid pasting images, memojis, or other non-string content.
+                // SAFETY: the pasteboard is read on the main thread.
+                unsafe { pasteboard().hasStrings() }
+            } else if action == sel!(copy:) || action == sel!(cut:) || action == sel!(delete:) {
+                // Flutter's framework turns copy and cut off for obscured text (`EditableTextState.copyEnabled`,
+                // `cutEnabled`).
+                let secret = action != sel!(delete:) && self.ivars().configuration.borrow().secure;
+                !secret && self.selected_text().is_some_and(|text| text.length() > 0)
+            } else if action == sel!(selectAll:) {
+                self.hasText()
+            } else if action == sel!(captureTextFromCamera:) {
+                true
+            } else {
+                unsafe { msg_send![super(self), canPerformAction: action, withSender: sender] }
+            }
+        }
+
+        #[unsafe(method(cut:))]
+        fn cut_action(&self, _sender: Option<&AnyObject>) {
+            self.edit_action(true, || {
+                let Some(range) = self.selectedTextRange() else { return; };
+                // SAFETY: the pasteboard is written on the main thread.
+                unsafe { pasteboard().setString(self.textInRange(&range).as_deref()) };
+                self.replaceRange_withText(&range, ns_string!(""));
+            });
+        }
+
+        #[unsafe(method(copy:))]
+        fn copy_action(&self, _sender: Option<&AnyObject>) {
+            // SAFETY: the pasteboard is written on the main thread.
+            unsafe { pasteboard().setString(self.selected_text().as_deref()) };
+        }
+
+        #[unsafe(method(paste:))]
+        fn paste_action(&self, _sender: Option<&AnyObject>) {
+            self.edit_action(true, || {
+                // SAFETY: the pasteboard is read on the main thread.
+                if let Some(pasteboard_string) = unsafe { pasteboard().string() } {
+                    self.insertText(&pasteboard_string);
+                }
+            });
+        }
+
+        #[unsafe(method(delete:))]
+        fn delete_action(&self, _sender: Option<&AnyObject>) {
+            self.edit_action(true, || {
+                if let Some(range) = self.selectedTextRange() {
+                    self.replaceRange_withText(&range, ns_string!(""));
+                }
+            });
+        }
+
+        #[unsafe(method(selectAll:))]
+        fn select_all_action(&self, _sender: Option<&AnyObject>) {
+            self.edit_action(false, || {
+                let all = self.textRangeFromPosition_toPosition(&self.beginningOfDocument(), &self.endOfDocument());
+                self.setSelectedTextRange(all.as_deref());
+            });
+        }
     }
 
     unsafe impl UIKeyInput for TextInputView {
@@ -632,6 +697,29 @@ impl TextInputView {
         self.with_handler(document_range).flatten()
     }
 
+    /// An edit action is UIKit's call but not the keyboard's edit, so the input delegate hears of it around the
+    /// change, as `UITextInput` asks: `selectionWillChange:` before (UIKit's keyboard accepts its autocorrection and
+    /// collapses the selection it knows), `selectionDidChange:` after (UIKit's handles follow a paste or cut). Told
+    /// only afterwards, as an app edit is, UIKit collapsed select all's new selection to its end.
+    fn edit_action(&self, content_changed: bool, action: impl FnOnce()) {
+        let delegate = self.inputDelegate();
+        let input = Some(ProtocolObject::from_ref(self));
+        if let Some(delegate) = &delegate {
+            if content_changed { delegate.textWillChange(input); }
+            delegate.selectionWillChange(input);
+        }
+        action();
+        if let Some(delegate) = &delegate {
+            delegate.selectionDidChange(input);
+            if content_changed { delegate.textDidChange(input); }
+        }
+    }
+
+    fn selected_text(&self) -> Option<Retained<NSString>> {
+        let range = self.selectedTextRange()?;
+        self.textInRange(&range)
+    }
+
     // Ported from flutter/flutter FlutterTextInputPlugin.mm `-[FlutterTokenizer lineEnclosingPosition:inDirection:]`
     // @ 3.50.1 (its iOS 17 branch). Copyright 2014 The Flutter Authors. BSD-3-Clause, see third_party/flutter/LICENSE.
     fn line_enclosing_position(
@@ -768,6 +856,16 @@ impl TextInputView {
             }
         }
     }
+}
+
+/// The general pasteboard, which the edit actions use. The oracle's binary has no app bundle, so iOS would ask the
+/// user before each read and the row would wait forever: its pasteboard is a named one.
+fn pasteboard() -> Retained<UIPasteboard> {
+    #[cfg(not(test))]
+    return UIPasteboard::generalPasteboard();
+    #[cfg(test)]
+    return UIPasteboard::pasteboardWithName_create(ns_string!("dev.parallax.text-input-oracle"), true)
+        .expect("UIKit creates a named pasteboard on request");
 }
 
 fn native_rect(bounds: gpui::Bounds<gpui::Pixels>) -> CGRect {
