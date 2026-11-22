@@ -15,9 +15,10 @@ use super::{
 };
 use crate::events::platform_input_from_native;
 use gpui::{
-    Bounds, KeyDownEvent, ModifiersChangedEvent, NativeViewId, Pixels, PlatformInput, Point, Rgba,
-    ScaledPixels, Scene, WindowBackgroundAppearance,
+    KeyDownEvent, ModifiersChangedEvent, NativeViewId, Pixels, PlatformInput, Point, Rgba, Scene,
+    WindowBackgroundAppearance, native_view_placement,
 };
+use gpui_apple::native_view_placement::{self as apple_placement, Layout, Placement, YAxis};
 use objc2::{
     class, msg_send,
     rc::Retained,
@@ -90,50 +91,6 @@ struct AttachedView {
     container: Retained<NSView>,
     /// Where the view was last placed, or `None` while it is hidden.
     placement: Option<Placement>,
-}
-
-/// Where a native view is shown, as `[x, y, width, height]` frames in points.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Placement {
-    /// The visible part of the view, in the window's content view.
-    container: [f64; 4],
-    /// The whole view, in its container.
-    view: [f64; 4],
-}
-
-impl Placement {
-    /// Places a view with the given bounds and clip, both in device pixels
-    /// from the top left of the GPUI view, whose frame is `gpui_frame`.
-    /// Returns `None` if the clip leaves none of the view visible.
-    fn new(
-        bounds: Bounds<ScaledPixels>,
-        content_mask: Bounds<ScaledPixels>,
-        scale_factor: f64,
-        gpui_frame: [f64; 4],
-    ) -> Option<Self> {
-        let visible = bounds.intersect(&content_mask);
-        if visible.is_empty() {
-            return None;
-        }
-        // AppKit measures from the bottom left of the enclosing view.
-        let to_frame = |bounds: Bounds<ScaledPixels>| {
-            let [gpui_x, gpui_y, _, gpui_height] = gpui_frame;
-            let to_points = |value: ScaledPixels| f64::from(value) / scale_factor;
-            let height = to_points(bounds.size.height);
-            [
-                gpui_x + to_points(bounds.origin.x),
-                gpui_y + gpui_height - to_points(bounds.origin.y) - height,
-                to_points(bounds.size.width),
-                height,
-            ]
-        };
-        let container = to_frame(visible);
-        let [x, y, width, height] = to_frame(bounds);
-        Some(Self {
-            container,
-            view: [x - container[0], y - container[1], width, height],
-        })
-    }
 }
 
 impl NativeViews {
@@ -335,12 +292,7 @@ pub(super) fn update_background(state: &mut MacWindowState, scene: &Scene) {
     if state.background_appearance != WindowBackgroundAppearance::Opaque {
         return;
     }
-    let background = scene
-        .native_views
-        .iter()
-        .rev()
-        .map(|native_view| Rgba::from(native_view.background))
-        .find(|background| background.a > 0.);
+    let background = native_view_placement::background(&scene.native_views);
     if state.native_views.background == background {
         return;
     }
@@ -360,62 +312,27 @@ fn background_color(color: Option<Rgba>) -> Retained<NSColor> {
     NSColor::colorWithSRGBRed_green_blue_alpha(r as f64, g as f64, b as f64, 1.)
 }
 
-/// What a scene changes about the window's attached views.
-#[derive(Default)]
-pub(super) struct Layout {
-    /// Views to place somewhere new, or to hide for `None`.
-    placements: Vec<(NativeViewId, Option<Placement>)>,
-    /// The views the scene shows, from back to front, if that order changed.
-    stacking: Option<Vec<NativeViewId>>,
-}
-
 /// Works out which attached views the scene moves, shows, hides, or restacks.
 pub(super) fn plan_layout(state: &MacWindowState, scene: &Scene) -> Layout {
-    if state.native_views.views.is_empty() {
-        return Layout::default();
-    }
-    let scale_factor = state.scale_factor() as f64;
     // SAFETY: The GPUI view is live for as long as the window state.
     let gpui_frame: NSRect = unsafe { msg_send![state.native_view.as_ptr(), frame] };
-    let gpui_frame = [
-        gpui_frame.origin.x,
-        gpui_frame.origin.y,
-        gpui_frame.size.width,
-        gpui_frame.size.height,
-    ];
-
-    let mut placements = Vec::new();
-    for attached in &state.native_views.views {
-        let placement = scene
+    apple_placement::plan_layout(
+        state
             .native_views
+            .views
             .iter()
-            .find(|native_view| native_view.id == attached.id)
-            .and_then(|native_view| {
-                Placement::new(
-                    native_view.bounds,
-                    native_view.content_mask.bounds,
-                    scale_factor,
-                    gpui_frame,
-                )
-            });
-        if attached.placement != placement {
-            placements.push((attached.id, placement));
-        }
-    }
-
-    // The scene's native views are sorted by draw order, so the ones painted
-    // later, which belong in front, come last.
-    let mut stacking = Vec::new();
-    for placement in &scene.native_views {
-        if !stacking.contains(&placement.id) {
-            stacking.push(placement.id);
-        }
-    }
-    let stacking = (stacking != state.native_views.stacking).then_some(stacking);
-    Layout {
-        placements,
-        stacking,
-    }
+            .map(|attached| (attached.id, attached.placement)),
+        &state.native_views.stacking,
+        scene,
+        state.scale_factor() as f64,
+        [
+            gpui_frame.origin.x,
+            gpui_frame.origin.y,
+            gpui_frame.size.width,
+            gpui_frame.size.height,
+        ],
+        YAxis::Up,
+    )
 }
 
 /// Applies a planned layout. The window state must be unlocked, because AppKit
@@ -1435,42 +1352,6 @@ extern "C" fn resign_first_responder(this: &AnyObject, _: Sel) -> Bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{point, size};
-
-    #[test]
-    fn placement_clips_a_view_to_its_content_mask() {
-        let scaled = |x: f32, y: f32, width: f32, height: f32| Bounds {
-            origin: point(ScaledPixels::from(x), ScaledPixels::from(y)),
-            size: size(ScaledPixels::from(width), ScaledPixels::from(height)),
-        };
-        // A 400 by 300 point GPUI view at twice the scale, 10 points above the
-        // bottom of the content view.
-        let gpui_frame = [0., 10., 400., 300.];
-        let bounds = scaled(100., 40., 200., 400.);
-
-        let unclipped = Placement::new(bounds, scaled(0., 0., 800., 600.), 2., gpui_frame);
-        assert_eq!(
-            unclipped,
-            Some(Placement {
-                container: [50., 90., 100., 200.],
-                view: [0., 0., 100., 200.],
-            })
-        );
-
-        // Clipping the top 60 and left 20 pixels shrinks the container, and the
-        // view keeps its size and stays where it was in the window.
-        let clipped = Placement::new(bounds, scaled(120., 100., 800., 600.), 2., gpui_frame);
-        assert_eq!(
-            clipped,
-            Some(Placement {
-                container: [60., 90., 90., 170.],
-                view: [-10., 0., 100., 200.],
-            })
-        );
-
-        let hidden = Placement::new(bounds, scaled(0., 500., 800., 100.), 2., gpui_frame);
-        assert_eq!(hidden, None);
-    }
 
     #[test]
     fn keyboard_input_follows_gpui_focus_except_from_views_gpui_did_not_attach() {

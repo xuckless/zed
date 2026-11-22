@@ -10,6 +10,7 @@ pub mod display_link;
 pub mod keychain;
 mod metal_atlas;
 pub mod metal_renderer;
+pub mod native_view_placement;
 pub mod process_info;
 
 #[cfg(feature = "font-kit")]
