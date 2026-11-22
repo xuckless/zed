@@ -125,7 +125,10 @@ impl NativeView {
     /// On Wayland it is a `wl_proxy` of a `wl_surface`
     /// made on the window's own `wl_display`, with no role, no `wp_viewport`
     /// and no subsurfaces of its own; GPUI makes it a subsurface of the window
-    /// and places it, and the app attaches and commits its buffers.
+    /// and places it, and the app commits every buffer through
+    /// `gpui_linux::NativeViewBuffers`, from a thread it stops and joins before
+    /// GPUI's connection closes (in `cx.on_app_quit`, or when the window
+    /// closes).
     ///
     /// GPUI retains the view and puts it inside a view of its own, until the
     /// last clone of the returned handle is dropped. Until then GPUI decides the

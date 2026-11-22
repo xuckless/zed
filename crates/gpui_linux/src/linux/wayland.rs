@@ -7,6 +7,8 @@ mod serial;
 mod touch;
 mod window;
 
+pub use window::{Committed, NativeViewBuffers};
+
 /// Contains Types for configuring layer_shell surfaces.
 pub mod layer_shell;
 

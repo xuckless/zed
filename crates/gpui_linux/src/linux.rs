@@ -26,6 +26,8 @@ pub(crate) use platform::*;
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(crate) use text_system::*;
 #[cfg(feature = "wayland")]
+pub use wayland::{Committed, NativeViewBuffers};
+#[cfg(feature = "wayland")]
 pub(crate) use wayland::*;
 #[cfg(feature = "x11")]
 pub(crate) use x11::*;
